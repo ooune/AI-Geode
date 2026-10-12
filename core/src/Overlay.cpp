@@ -52,12 +52,16 @@ void buildOverlay(PredictedPath const& main, PredictedPath const* alternative, s
     if (!main.points.empty()) {
         float x0 = main.points.front().x - 30.f;
         float x1 = main.points.back().x + 30.f;
+        auto const& h = main.hit;
+        bool hasHit = main.collisionStep >= 0;
         for (size_t i = 0; i < obstacles.size() && out.boxes.size() < maxHazards; ++i) {
             auto const& o = obstacles[i];
             if (o.kind != Obstacle::Kind::Hazard || o.r < x0 || o.l > x1) continue;
-            bool hit = main.obstacle == static_cast<int>(i);
-            out.boxes.push_back({o.l, o.b, o.r, o.t, hit ? OverlayGeometry::Style::HazardHit : OverlayGeometry::Style::Hazard});
+            bool hit = hasHit && o.l == h.l && o.r == h.r && o.b == h.b && o.t == h.t;
+            if (!hit) out.boxes.push_back({o.l, o.b, o.r, o.t, OverlayGeometry::Style::Hazard});
         }
+        // the obstacle the path runs into (hazard or block), always shown
+        if (hasHit) out.boxes.push_back({h.l, h.b, h.r, h.t, OverlayGeometry::Style::HazardHit});
     }
 
     char buf[96];

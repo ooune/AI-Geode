@@ -97,6 +97,43 @@
 				"input": true
 			}
 		},
+		"title-prediction": {
+			"type": "title",
+			"name": "Trajectory Prediction"
+		},
+		"prediction-enabled": {
+			"type": "bool",
+			"name": "Use Prediction",
+			"description": "Simulate the cube's path before each decision: avoid predicted collisions, pick jump timings by simulation, and learn rejected timings without dying. Cube mode only; other modes learn from experience as before.",
+			"default": true
+		},
+		"show-trajectory": {
+			"type": "bool",
+			"name": "Show Trajectory",
+			"description": "Draw the predicted path in the level: green = safe, yellow = uncertain, red = collision, with the landing point, nearby spike hitboxes and steps until a collision.",
+			"default": true
+		},
+		"show-alternative": {
+			"type": "bool",
+			"name": "Show Alternative Path",
+			"description": "Also draw (in blue) what would happen with the other button state.",
+			"default": false
+		},
+		"prediction-horizon": {
+			"type": "float",
+			"name": "Prediction Horizon",
+			"description": "How far ahead (seconds) the path is simulated. Longer sees further but costs more and is less certain.",
+			"default": 0.75,
+			"min": 0.3,
+			"max": 1.5,
+			"control": {
+				"slider": true,
+				"slider-step": 0.05,
+				"arrows": true,
+				"arrow-step": 0.05,
+				"input": true
+			}
+		},
 		"title-display": {
 			"type": "title",
 			"name": "Display"

@@ -5,6 +5,9 @@
 
 #include <aigd/Agent.hpp>
 #include <aigd/Memory.hpp>
+#include <aigd/Overlay.hpp>
+#include <aigd/Physics.hpp>
+#include <aigd/Predictor.hpp>
 
 #include <filesystem>
 #include <memory>
@@ -32,6 +35,10 @@ public:
         float learningSpeed = 0.5f;
         float respawnDelay = 0.5f;
         float trainingSpeed = 1.f;
+        bool prediction = true;
+        bool showTrajectory = true;
+        bool showAlternative = false;
+        float predictionHorizon = 0.75f; // seconds
     };
 
     void loadSettings();
@@ -74,6 +81,10 @@ public:
     std::string const& unsupportedReason() const { return m_unsupportedReason; }
     std::string const& notice() const { return m_notice; }
     size_t indexedObjects() const { return m_observer.indexedObjects(); }
+    aigd::Predictor const& predictor() const { return m_predictor; }
+    size_t obstacleCount() const { return m_obstacles.size(); }
+    // Fills the trajectory overlay for the current plan; false = draw nothing.
+    bool overlayGeometry(aigd::OverlayGeometry& out) const;
 
 private:
     AIController();
@@ -100,6 +111,11 @@ private:
     bool m_patternsLoaded = false;
     Observer m_observer;
     SaveWorker m_saver;
+
+    // trajectory prediction
+    aigd::PhysicsModel m_physics;
+    aigd::Predictor m_predictor{m_physics};
+    std::vector<aigd::Obstacle> m_obstacles;
 
     PlayLayer* m_layer = nullptr;   // identity only, cleared when the layer goes away
     bool m_supported = false;

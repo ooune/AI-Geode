@@ -1139,6 +1139,7 @@ static void runBench() {
     struct Variant {
         char const* name;
         LearnerConfig cfg;
+        bool prediction = false;
     };
     std::vector<Variant> variants;
     {
@@ -1158,6 +1159,9 @@ static void runBench() {
         c.learningSpeed = sp;
         variants.push_back({sp < 0.5f ? "default, speed 0.1" : "default, speed 1.0", c});
     }
+    // Same default learner plus trajectory prediction (fresh, uncalibrated
+    // physics model per run: calibration happens during the first attempts).
+    variants.push_back({"default + trajectory prediction", LearnerConfig{}, true});
 
     for (auto const& level : sim::allLevels()) {
         std::printf("%s\n", level.name.c_str());
@@ -1170,7 +1174,9 @@ static void runBench() {
                 PatternMemory pat;
                 Agent agent(cfg);
                 agent.attach(&mem, &pat);
-                auto r = train(agent, level, 3000);
+                PredictionRig rig;
+                if (v.prediction) agent.setPredictor(&rig.predictor);
+                auto r = train(agent, level, 3000, v.prediction ? &rig : nullptr);
                 results.push_back(r.attemptsToComplete < 0 ? 99999 : r.attemptsToComplete);
             }
             std::sort(results.begin(), results.end());

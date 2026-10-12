@@ -28,7 +28,10 @@ All settings live in the mod's Geode settings page. Most also appear in the in-g
 | **Auto Retry** + **Respawn Delay** | Restart automatically after a death. |
 | **Practice Mode Learning** | Plays in practice mode and places its own checkpoints (see below). |
 | **Training Speed** | 1–4× game speed while the AI plays. Physics stay at 240 steps/s, so learning is unaffected, but music desyncs. |
-| **Show Status Panel** / **Show Debug Data** | The in-level overlay, and its debug lines (observation, Q-values, memory sizes). |
+| **Use Prediction** | Simulate the cube's path before each decision (see *Trajectory prediction*). Cube mode only. |
+| **Show Trajectory** / **Show Alternative Path** | Draw the predicted path in the level; optionally also the path for the other button state. |
+| **Prediction Horizon** | 0.3–1.5 s of simulated future (default 0.75 s). |
+| **Show Status Panel** / **Show Debug Data** | The in-level overlay, and its debug lines (observation, Q-values, memory sizes, physics calibration, planner cost, prediction error). |
 
 The **status panel** shows:
 - the current state (Observing / Playing / Learning / Retrying / Completed);
@@ -100,6 +103,78 @@ Inputs go through `GJBaseGameLayer::handleButton` from a `processCommands` hook,
 8. **Stuck detection.** After 20 attempts without a new best, exploration widens around the trouble spot and the search reaches further back.
 9. **Timing statistics.** Every successful jump over a hazard records its lead distance per mode and speed. These statistics seed future "add a press" experiments on any level.
 
+### Trajectory prediction (cube)
+Learning only from deaths is slow: every bad timing has to be tried once. The
+predictor simulates the cube's future instead, so most bad timings are rejected
+before they are tried.
+
+**Physics model** (`core/Physics`). Per 240 Hz step, airborne: `vy -= g`,
+`y += vy * k`, with `vy` capped at the fall speed; a jump sets `vy` to the
+take-off speed. The defaults were measured from GD 2.2081 itself (from saved
+traces: g = 0.2156, k = 0.225, take-off vy = 10.964, i.e. the 11.18 jump impulse
+minus one step of gravity; x = 1.298 units/step at 1×). An online calibrator
+refits gravity, k, take-off speed, fall cap, floor height and x speed per speed
+class from consecutive real observations. Single odd frames (orbs, pads,
+teleports) are rejected as outliers, and parameters only move after enough
+consistent samples. The calibration is saved in `patterns.json`.
+
+**Collision prediction** (`core/Predictor`). The simulation steps the cube
+forward against the game's own collision rectangles
+(`GameObject::getObjectRect`, so spike hitboxes are the real, small ones).
+- Hazards kill on contact with the outer hitbox.
+- Blocks are landed on from above (from below when upside down), bump the cube
+  when rising into them, and kill only if the small inner hitbox enters them.
+- Walking off edges and holding to re-jump on landing are modelled.
+- Each path is classed as **Collision** (overlap deeper than the error margin),
+  **Uncertain** (a near miss within the margin, contact between steps, or
+  touching an unmodelled object: orbs, pads, portals, speed changes, slopes,
+  one-way blocks) or **Safe**.
+- The margin grows with the measured model error and the distance into the
+  future, so an inaccurate model makes the AI more cautious, not more confident.
+
+**Receding-horizon planner.** Before each decision it simulates:
+- *press now*, as a tap and as hold-through-landing;
+- *release now*: never press, or press after k steps. k is tried on a coarse
+  schedule, then refined to single steps around the best timing and wherever
+  the outcome flips.
+
+Only the first action of the best plan is executed. The next step re-plans from
+the new real state. Plans that would press only after the "never press" path
+has already collided are skipped, and while airborne with the button up the
+last plan is reused until about 20 steps before landing.
+
+**How it feeds learning** (`Agent::act`):
+- Where the Q-table has no preference yet, the planner's best plan decides.
+- If the chosen action is predicted to collide (every continuation) while the
+  other action still has a way through, it is blocked. The blocked action is
+  written into the Q-table as an *imagined death*, so that timing is learned
+  without dying.
+- Real outcomes still drive all normal learning. Predicted safety is never
+  treated as proof.
+
+**Checking the model against reality.**
+- Every 16 steps the last 32 real steps are re-simulated with the inputs that
+  were actually used, and the end positions are compared. This gives drift per
+  step, shown in the debug panel; high drift lowers trust.
+- A one-step prediction error is shown too.
+- If a path was predicted safe a moment before an actual death, that counts as a
+  *misprediction*: caution rises and the event is logged with the predicted vs.
+  actual position. Successful predictions slowly restore trust.
+- The predictor is not used at all until the model is calibrated (a couple of
+  jumps).
+
+**Overlay** (`src/ui/TrajectoryOverlay`). One `CCDrawNode` in the level's object
+layer is redrawn once per frame from geometry built in the core (so tests can
+check it). It shows:
+- the path: green = safe, yellow = uncertain, red = collision;
+- the predicted landing point and nearby spike hitboxes;
+- the obstacle the path runs into, with the steps until the hit;
+- optionally the alternative path, in blue.
+
+Other game modes (ship, ball, UFO, wave, robot, spider, swing) are not modelled.
+In those modes the overlay is hidden and learning works from experience as
+before.
+
 ### Practice-mode learning
 With **Practice Mode Learning** on, the AI:
 - switches the level to practice mode;
@@ -170,11 +245,52 @@ Add `--bench` to also run the multi-seed learning benchmark.
 - the agent **completing all four simulator levels**, with later attempts measurably further than early ones;
 - **learned policy surviving save + reload**: a fresh agent with learning disabled completes the level from the saved file, while an untrained one does not;
 - cross-level transfer through pattern memory;
-- per-tick cost.
+- per-tick cost;
+- trajectory prediction against the simulator:
+  - physics calibration learning the simulator's (deliberately different) constants;
+  - standing still before a spike;
+  - every jump timing in a sweep over a single spike and over a triple spike
+    (too early, too late, clearing), checking that no timing that dies is
+    predicted safe;
+  - landing positions on flat ground and on a block top;
+  - 0.5×, 2× and 4× speed;
+  - gravity portals (marked uncertain) and upside-down landing;
+  - the overlay geometry matching the simulated path, collision point and hit hitbox;
+  - the planner alone clearing levels;
+  - learning speed with vs. without prediction;
+  - calibration persistence;
+  - misprediction caution;
+  - no action before calibration.
 
-### Results (as of this commit)
+### Results
 
-Unit tests: 17 tests, 335 checks, 0 failures.
+Unit tests (last full run, before the final overlay/UI wiring commit): 31 tests, 430 checks, 0 failures.
+
+Trajectory prediction against the simulator:
+- calibration recovers the simulator's physics exactly (g 0.2200, k 0.2326,
+  take-off 10.780, floor, x speed);
+- standing still before a spike: collision predicted at step 125, actual 124;
+- single-spike timing sweep: 106/111 timings classified correctly, 5 uncertain,
+  0 falsely called safe;
+- triple spike: 85/91 correct, 6 uncertain, 0 falsely called safe;
+- landing on a block top: exact; on flat ground within 1.3 units (one step);
+- at 0.5×, 2× and 4× speed the collision step is within 1 of the real one;
+- the planner alone, without any learning, completes the basics, spikes and
+  blocks levels with no deaths;
+- cost: about 100 µs per physics step on average (about 14 simulations per
+  step), i.e. about 2.4% of one core at 1× speed.
+
+Attempts to first completion, same seed, with vs. without prediction:
+
+| Level | With prediction | Without |
+|---|---|---|
+| basics | 3 | 9 |
+| spikes | 3 | 16 |
+| blocks | 4 | 15 |
+| ship | 29 | 55 (ship itself is not modelled; the gain is from the cube parts) |
+
+The first one or two attempts are still learned the old way while the physics
+model calibrates.
 
 Per-tick cost: about 0.5 µs per decision in the simulator. The end-of-attempt update over about 1,100 decisions takes about 0.25 ms. Saving is done on a background thread.
 
@@ -198,7 +314,17 @@ Cross-level transfer: after training on *spikes*, the *basics* level was complet
 - Deaths are detected and analysed, the level auto-retries, and memory is written to disk.
 - Progress rose from 1.9% on attempt 1 to 13.3% by attempt 12, each attempt using a change derived from the previous death.
 
-Later in-game results are in [TESTING.md](TESTING.md).
+Later in-game runs on Stereo Madness (before trajectory prediction) reached
+51.5% after 386 attempts. Several problems were found in game and fixed:
+- regressions into already-solved sections, fixed by best-path protection;
+- ship deaths misclassified by obstacle centre, fixed by using obstacle edges;
+- ship climbs needing a hold-range search instead of a single tap.
+
+**Trajectory prediction has not been verified in game yet.** Its accuracy on the
+real game is measured by the debug panel (step error, 32-step error, drift,
+mispredictions) and in the log at every death (`Prediction check: ...`). The
+physics defaults come from real game data, but collision details such as hitbox
+sizes and landing tolerance are still unconfirmed.
 
 ---
 
@@ -207,7 +333,12 @@ Later in-game results are in [TESTING.md](TESTING.md).
 - **Platformer levels** are not supported: they need left/right input. The AI disables itself there and says why.
 - **Two-player levels**: only player 1 is controlled.
 - **Moving obstacles**: hazards moved by triggers are indexed by their starting x. A padded lookup tolerates small movements, but heavily animated levels give the cross-level pattern features less accurate input. The per-level table is unaffected, because it is keyed by the player's own state.
-- **Exact physics are not modelled.** The AI learns by trying, so hard levels can take hundreds or thousands of attempts, and very precise sections (frame-perfect inputs, tight wave corridors) may never be beaten. Timing resolution is a 3-unit x cell, about 2 ticks at 1× speed.
+- **Physics are only modelled for the cube.** Other modes learn by trying, so hard levels can take hundreds or thousands of attempts, and very precise sections (frame-perfect inputs, tight wave corridors) may never be beaten. The learned table's timing resolution is a 3-unit x cell, about 2 ticks at 1× speed. The planner itself works per tick.
+- **Trajectory prediction limits:**
+  - player hitbox sizes (30 units, inner 9 units; mini 18/5.4) and the 2-unit landing tolerance are assumptions, not values read from the game;
+  - orbs, pads, portals, speed changes, slopes and moving objects are not simulated: paths touching them are marked uncertain, and objects moved by triggers use their current position only;
+  - mini-cube physics start from guesses until calibrated;
+  - robot, ball and other modes are not predicted at all.
 - **Determinism**: GD 2.2's physics are deterministic for identical inputs, which the learning relies on. Mods that change input timing, such as *Click Between Frames*, or physics settings can make attempts less repeatable and learning slower.
 - The memory of a local/editor level is keyed by its content, so editing the level starts a fresh memory.
 - **Training Speed** above 1× desyncs the music.
@@ -216,9 +347,10 @@ Later in-game results are in [TESTING.md](TESTING.md).
 ## Repository layout
 
 ```
-core/      learning library (Agent, FailureAnalyzer, Memory, Storage, Json) – no Geode dependency
+core/      learning library (Agent, FailureAnalyzer, Memory, Storage, Json,
+           Physics, Predictor, Overlay) – no Geode dependency
 tests/     unit tests, GD-like simulator, benchmark
-src/       Geode mod: Observer, AIController, SaveWorker, hooks/, ui/
+src/       Geode mod: Observer, AIController, SaveWorker, hooks/, ui/ (StatusPanel, AIMenuPopup, TrajectoryOverlay)
 mod.json   Geode metadata and settings
 ```
 

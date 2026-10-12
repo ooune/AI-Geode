@@ -15,6 +15,43 @@ constexpr float kMaxDy = 90.f;          // 3 blocks above/below
 constexpr float kIndexPadding = 120.f;  // tolerance for objects moved by triggers
 constexpr int kMaxScan = 512;           // hard cap on objects inspected per tick
 
+bool isSpeedPortal(int id) { return id == 200 || id == 201 || id == 202 || id == 203 || id == 1334; }
+
+// Objects that change the player's movement in ways the physics model does not
+// simulate: a predicted path that touches one becomes "uncertain".
+bool isUnmodelled(GameObject* obj) {
+    switch (obj->m_objectType) {
+        case GameObjectType::Slope:
+        case GameObjectType::YellowJumpPad:
+        case GameObjectType::PinkJumpPad:
+        case GameObjectType::GravityPad:
+        case GameObjectType::RedJumpPad:
+        case GameObjectType::SpiderPad:
+        case GameObjectType::InverseGravityPortal:
+        case GameObjectType::NormalGravityPortal:
+        case GameObjectType::GravityTogglePortal:
+        case GameObjectType::ShipPortal:
+        case GameObjectType::CubePortal:
+        case GameObjectType::BallPortal:
+        case GameObjectType::UfoPortal:
+        case GameObjectType::WavePortal:
+        case GameObjectType::RobotPortal:
+        case GameObjectType::SpiderPortal:
+        case GameObjectType::SwingPortal:
+        case GameObjectType::RegularSizePortal:
+        case GameObjectType::MiniSizePortal:
+        case GameObjectType::DualPortal:
+        case GameObjectType::SoloPortal:
+        case GameObjectType::TeleportPortal:
+            return true;
+        case GameObjectType::Solid:
+        case GameObjectType::Breakable:
+            return obj->m_isPassable; // one-way platforms
+        default:
+            return isSpeedPortal(obj->m_objectID);
+    }
+}
+
 std::optional<uint8_t> classify(GameObjectType type) {
     switch (type) {
         case GameObjectType::Hazard:
@@ -63,8 +100,9 @@ void Observer::ensureIndex(PlayLayer* layer) {
     for (auto* obj : CCArrayExt<GameObject*>(layer->m_objects)) {
         if (!obj) continue;
         auto kind = classify(obj->m_objectType);
-        if (!kind) continue;
-        m_items.push_back({obj, obj->getPositionX(), static_cast<Kind>(*kind)});
+        bool unmodelled = isUnmodelled(obj);
+        if (!kind && !unmodelled) continue;
+        m_items.push_back({obj, obj->getPositionX(), kind ? static_cast<Kind>(*kind) : Kind::Other, unmodelled});
     }
     std::sort(m_items.begin(), m_items.end(), [](Item const& a, Item const& b) { return a.x < b.x; });
     m_cursor = 0;
@@ -121,7 +159,7 @@ aigd::Observation Observer::observe(PlayLayer* layer, int32_t tick) {
         auto const& it = m_items[i];
         if (it.x > o.x + kLookAhead + kIndexPadding) break;
         auto* obj = it.object;
-        if (obj->m_isGroupDisabled) continue;
+        if (obj->m_isGroupDisabled || it.kind == Kind::Other) continue;
         auto const& rect = obj->getObjectRect();
         float cx = rect.getMidX();
         float cy = rect.getMidY();
@@ -137,6 +175,31 @@ aigd::Observation Observer::observe(PlayLayer* layer, int32_t tick) {
         }
     }
     return o;
+}
+
+void Observer::collectObstacles(float x0, float x1, std::vector<aigd::Obstacle>& out) const {
+    out.clear();
+    if (m_items.empty()) return;
+    auto it = std::lower_bound(m_items.begin(), m_items.end(), x0 - kIndexPadding,
+                               [](Item const& item, float v) { return item.x < v; });
+    for (; it != m_items.end() && out.size() < kMaxObstacles; ++it) {
+        if (it->x > x1 + kIndexPadding) break;
+        auto* obj = it->object;
+        if (obj->m_isGroupDisabled || obj->m_isNoTouch) continue;
+        auto const& rect = obj->getObjectRect();
+        if (rect.getMaxX() < x0 || rect.getMinX() > x1 || rect.size.width <= 0.f || rect.size.height <= 0.f) continue;
+        aigd::Obstacle o;
+        o.l = rect.getMinX();
+        o.b = rect.getMinY();
+        o.r = rect.getMaxX();
+        o.t = rect.getMaxY();
+        if (it->unmodelled) o.kind = aigd::Obstacle::Kind::Uncertain;
+        else if (it->kind == Kind::Hazard) o.kind = aigd::Obstacle::Kind::Hazard;
+        else if (it->kind == Kind::Solid) o.kind = aigd::Obstacle::Kind::Solid;
+        else o.kind = aigd::Obstacle::Kind::Uncertain; // orbs: act only if pressed inside them
+        out.push_back(o);
+    }
+    std::sort(out.begin(), out.end(), [](aigd::Obstacle const& a, aigd::Obstacle const& b) { return a.l < b.l; });
 }
 
 aigd::DeathInfo Observer::deathInfo(PlayLayer* layer, PlayerObject* player, GameObject* killer) const {

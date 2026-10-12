@@ -37,6 +37,8 @@ AIController& AIController::get() {
 }
 
 AIController::AIController() {
+    m_agent.setPredictor(&m_predictor);
+    m_obstacles.reserve(256);
     loadSettings();
 }
 
@@ -51,6 +53,10 @@ void AIController::loadSettings() {
     m_settings.learningSpeed = static_cast<float>(mod->getSettingValue<double>("learning-speed"));
     m_settings.respawnDelay = static_cast<float>(mod->getSettingValue<double>("respawn-delay"));
     m_settings.trainingSpeed = static_cast<float>(mod->getSettingValue<double>("training-speed"));
+    m_settings.prediction = mod->getSettingValue<bool>("prediction-enabled");
+    m_settings.showTrajectory = mod->getSettingValue<bool>("show-trajectory");
+    m_settings.showAlternative = mod->getSettingValue<bool>("show-alternative");
+    m_settings.predictionHorizon = static_cast<float>(mod->getSettingValue<double>("prediction-horizon"));
     applyAgentConfig();
 }
 
@@ -58,7 +64,9 @@ void AIController::applyAgentConfig() {
     auto cfg = m_agent.config();
     cfg.learningSpeed = std::clamp(m_settings.learningSpeed, 0.f, 1.f);
     cfg.learningEnabled = m_settings.learning;
+    cfg.usePrediction = m_settings.prediction;
     m_agent.setConfig(cfg);
+    m_predictor.setHorizon(static_cast<int>(m_settings.predictionHorizon * aigd::kTicksPerSecond));
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +103,9 @@ void AIController::ensurePatternsLoaded() {
     m_patternsLoaded = true;
     std::string err;
     if (aigd::storage::loadPatternFile(patternsPath(), m_patterns, &err)) {
-        log::info("Loaded pattern memory: {} situations, {} timing stats", m_patterns.q.size(), m_patterns.leads.size());
+        m_physics.loadCalibration(m_patterns.physics);
+        log::info("Loaded pattern memory: {} situations, {} timing stats; physics {}", m_patterns.q.size(),
+                  m_patterns.leads.size(), m_physics.describe());
     } else {
         log::info("No pattern memory yet ({})", err);
     }
@@ -238,6 +248,12 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
     applyTimeScale(true);
     m_observer.ensureIndex(layer);
     auto obs = m_observer.observe(layer, tick);
+    // Hitboxes around the player for the trajectory predictor: a little behind
+    // (for re-simulating the last steps) up to the end of the prediction horizon.
+    float reach = m_settings.predictionHorizon * aigd::unitsPerSecond(obs.speedClass()) * 1.1f;
+    m_observer.collectObstacles(obs.x - 90.f, obs.x + reach + 60.f, m_obstacles);
+    obs.obstacles = m_obstacles;
+    m_predictor.observe(obs, m_holding);
     if (m_level->levelLength < obs.levelLength) m_level->levelLength = obs.levelLength;
 
     if (!m_agent.attemptActive()) {
@@ -251,6 +267,7 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
     bool hold = m_agent.act(obs);
     if (hold != m_holding) press(layer, hold);
     m_lastObs = obs;
+    m_lastObs.obstacles = {}; // the span is only valid for this step
 
     // Watchdog: classic levels always move right; if nothing happens for a
     // while (stuck object, odd trigger setup) restart instead of hanging.
@@ -295,6 +312,7 @@ void AIController::onPlayerDestroyed(PlayLayer* layer, PlayerObject* player, Gam
     auto death = m_observer.deathInfo(layer, player, killer);
     if (m_holding) press(layer, false);
     m_agent.onDeath(obs, death);
+    if (!m_agent.status().predictionNote.empty()) log::info("Prediction check: {}", m_agent.status().predictionNote);
     m_deathPending = true;
     m_deathTimer = 0.f;
     // lastChange is still the change that was tested in this attempt; the plan
@@ -381,6 +399,7 @@ void AIController::saveAsync() {
         m_saver.enqueue(levelPath(snapshot->key), [snapshot] { return aigd::storage::serializeLevel(*snapshot); });
     }
     if (m_patternsLoaded) {
+        m_patterns.physics = m_physics.calibration();
         auto snapshot = std::make_shared<aigd::PatternMemory>(m_patterns);
         m_saver.enqueue(patternsPath(), [snapshot] { return aigd::storage::serializePatterns(*snapshot); });
     }
@@ -436,6 +455,7 @@ void AIController::resetAllMemory() {
     std::filesystem::remove(patternsPath(), ec);
     std::filesystem::remove(patternsPath().string() + ".bak", ec);
     m_patterns = aigd::PatternMemory{};
+    m_physics.reset();
     if (m_level) {
         aigd::LevelMemory fresh;
         fresh.key = m_level->key;
@@ -505,6 +525,14 @@ void AIController::importLevelMemory() {
             notify("Imported memory for level " + (imported.name.empty() ? imported.key : imported.name) + ".", NotificationIcon::Success);
         }
     });
+}
+
+bool AIController::overlayGeometry(aigd::OverlayGeometry& out) const {
+    if (!m_layer || !m_supported || !m_settings.aiEnabled || !m_settings.prediction || !m_settings.showTrajectory) return false;
+    auto const& adv = m_predictor.lastAdvice();
+    if (!adv.valid || !m_agent.attemptActive()) return false;
+    aigd::buildOverlay(m_predictor.bestPath(), m_settings.showAlternative ? &m_predictor.alternativePath() : nullptr, m_obstacles, out);
+    return true;
 }
 
 void AIController::openMemoryFolder() const {

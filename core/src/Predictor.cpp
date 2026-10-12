@@ -103,6 +103,7 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
         out.collisionX = x;
         out.collisionY = y * sg;
         out.obstacle = idx;
+        out.hit = obstacles[static_cast<size_t>(idx)];
     };
 
     for (int step = 0; step < steps; ++step) {

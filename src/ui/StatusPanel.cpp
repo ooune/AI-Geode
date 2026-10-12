@@ -72,6 +72,24 @@ void StatusPanel::refresh() {
         if (st.lastImproved >= 0) text += st.lastImproved ? "\nResult: went further than the previous attempt" : "\nResult: did not get further";
         if (!ai.notice().empty()) text += "\n" + ai.notice();
 
+        if (set.prediction) {
+            auto const& pr = ai.predictor();
+            auto outcome = [](aigd::Certainty c, int32_t ttc) {
+                return ttc >= 0 ? fmt::format("{} in {}", aigd::certaintyName(c), ttc + 1) : std::string(aigd::certaintyName(c));
+            };
+            if (!aigd::Predictor::supports(ai.lastObservation().mode)) {
+                text += fmt::format("\nPrediction: not modelled for {} (learning from experience)", aigd::gameModeName(ai.lastObservation().mode));
+            } else if (!st.predictionValid) {
+                text += "\nPrediction: nothing to avoid ahead";
+            } else {
+                text += fmt::format("\nPrediction: press {} | release {} | {} | avoided {} this attempt",
+                                    outcome(st.pressOutcome, st.pressTTC), outcome(st.releaseOutcome, st.releaseTTC),
+                                    st.predictionTrusted ? fmt::format("model ok, drift {:.3f}/step", pr.model().driftPerTick())
+                                                         : std::string("calibrating - not acting on it yet"),
+                                    st.shieldsThisAttempt);
+            }
+        }
+
         if (set.showDebug) {
             auto const& o = ai.lastObservation();
             auto feat = [](char const* name, aigd::Feature const& f) {
@@ -90,6 +108,21 @@ void StatusPanel::refresh() {
                 "\n[memory] {} level states, {} pattern states, {} hotspots, {} objects indexed",
                 st.tableSize, st.patternSize, mem ? mem->hotspots.size() : 0, ai.indexedObjects()
             );
+            if (set.prediction) {
+                auto const& pr = ai.predictor();
+                auto const& adv = pr.lastAdvice();
+                text += fmt::format(
+                    "\n[physics] {} | step error {:.2f}u (pred y {:.2f} / real {:.2f}) | 32-step error {:.2f}u",
+                    pr.model().describe(), pr.lastStepError(), pr.lastPredictedY(), pr.lastActualY(), pr.model().lastResimError()
+                );
+                text += fmt::format(
+                    "\n[planner] {} sims in {:.0f}us | {} obstacles | best: {} | mispredictions {} (caution {:.2f}) | {}{}",
+                    adv.simulations, adv.micros, ai.obstacleCount(),
+                    adv.bestPresses ? std::string("press now") : (adv.bestPressAt >= 0 ? fmt::format("press in {} steps", adv.bestPressAt) : std::string("no press")),
+                    pr.mispredictions(), pr.caution(), st.planned ? "planned " : "", st.shielded ? "SHIELDED" : ""
+                );
+                if (!st.predictionNote.empty()) text += "\n[last death] " + st.predictionNote;
+            }
         }
     }
 

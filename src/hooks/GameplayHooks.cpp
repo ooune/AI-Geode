@@ -3,6 +3,7 @@
 
 #include "AIController.hpp"
 #include "ui/StatusPanel.hpp"
+#include "ui/TrajectoryOverlay.hpp"
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/AppDelegate.hpp>
@@ -36,6 +37,8 @@ class $modify(AIPlayLayer, PlayLayer) {
     struct Fields {
         PlayLayer* self = nullptr;
         StatusPanel* panel = nullptr;
+        TrajectoryOverlay* overlay = nullptr;
+        aigd::OverlayGeometry geometry;
         float uiTimer = 0.f;
 
         ~Fields() {
@@ -55,6 +58,15 @@ class $modify(AIPlayLayer, PlayLayer) {
         this->addChild(panel, 1000);
         m_fields->panel = panel;
         panel->refresh();
+
+        // The overlay lives in the object layer so it shares world coordinates
+        // with the player and obstacles and scrolls with the camera.
+        if (m_objectLayer) {
+            auto* overlay = TrajectoryOverlay::create();
+            overlay->setID("trajectory-overlay"_spr);
+            m_objectLayer->addChild(overlay, 9999);
+            m_fields->overlay = overlay;
+        }
         return true;
     }
 
@@ -94,6 +106,11 @@ class $modify(AIPlayLayer, PlayLayer) {
         PlayLayer::postUpdate(dt);
         AIController::get().onPostUpdate(this, dt);
         auto& f = m_fields;
+        if (f->overlay) {
+            // once per rendered frame, from the latest plan
+            if (AIController::get().overlayGeometry(f->geometry)) f->overlay->render(f->geometry);
+            else f->overlay->clearAll();
+        }
         f->uiTimer += dt;
         if (f->panel && f->uiTimer >= 0.1f) {
             f->uiTimer = 0.f;

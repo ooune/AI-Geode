@@ -36,7 +36,8 @@ struct PredictedPath {
     Certainty outcome = Certainty::Safe;
     int32_t collisionStep = -1;    // first step with a (definite or potential) collision
     float collisionX = 0.f, collisionY = 0.f;
-    int obstacle = -1;             // index into the obstacle span
+    int obstacle = -1;             // index into the obstacle span used for the simulation
+    Obstacle hit;                  // copy of that obstacle (the span may be refilled later)
     int32_t uncertainFrom = -1;    // step where an unmodelled object was touched
     bool landed = false;
     float landX = 0.f, landY = 0.f;

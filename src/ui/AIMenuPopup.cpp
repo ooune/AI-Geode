@@ -11,9 +11,9 @@
 using namespace geode::prelude;
 
 namespace {
-enum ToggleTag { kAI = 0, kLearning, kAutoRetry, kPractice, kDebug, kPanel };
+enum ToggleTag { kAI = 0, kLearning, kAutoRetry, kPractice, kDebug, kPanel, kPrediction, kTrajectory };
 constexpr float kWidth = 360.f;
-constexpr float kHeight = 260.f;
+constexpr float kHeight = 290.f;
 
 char const* settingKey(int tag) {
     switch (tag) {
@@ -22,6 +22,8 @@ char const* settingKey(int tag) {
         case kPractice: return "practice-mode";
         case kDebug: return "show-debug";
         case kPanel: return "show-panel";
+        case kPrediction: return "prediction-enabled";
+        case kTrajectory: return "show-trajectory";
         default: return "ai-enabled";
     }
 }
@@ -55,9 +57,11 @@ bool AIMenuPopup::init() {
     addToggle(menu, "Practice Mode", kPractice, s.practice, {right, top});
     addToggle(menu, "Show Panel", kPanel, s.showPanel, {right, top - 26.f});
     addToggle(menu, "Show Debug Data", kDebug, s.showDebug, {right, top - 52.f});
+    addToggle(menu, "Prediction", kPrediction, s.prediction, {left, top - 78.f});
+    addToggle(menu, "Show Trajectory", kTrajectory, s.showTrajectory, {right, top - 78.f});
 
     // Learning speed: - [value] +
-    float speedY = top - 82.f;
+    float speedY = top - 108.f;
     auto* speedTitle = CCLabelBMFont::create("Learning Speed", "bigFont.fnt");
     speedTitle->setScale(0.4f);
     speedTitle->setAnchorPoint({0.f, 0.5f});
