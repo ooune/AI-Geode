@@ -79,7 +79,24 @@ char const* alternativePhrase(GameMode mode, bool onGround, bool holding, int b)
 }
 
 constexpr size_t kNone = static_cast<size_t>(-1);
+constexpr size_t kSafetyLogSize = 256;
+
+char const* buttonName(GameMode mode, int a) {
+    if (needsGroundToAct(mode)) return a ? "jump/hold" : "release";
+    return a ? "hold" : "release";
+}
 } // namespace
+
+char const* safetyVerdictName(SafetyVerdict v) {
+    switch (v) {
+        case SafetyVerdict::NoPrediction: return "no prediction";
+        case SafetyVerdict::Clear: return "safe";
+        case SafetyVerdict::Kept: return "kept (danger near)";
+        case SafetyVerdict::Overridden: return "SAFETY OVERRIDE";
+        case SafetyVerdict::NoSafeOption: return "NO SAFE OPTION";
+        default: return "?";
+    }
+}
 
 Agent::Agent(LearnerConfig cfg) : m_cfg(cfg), m_rng(cfg.seed) {}
 
@@ -198,6 +215,11 @@ void Agent::beginAttempt(Observation const& first, bool fromCheckpoint) {
     m_avoidedThisAttempt.clear();
     m_pivot = kNone;
     m_cutAtPivot = false;
+    m_danger = false;
+    m_safetyLog.clear();
+    m_status.overridesThisAttempt = 0;
+    m_status.noSafeOptionThisAttempt = 0;
+    m_status.safety = SafetyRecord{};
     if (m_cfg.learningEnabled && m_pendingExp.active && m_pendingExp.toCell >= xCell(first.x, m_cfg.cellSize)) {
         m_activeExp = std::move(m_pendingExp);
     }
@@ -232,7 +254,12 @@ bool Agent::act(Observation const& obs) {
 
     bool holdingNow = m_curAction == 1;
     uint64_t key = encodeLevelKey(obs, holdingNow, m_cfg.cellSize);
-    if (key == m_curKey && obs.tick - m_lastDecisionTick < m_cfg.maxStickTicks) return holdingNow;
+    // The same discretised state as at the last decision: keep the input -
+    // unless a collision may be near, or the player has left the path that
+    // was predicted for the input being executed. Then every step is checked.
+    bool const watched = m_predictor && m_cfg.usePrediction && !obs.obstacles.empty();
+    bool const offPath = watched && m_predictor->hasExecuted() && m_predictor->offPredictedPath(obs);
+    if (key == m_curKey && obs.tick - m_lastDecisionTick < m_cfg.maxStickTicks && !(watched && (m_danger || offPath))) return holdingNow;
 
     if (!m_steps.empty()) m_steps.back().reward += progressReward(obs.x - m_steps.back().x);
 
@@ -268,7 +295,7 @@ bool Agent::act(Observation const& obs) {
     // find the deciding decision afterwards.
     Predictor::Advice const* adv = nullptr;
     if (m_predictor && m_cfg.usePrediction && !obs.obstacles.empty()) {
-        adv = &m_predictor->advise(obs, holdingNow);
+        adv = &m_predictor->advise(obs, holdingNow, !m_danger && !offPath);
         m_status.predictionValid = adv->valid;
         m_status.predictionTrusted = adv->trusted;
         if (adv->valid) {
@@ -355,53 +382,155 @@ bool Agent::act(Observation const& obs) {
         }
     }
 
-    // Trajectory prediction: simulate pressing vs. releasing before committing.
+    // Trajectory prediction: no learned preference here yet -> follow the
+    // planner's best plan.
     bool planned = false;
     bool shielded = false;
     if (trusted) {
-        // No learned preference here yet: follow the planner's best plan.
         bool opinion = (e->visited(0) || e->visited(1)) && std::fabs(e->q[0] - e->q[1]) > 1e-3f;
         if (!decided && !explored && !opinion) {
             a = adv->bestPresses ? 1 : 0;
             planned = true;
             src = DecisionSource::Planner;
         }
-        // Never execute an action whose every continuation is predicted to
-        // collide while the other action still has a way through. The
-        // rejected action is learned as an imagined death right away, so
-        // the timing does not have to be discovered by dying.
-        Certainty mine = predicted(a);
-        Certainty other = predicted(1 - a);
-        if (mine == Certainty::Collision && other != Certainty::Collision) {
-            int32_t ttc = std::max(0, a ? adv->pressTTC : adv->releaseTTC);
-            if (m_cfg.learningEnabled) {
-                float target = -m_cfg.deathPenalty * std::pow(m_cfg.gammaPerTick, static_cast<float>(ttc));
-                e->q[a] += m_cfg.alpha() * m_cfg.imaginedScale * (target - e->q[a]);
-                if (e->n[a] < 0xFFFF) ++e->n[a]; // it is evidence about this action
-            }
-            if (src != DecisionSource::Planner) {
-                reason = fmt("Collision avoided: %s was predicted to collide in %d steps; %s was not.",
-                             failedPhrase(obs.mode, obs.onGround, holdingNow, a), ttc + 1,
-                             alternativePhrase(obs.mode, obs.onGround, holdingNow, 1 - a));
-            }
-            a = 1 - a;
-            shielded = true;
-            forced = false;
-            explored = false;
-            replayed = false;
-            src = DecisionSource::Shield;
-        }
     }
 
     // Never toggle faster than the configured minimum (prevents input spam).
+    // Applied before the safety check, so that the check judges the action
+    // that will really be executed; the check itself may override it.
     if (a != m_curAction && obs.tick - m_lastToggleTick < m_cfg.minToggleTicks) {
         a = m_curAction;
         forced = false;
         explored = false;
-        shielded = false;
         replayed = false;
+        planned = false;
         src = DecisionSource::Debounce;
     }
+
+    // ---- Safety check on the action about to be executed ----
+    // The prediction of an action is its best continuation ("press now, then
+    // release in 2 steps"). The controller does not promise to follow that
+    // continuation, so an action is only accepted while there is enough time
+    // left to change course: when keeping the current input would require a
+    // change within the slack, the change is made now. An action predicted
+    // to collide is replaced whenever the other one is not.
+    SafetyRecord rec;
+    rec.tick = obs.tick;
+    rec.x = obs.x;
+    rec.y = obs.y;
+    rec.vy = obs.vy;
+    rec.mode = obs.mode;
+    rec.onGround = obs.onGround;
+    rec.holdingBefore = holdingNow;
+    rec.proposed = static_cast<uint8_t>(a);
+    rec.proposedSource = src;
+    bool overridden = false;
+    if (trusted) {
+        rec.predictionCurrent = adv->computedTick == obs.tick && !adv->reused;
+        rec.predictionAge = obs.tick - adv->computedTick;
+        for (int k = 0; k < kActions; ++k) {
+            rec.outcome[k] = adv->outcome(k);
+            rec.ttc[k] = adv->ttc(k);
+            rec.keepFor[k] = adv->keepFor(k);
+        }
+        rec.keep = adv->keep;
+        rec.keepTTC = adv->keepTTC;
+        // Rank both candidates by safety:
+        //   0 predicted collision
+        //   1 no safe continuation, a near miss coming up soon (imminentRiskSteps)
+        //   2 safe, but the input would have to change within the slack
+        //   3 safe with time to spare
+        // "Must change within the slack" only applies to keeping the current
+        // input, or to any input in continuously steered modes (ship, wave),
+        // where whatever is chosen now is held until the next change. It does
+        // not apply to the planner's own choice: the planner follows its plan
+        // and re-plans every step while danger is near, so it makes that
+        // change itself, at the planned moment.
+        int32_t const slack = std::max(1, m_cfg.safetySlackSteps);
+        bool const steered = obs.mode == GameMode::Ship || obs.mode == GameMode::Wave;
+        bool const planCommitted = src == DecisionSource::Planner;
+        int const proposedAction = a;
+        auto margin = [&](int k) {
+            int32_t m = adv->keepForSafe(k);
+            return m >= 0 ? m : adv->keepFor(k);
+        };
+        auto rank = [&](int k) {
+            Certainty o = adv->outcome(k);
+            if (o == Certainty::Collision) return 0;
+            if (o == Certainty::Uncertain && adv->risk(k) >= 0 && adv->risk(k) < m_cfg.imminentRiskSteps) return 1;
+            bool continuing = (k == 1) == holdingNow;
+            if ((continuing || steered) && margin(k) < slack && !(planCommitted && k == proposedAction)) return 2;
+            return 3;
+        };
+        auto describe = [&](int k) {
+            switch (rank(k)) {
+                case 0: return fmt("%s collides in %d steps", buttonName(obs.mode, k), adv->ttc(k) + 1);
+                case 1: return fmt("%s risks a hit in %d steps", buttonName(obs.mode, k), adv->risk(k) + 1);
+                case 2: return fmt("keeping %s leaves %d step(s) to change course", buttonName(obs.mode, k), std::max(0, margin(k)));
+                default:
+                    if (adv->outcome(k) == Certainty::Safe) return fmt("%s is safe (input can stay for %d steps)", buttonName(obs.mode, k), margin(k));
+                    return fmt("%s has no definite hit, but is uncertain further ahead", buttonName(obs.mode, k));
+            }
+        };
+        int const b = 1 - a;
+        int const ra = rank(a);
+        int const rb = rank(b);
+        rec.alternativeAvailable = rb > 0;
+        char const* fresh = rec.predictionCurrent ? "current prediction" : "prediction from an earlier step";
+        if (ra == 3) {
+            rec.verdict = margin(a) < m_cfg.dangerWindowSteps || adv->outcome(a) != Certainty::Safe ? SafetyVerdict::Kept : SafetyVerdict::Clear;
+            if (rec.verdict == SafetyVerdict::Kept) rec.reason = fmt("%s kept: %s (%s)", buttonName(obs.mode, a), describe(a).c_str(), fresh);
+        } else if (rb > ra) {
+            // The other action is safer: execute it. A rejected definite
+            // collision is also learned as an imagined death right away.
+            if (ra == 0 && m_cfg.learningEnabled) {
+                float target = -m_cfg.deathPenalty * std::pow(m_cfg.gammaPerTick, static_cast<float>(std::max(0, adv->ttc(a))));
+                e->q[a] += m_cfg.alpha() * m_cfg.imaginedScale * (target - e->q[a]);
+                if (e->n[a] < 0xFFFF) ++e->n[a]; // it is evidence about this action
+            }
+            rec.verdict = SafetyVerdict::Overridden;
+            rec.reason = fmt("Safety override: %s; executing %s instead: %s (%s)", describe(a).c_str(), buttonName(obs.mode, b),
+                             describe(b).c_str(), fresh);
+            a = b;
+            overridden = true;
+        } else if (ra == 0) {
+            // Every candidate collides: take the one that collides later (more
+            // time for the next step to find a way), and say so.
+            int pick = adv->ttc(b) > adv->ttc(a) ? b : a;
+            rec.verdict = SafetyVerdict::NoSafeOption;
+            rec.reason = fmt("No safe option: release collides in %d, press in %d steps; executing %s (collides later)",
+                             adv->ttc(0) + 1, adv->ttc(1) + 1, buttonName(obs.mode, pick));
+            overridden = pick != a;
+            a = pick;
+        } else {
+            // Not comfortable, but the other action is no better: keep it and
+            // check again next step.
+            rec.verdict = SafetyVerdict::Kept;
+            rec.reason = fmt("%s kept: %s; the other is no better (%s) (%s)", buttonName(obs.mode, a), describe(a).c_str(),
+                             describe(b).c_str(), fresh);
+        }
+        if (overridden) {
+            shielded = true;
+            forced = false;
+            explored = false;
+            replayed = false;
+            planned = false;
+            src = DecisionSource::Shield;
+            reason = rec.reason;
+        }
+        m_danger = rec.verdict != SafetyVerdict::Clear;
+    } else {
+        m_danger = false;
+    }
+    rec.executed = static_cast<uint8_t>(a);
+    if (rec.verdict == SafetyVerdict::Overridden) ++m_status.overridesThisAttempt;
+    if (rec.verdict == SafetyVerdict::NoSafeOption) ++m_status.noSafeOptionThisAttempt;
+    if (rec.verdict != SafetyVerdict::Clear && rec.verdict != SafetyVerdict::NoPrediction) {
+        if (m_safetyLog.size() >= kSafetyLogSize) m_safetyLog.erase(m_safetyLog.begin(), m_safetyLog.begin() + kSafetyLogSize / 2);
+        m_safetyLog.push_back(rec);
+    }
+    m_status.safety = std::move(rec);
+
     if (adv) m_predictor->noteExecuted(a == 1);
     if (shielded) {
         ++m_status.shieldsThisAttempt;
@@ -433,7 +562,7 @@ bool Agent::act(Observation const& obs) {
     s.shielded = shielded;
     s.replayed = replayed;
     s.source = src;
-    if (trusted) {
+    if (trusted && adv->computedTick == obs.tick) {
         s.pred[0] = static_cast<int8_t>(adv->release);
         s.pred[1] = static_cast<int8_t>(adv->press);
     }

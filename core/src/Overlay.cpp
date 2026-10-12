@@ -76,4 +76,50 @@ void buildOverlay(PredictedPath const& main, PredictedPath const* alternative, s
     out.label = buf;
 }
 
+bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decision, int32_t nowTick, bool showAlternative,
+                          std::span<Obstacle const> obstacles, OverlayGeometry& out) {
+    out.clear();
+    auto const& adv = predictor.lastAdvice();
+    out.verdict = decision.verdict;
+    if (!adv.valid || !predictor.hasExecuted()) {
+        out.label = "no prediction (nothing ahead)";
+        return false;
+    }
+    PredictedPath const& main = predictor.executedPath();
+    buildOverlay(main, showAlternative ? &predictor.otherPath() : nullptr, obstacles, out);
+    out.verdict = decision.verdict;
+    out.selectedPress = predictor.executedPress();
+    out.predictionAge = nowTick - adv.computedTick;
+    out.stale = out.predictionAge > 0 || adv.reused;
+    // What would happen without touching the button, when that is not what is
+    // being executed (e.g. the safety layer just changed the input).
+    if (predictor.keepPath().points.size() >= 2 && (decision.holdingBefore != predictor.executedPress())) {
+        auto const& kp = predictor.keepPath().points;
+        size_t prev = 0;
+        for (size_t i = 4; i < kp.size(); i += 4) {
+            out.segments.push_back({kp[prev].x, kp[prev].y, kp[i].x, kp[i].y, OverlayGeometry::Style::Keep});
+            prev = i;
+        }
+    }
+    if (out.stale) {
+        for (auto& sgm : out.segments)
+            if (sgm.style != OverlayGeometry::Style::Alternative && sgm.style != OverlayGeometry::Style::Keep) sgm.style = OverlayGeometry::Style::Stale;
+    }
+
+    char const* button = decision.mode == GameMode::Ship || decision.mode == GameMode::Wave || decision.mode == GameMode::Ufo ||
+                                 decision.mode == GameMode::Swing
+                             ? (out.selectedPress ? "HOLD" : "RELEASE")
+                             : (out.selectedPress ? "PRESS" : "RELEASE");
+    char const* safety = main.outcome == Certainty::Safe ? "safe" : main.outcome == Certainty::Uncertain ? "risky" : "UNSAFE";
+    char buf[192];
+    int n = std::snprintf(buf, sizeof(buf), "%s - %s", button, safety);
+    if (out.hasCollision) n += std::snprintf(buf + n, sizeof(buf) - n, ", hit in %d", out.stepsToCollision);
+    if (!adv.trusted) n += std::snprintf(buf + n, sizeof(buf) - n, " - calibrating, not used");
+    if (decision.verdict == SafetyVerdict::Overridden) n += std::snprintf(buf + n, sizeof(buf) - n, " - SAFETY OVERRIDE");
+    if (decision.verdict == SafetyVerdict::NoSafeOption) n += std::snprintf(buf + n, sizeof(buf) - n, " - NO SAFE OPTION");
+    if (out.stale) std::snprintf(buf + n, sizeof(buf) - n, " - prediction %d step(s) old", out.predictionAge);
+    out.label = buf;
+    return true;
+}
+
 } // namespace aigd

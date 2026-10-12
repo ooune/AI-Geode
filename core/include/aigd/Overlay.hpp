@@ -1,5 +1,6 @@
 #pragma once
 
+#include <aigd/Agent.hpp>
 #include <aigd/Physics.hpp>
 #include <aigd/Predictor.hpp>
 
@@ -23,6 +24,8 @@ struct OverlayGeometry {
         Collision,
         Hazard,
         HazardHit,
+        Keep,     // what keeping the current button state would do
+        Stale,    // a prediction that was not computed for the current step
     };
     struct Segment {
         float x0, y0, x1, y1;
@@ -45,6 +48,11 @@ struct OverlayGeometry {
     int32_t stepsToCollision = -1;
     Certainty outcome = Certainty::Safe;
     std::string label; // e.g. "collision in 37 steps" / "safe"
+    // decision overlay: what the main path is
+    bool selectedPress = false;   // the main path is the executed action's branch with this button state
+    bool stale = false;           // prediction not computed for the current step
+    int32_t predictionAge = 0;
+    SafetyVerdict verdict = SafetyVerdict::NoPrediction;
 
     void clear();
 };
@@ -54,5 +62,14 @@ struct OverlayGeometry {
 // a 180-step prediction becomes ~45 segments.
 void buildOverlay(PredictedPath const& main, PredictedPath const* alternative, std::span<Obstacle const> obstacles,
                   OverlayGeometry& out, int stride = 4, size_t maxHazards = 24);
+
+// The overlay of the decision that was actually executed: the main path is
+// the executed action's branch (never a plan the controller is not
+// following), plus "keep the current input" when that differs, the other
+// action if wanted, and a label with the action, its safety, the time to a
+// collision and whether the safety layer overrode the policy. Returns false
+// when there is nothing current to show (the label then says why).
+bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decision, int32_t nowTick, bool showAlternative,
+                          std::span<Obstacle const> obstacles, OverlayGeometry& out);
 
 } // namespace aigd

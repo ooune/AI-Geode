@@ -387,11 +387,40 @@ float Predictor::score(PredictedPath const& p) const {
     return base + std::min(p.clearance, 30.f);
 }
 
+bool Predictor::sameState(Observation const& obs, bool holding) const {
+    return obs.tick == m_adviceTick && holding == m_adviceHolding && obs.x == m_stateX && obs.y == m_stateY && obs.vy == m_stateVy &&
+           obs.mode == m_computedMode && obs.onGround == m_stateGround && obs.upsideDown == m_stateFlipped;
+}
+
+bool Predictor::offPredictedPath(Observation const& obs) const {
+    // Where the executed branch said the player would be now.
+    PredictedPath const& p = executedPath();
+    int32_t i = obs.tick - m_computedTick - 1;
+    if (!m_executedValid || i < 0 || i >= static_cast<int32_t>(p.points.size())) return true;
+    return std::fabs(p.points[static_cast<size_t>(i)].x - obs.x) > 1.f || std::fabs(p.points[static_cast<size_t>(i)].y - obs.y) > 0.5f;
+}
+
 void Predictor::evaluate(SimStart const& s, std::span<Obstacle const> obs, Plan const& plan, PredictedPath& tmp,
-                         PredictedPath& best, bool& haveBest) {
+                         PredictedPath& best, bool& haveBest, int branch) {
     simulate(s, obs, plan, tmp);
     ++m_advice.simulations;
     ++m_totalSims;
+    if (tmp.outcome != Certainty::Collision) {
+        // How long this plan keeps the branch's first button state.
+        int32_t keep = static_cast<int32_t>(tmp.holds.size());
+        for (size_t i = 1; i < tmp.holds.size(); ++i) {
+            if (tmp.holds[i] != tmp.holds[0]) {
+                keep = static_cast<int32_t>(i);
+                break;
+            }
+        }
+        int32_t& k = branch ? m_advice.pressKeepFor : m_advice.releaseKeepFor;
+        k = std::max(k, keep);
+        if (tmp.outcome == Certainty::Safe) {
+            int32_t& ks = branch ? m_advice.pressKeepForSafe : m_advice.releaseKeepForSafe;
+            ks = std::max(ks, keep);
+        }
+    }
     if (!haveBest || score(tmp) > score(best)) {
         std::swap(tmp, best);
         haveBest = true;
@@ -399,17 +428,30 @@ void Predictor::evaluate(SimStart const& s, std::span<Obstacle const> obs, Plan 
 }
 
 Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding, bool allowReuse) {
-    if (allowReuse && obs.tick == m_adviceTick && holding == m_adviceHolding) return m_advice;
+    // The same state again in the same tick: nothing can have changed.
+    if (sameState(obs, holding) && (allowReuse || m_computedTick == obs.tick)) return m_advice;
     // Reuse the last plan where re-planning cannot change anything (or every
-    // other step for continuously controlled modes).
+    // other step for continuously controlled modes) - but never while a
+    // collision is near, and never once the player is not where the executed
+    // plan said it would be.
     bool reuse = false;
     bool const imminent = !m_advice.bestPresses && m_advice.bestPressAt >= 0 && m_advice.bestPressAt <= 2 + (obs.tick - m_computedTick);
-    if (allowReuse && m_advice.valid && obs.tick > m_adviceTick && holding == m_adviceHolding && obs.mode == m_computedMode && !imminent) {
+    int const ex = m_executedPress ? 1 : 0;
+    // (16 steps: several times the time an input needs to take effect)
+    bool const danger = m_advice.outcome(ex) != Certainty::Safe || m_advice.keepForSafe(ex) < 16;
+    if (allowReuse && m_advice.valid && obs.tick > m_adviceTick && holding == m_adviceHolding && obs.mode == m_computedMode && !imminent &&
+        !danger && holding == m_executedPress && !offPredictedPath(obs)) {
         if (groundOnly(obs.mode) && !holding && !obs.onGround && obs.tick <= m_reuseUntilTick && !m_advice.bestPresses) reuse = true;
         if ((continuousControl(obs.mode) || tapControl(obs.mode)) && obs.tick - m_computedTick < 2) reuse = true;
     }
     if (reuse) {
         m_adviceTick = obs.tick;
+        m_stateX = obs.x;
+        m_stateY = obs.y;
+        m_stateVy = obs.vy;
+        m_stateGround = obs.onGround;
+        m_stateFlipped = obs.upsideDown;
+        m_advice.reused = true;
         m_advice.simulations = 0;
         m_advice.micros = 0.f;
         ++m_reused;
@@ -422,6 +464,16 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     m_computedTick = obs.tick;
     m_computedMode = obs.mode;
     m_adviceHolding = holding;
+    m_advice.computedTick = obs.tick;
+    m_stateX = obs.x;
+    m_stateY = obs.y;
+    m_stateVy = obs.vy;
+    m_stateGround = obs.onGround;
+    m_stateFlipped = obs.upsideDown;
+    m_executedValid = false;
+    m_keep = PredictedPath{};
+    m_press = PredictedPath{};
+    m_release = PredictedPath{};
     if (!supports(obs.mode) || obs.obstacles.empty()) return m_advice;
 
     SimStart s = startFrom(obs, holding);
@@ -447,7 +499,7 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
 
     auto const& span = obs.obstacles;
     bool havePress = false, haveRelease = false;
-    auto press = [&](Plan p) { evaluate(s, span, p, m_tmp, m_press, havePress); };
+    auto press = [&](Plan p) { evaluate(s, span, p, m_tmp, m_press, havePress, 1); };
 
     // ---- branch 1: button down this step ----
     switch (s.mode) {
@@ -475,7 +527,7 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     }
 
     // ---- branch 2: button up this step; never press, or press k steps later ----
-    evaluate(s, span, Plan{-1, 0, 0, false}, m_tmp, m_release, haveRelease);
+    evaluate(s, span, Plan{-1, 0, 0, false}, m_tmp, m_release, haveRelease, 0);
     // Pressing at step k behaves exactly like never pressing up to step k: if
     // "never" already collides by then, so does every later k (no need to simulate).
     int32_t const neverHit = m_release.outcome == Certainty::Collision ? m_release.collisionStep : INT32_MAX;
@@ -510,7 +562,7 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
             if (k > neverHit) {
                 out = Certainty::Collision;
             } else {
-                evaluate(s, span, p, m_tmp, m_release, haveRelease);
+                evaluate(s, span, p, m_tmp, m_release, haveRelease, 0);
                 bool kept = m_release.plan.pressAt == k && m_release.plan.holdFor == p.holdFor && m_release.plan.repeatEvery == p.repeatEvery;
                 out = kept ? m_release.outcome : m_tmp.outcome;
             }
@@ -543,18 +595,27 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     for (size_t i = 0; i < nRefine; ++i) {
         Plan p = shapes[refine[i].second];
         p.pressAt = refine[i].first;
-        evaluate(s, span, p, m_tmp, m_release, haveRelease);
+        evaluate(s, span, p, m_tmp, m_release, haveRelease, 0);
     }
     if ((s.mode == GameMode::Cube || s.mode == GameMode::Robot) && m_release.plan.pressAt > 0) {
         Plan p = m_release.plan;
         p.rejump = true;
-        evaluate(s, span, p, m_tmp, m_release, haveRelease);
+        evaluate(s, span, p, m_tmp, m_release, haveRelease, 0);
     }
 
     m_advice.press = m_press.outcome;
     m_advice.release = m_release.outcome;
     m_advice.pressTTC = m_press.outcome == Certainty::Collision ? m_press.collisionStep : -1;
     m_advice.releaseTTC = m_release.outcome == Certainty::Collision ? m_release.collisionStep : -1;
+    m_advice.pressRisk = m_press.outcome != Certainty::Safe ? m_press.collisionStep : -1;
+    m_advice.releaseRisk = m_release.outcome != Certainty::Safe ? m_release.collisionStep : -1;
+
+    // What happens if nobody touches the button: the current state kept.
+    simulate(s, span, holding ? Plan{0, -1, 0, false} : Plan{-1, 0, 0, false}, m_keep);
+    ++m_advice.simulations;
+    ++m_totalSims;
+    m_advice.keep = m_keep.outcome;
+    m_advice.keepTTC = m_keep.outcome == Certainty::Collision ? m_keep.collisionStep : -1;
     // Prefer not pressing unless pressing now is clearly better: waiting keeps
     // options open. But if the best "wait" plan presses within two steps anyway,
     // waiting gains nothing and risks being too late: press unless waiting is
@@ -578,6 +639,8 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
 }
 
 void Predictor::noteExecuted(bool pressed) {
+    m_executedPress = pressed;
+    m_executedValid = m_advice.valid;
     if (!m_advice.valid) {
         m_expectValid = false;
         return;

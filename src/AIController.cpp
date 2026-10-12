@@ -266,6 +266,11 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
 
     bool hold = m_agent.act(obs);
     if (hold != m_holding) press(layer, hold);
+    // The input sent to the game is exactly the decision that was recorded.
+    if (m_agent.status().safety.tick == tick && (m_agent.status().safety.executed != 0) != m_holding) {
+        log::error("Input mismatch at tick {}: recorded {} but the button is {}", tick, m_agent.status().safety.executed ? "down" : "up",
+                   m_holding ? "down" : "up");
+    }
     m_lastObs = obs;
     m_lastObs.obstacles = {}; // the span is only valid for this step
 
@@ -311,6 +316,16 @@ void AIController::onPlayerDestroyed(PlayLayer* layer, PlayerObject* player, Gam
     obs.dead = true;
     auto death = m_observer.deathInfo(layer, player, killer);
     if (m_holding) press(layer, false);
+    // The safety-critical decisions right before the death, as executed.
+    auto const& safetyLog = m_agent.safetyLog();
+    for (size_t i = safetyLog.size() > 8 ? safetyLog.size() - 8 : 0; i < safetyLog.size(); ++i) {
+        auto const& r = safetyLog[i];
+        log::info("Safety t={} x={:.1f} y={:.1f} vy={:.2f} held={} | release {} (hit {}, keep {}) | press {} (hit {}, keep {}) | "
+                  "proposed {} by {} -> executed {} | {}{} | {}",
+                  r.tick, r.x, r.y, r.vy, r.holdingBefore, aigd::certaintyName(r.outcome[0]), r.ttc[0], r.keepFor[0],
+                  aigd::certaintyName(r.outcome[1]), r.ttc[1], r.keepFor[1], r.proposed, aigd::decisionSourceName(r.proposedSource),
+                  r.executed, aigd::safetyVerdictName(r.verdict), r.predictionCurrent ? "" : " (stale prediction)", r.reason);
+    }
     m_agent.onDeath(obs, death);
     if (!m_agent.status().predictionNote.empty()) log::info("Prediction check: {}", m_agent.status().predictionNote);
     m_deathPending = true;
@@ -529,10 +544,9 @@ void AIController::importLevelMemory() {
 
 bool AIController::overlayGeometry(aigd::OverlayGeometry& out) const {
     if (!m_layer || !m_supported || !m_settings.aiEnabled || !m_settings.prediction || !m_settings.showTrajectory) return false;
-    auto const& adv = m_predictor.lastAdvice();
-    if (!adv.valid || !m_agent.attemptActive()) return false;
-    aigd::buildOverlay(m_predictor.bestPath(), m_settings.showAlternative ? &m_predictor.alternativePath() : nullptr, m_obstacles, out);
-    return true;
+    if (!m_agent.attemptActive()) return false;
+    // The executed decision's path, labelled with what is really being done.
+    return aigd::buildDecisionOverlay(m_predictor, m_agent.status().safety, m_lastTick, m_settings.showAlternative, m_obstacles, out);
 }
 
 void AIController::openMemoryFolder() const {

@@ -73,6 +73,38 @@ struct LearningMetrics {
     uint32_t independentSteps = 0;         // all other decisions
 };
 
+// Outcome of the safety check that runs on the action about to be executed.
+enum class SafetyVerdict : uint8_t {
+    NoPrediction = 0, // no trusted, relevant prediction: nothing was checked
+    Clear,            // the executed action is safe and keeps enough time to change course
+    Kept,             // danger near, but the executed action is still the best available
+    Overridden,       // the proposed action was unsafe and was replaced by a safer one
+    NoSafeOption,     // every candidate is predicted to collide; the least bad one was executed
+};
+char const* safetyVerdictName(SafetyVerdict v);
+
+// One safety-critical decision, as it really happened.
+struct SafetyRecord {
+    int32_t tick = 0;
+    float x = 0.f, y = 0.f, vy = 0.f;
+    GameMode mode = GameMode::Cube;
+    bool onGround = false;
+    bool holdingBefore = false;
+    bool predictionCurrent = false;  // simulated from exactly this state in this step
+    int32_t predictionAge = 0;       // steps since it was simulated (0 = current)
+    Certainty outcome[2] = {Certainty::Safe, Certainty::Safe}; // [release, press]
+    int32_t ttc[2] = {-1, -1};       // steps to a definite collision (-1 none)
+    int32_t keepFor[2] = {-1, -1};   // steps that action can be kept before it must change (-1 never safe)
+    Certainty keep = Certainty::Safe; // keeping the current button state unchanged
+    int32_t keepTTC = -1;
+    uint8_t proposed = 0;            // what the policy/planner wanted
+    DecisionSource proposedSource = DecisionSource::Policy;
+    uint8_t executed = 0;            // what was actually returned to the game
+    SafetyVerdict verdict = SafetyVerdict::NoPrediction;
+    bool alternativeAvailable = false;
+    std::string reason;
+};
+
 struct AgentStatus {
     AgentPhase phase = AgentPhase::Idle;
     uint32_t attempt = 0;          // number of the attempt being played
@@ -119,6 +151,11 @@ struct AgentStatus {
     uint8_t streak[2] = {0, 0};
     std::string lastCredit;        // which decision was blamed for the last death, and why
     LearningMetrics metrics;
+
+    // safety layer
+    SafetyRecord safety;           // the last decision's safety check
+    uint32_t overridesThisAttempt = 0;
+    uint32_t noSafeOptionThisAttempt = 0;
 };
 
 class Agent {
@@ -157,6 +194,8 @@ public:
     Experiment const& activeExperiment() const { return m_activeExp; }
     Experiment const& pendingExperiment() const { return m_pendingExp; }
     FailureReport const& lastReport() const { return m_lastReport; }
+    // Safety-critical decisions of the current/last attempt (most recent last).
+    std::vector<SafetyRecord> const& safetyLog() const { return m_safetyLog; }
 
     // Forget transient search state (used after memory is reset/imported).
     void resetTransient();
@@ -260,6 +299,10 @@ private:
     size_t m_pivot = static_cast<size_t>(-1);
     bool m_cutAtPivot = false;
     std::vector<uint64_t> m_avoidedThisAttempt;  // states where the alternative to a repeated failure was played
+    // Danger near: the executed input may have to change soon, so it is
+    // re-checked every step instead of being kept while the state key is unchanged.
+    bool m_danger = false;
+    std::vector<SafetyRecord> m_safetyLog;
     FailureReport m_lastReport;
     AgentStatus m_status;
 

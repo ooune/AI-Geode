@@ -87,8 +87,31 @@ public:
         int32_t releaseTTC = -1;
         bool bestPresses = false;      // first action of the overall best plan
         int32_t bestPressAt = -1;      // when the overall best plan presses
+        // First step with a definite or potential collision of each branch's
+        // best plan (-1 none); unlike pressTTC also set for "uncertain".
+        int32_t pressRisk = -1;
+        int32_t releaseRisk = -1;
+        // How many steps the button can stay in that state (down / up) and
+        // still have a plan that does not collide: the latest moment the
+        // input must change. -1 = no such plan; the horizon = no change needed.
+        int32_t pressKeepFor = -1;
+        int32_t releaseKeepFor = -1;
+        // The same, counting only plans predicted Safe (no near miss either).
+        int32_t pressKeepForSafe = -1;
+        int32_t releaseKeepForSafe = -1;
+        // Keeping the current button state unchanged for the whole horizon.
+        Certainty keep = Certainty::Safe;
+        int32_t keepTTC = -1;
+        int32_t computedTick = INT32_MIN; // the tick whose state this was simulated from
+        bool reused = false;             // carried over from an earlier tick (not recomputed)
         int simulations = 0;
         float micros = 0.f;
+
+        Certainty outcome(int action) const { return action ? press : release; }
+        int32_t ttc(int action) const { return action ? pressTTC : releaseTTC; }
+        int32_t risk(int action) const { return action ? pressRisk : releaseRisk; }
+        int32_t keepFor(int action) const { return action ? pressKeepFor : releaseKeepFor; }
+        int32_t keepForSafe(int action) const { return action ? pressKeepForSafe : releaseKeepForSafe; }
     };
 
     explicit Predictor(PhysicsModel& model);
@@ -113,7 +136,14 @@ public:
     // Receding-horizon evaluation for the current step (cached per tick; while
     // nothing can change, e.g. a cube in the air, the previous plan is reused
     // unless allowReuse is false).
+    // Advice is only ever returned for exactly the given state (position,
+    // velocity, mode, button): a cached result for a different state is
+    // never handed out. It is not reused across ticks while a collision is
+    // near, or once the player has left the predicted path.
     Advice const& advise(Observation const& obs, bool holding, bool allowReuse = true);
+    // The button state the controller actually executes after the last
+    // advice. The overlay draws that branch, never a plan that is not being
+    // followed.
     void noteExecuted(bool pressed);
 
     // Calibration + accuracy + floor/ceiling tracking: call once per physics
@@ -126,6 +156,13 @@ public:
 
     PredictedPath const& bestPath() const { return m_bestPresses ? m_press : m_release; }
     PredictedPath const& alternativePath() const { return m_bestPresses ? m_release : m_press; }
+    // The branch of the action that was executed (see noteExecuted), the
+    // other one, and "keep the current button state unchanged".
+    PredictedPath const& executedPath() const { return m_executedPress ? m_press : m_release; }
+    PredictedPath const& otherPath() const { return m_executedPress ? m_release : m_press; }
+    PredictedPath const& keepPath() const { return m_keep; }
+    bool executedPress() const { return m_executedPress; }
+    bool hasExecuted() const { return m_executedValid; }
     PredictedPath const& pressPath() const { return m_press; }
     PredictedPath const& releasePath() const { return m_release; }
     Advice const& lastAdvice() const { return m_advice; }
@@ -154,7 +191,15 @@ private:
 
     float score(PredictedPath const& p) const;
     void evaluate(SimStart const& s, std::span<Obstacle const> obs, Plan const& plan, PredictedPath& tmp, PredictedPath& best,
-                  bool& haveBest);
+                  bool& haveBest, int branch);
+    bool sameState(Observation const& obs, bool holding) const;
+
+public:
+    // True when the player is not where the executed branch predicted it
+    // would be now (or there is no such prediction).
+    bool offPredictedPath(Observation const& obs) const;
+
+private:
     void updateBounds(Observation const& obs, bool held);
 
     PhysicsModel& m_model;
@@ -178,8 +223,13 @@ private:
     int32_t m_computedTick = INT32_MIN;   // when the current plan was actually computed
     GameMode m_computedMode = GameMode::Count;
     uint64_t m_reused = 0;
-    PredictedPath m_press, m_release, m_tmp;
+    PredictedPath m_press, m_release, m_tmp, m_keep;
     bool m_bestPresses = false;
+    bool m_executedPress = false;
+    bool m_executedValid = false;
+    // state the current advice was computed for (exact match required)
+    float m_stateX = 0.f, m_stateY = 0.f, m_stateVy = 0.f;
+    bool m_stateGround = false, m_stateFlipped = false;
 
     bool m_expectValid = false;
     Certainty m_expectOutcome = Certainty::Safe;

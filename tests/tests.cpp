@@ -1037,6 +1037,7 @@ TEST(planner_alone_clears_cube_levels) {
                 ++advises;
             }
             if (hold && firstPress < 0) firstPress = t;
+            rig.predictor.noteExecuted(hold);
             rig.held = hold;
             w.step(hold);
             ++ticks;
@@ -1341,6 +1342,7 @@ TEST(all_modes_planner_alone_clears_course) {
                 micros += adv.micros;
                 sims += adv.simulations;
             }
+            rig.predictor.noteExecuted(hold);
             rig.held = hold;
             w.step(hold);
             ++ticks;
@@ -1968,6 +1970,357 @@ TEST(learning_metrics_regression) {
 }
 
 // ---------------------------------------------------------------------------
+// Prediction must control the executed input (regression tests for "the
+// overlay predicted the crash but the AI kept its input and died")
+
+namespace {
+// A learned policy that insists on one action: before every decision the
+// values of the current state are set to prefer `want`, with experience on
+// both actions (so the policy has an opinion and the planner is not asked).
+// Every step also checks that the overlay shows the executed action's path
+// and that the safety record matches the input really applied.
+struct StubbornRun {
+    bool died = false;
+    bool completed = false;
+    float endX = 0.f;
+    int overridden = 0;          // ticks where the executed input differed from what the policy wanted
+    int firstOverrideTick = -1;
+    int overriddenAfterCalm = 0; // ... after `calmAfterX`, where nothing is in the way any more
+    int deathTick = -1;
+    int overlayMismatches = 0;   // overlay main path is not the executed action's branch
+    int recordMismatches = 0;    // safety record disagrees with the applied input / its own verdict
+    int overrideRecords = 0;
+    std::vector<uint8_t> applied; // button state actually applied to the game, per tick
+    std::vector<uint8_t> wanted;
+};
+
+StubbornRun runStubborn(Agent& agent, LevelMemory& mem, sim::Level const& level, PredictionRig& rig,
+                        std::function<int(Observation const&, bool)> const& want, float calmAfterX = 1e9f, int maxTicks = 20000) {
+    StubbornRun r;
+    sim::World w(level);
+    rig.held = false;
+    agent.beginAttempt(rig.observe(w), false);
+    for (int t = 0; t < maxTicks; ++t) {
+        Observation o = rig.observe(w);
+        rig.predictor.observe(o, rig.held);
+        int a = want(o, agent.holding());
+        QEntry& e = mem.q.getOrCreate(encodeLevelKey(o, agent.holding(), agent.config().cellSize));
+        e.q[a] = 5.f;
+        e.q[1 - a] = 0.f;
+        e.n[0] = e.n[1] = 50;
+        bool hold = agent.act(o);
+        auto const& rec = agent.status().safety;
+        if (rec.tick == o.tick) {
+            if ((rec.executed != 0) != hold) ++r.recordMismatches;
+            if (rec.verdict == SafetyVerdict::Overridden && rec.executed == rec.proposed) ++r.recordMismatches;
+            if ((rec.verdict == SafetyVerdict::Clear || rec.verdict == SafetyVerdict::Kept) && rec.executed != rec.proposed) ++r.recordMismatches;
+            if (rec.verdict == SafetyVerdict::Overridden) ++r.overrideRecords;
+            OverlayGeometry g;
+            if (buildDecisionOverlay(rig.predictor, rec, o.tick, false, o.obstacles, g)) {
+                bool const mainIsExecuted = !rig.predictor.executedPath().holds.empty() &&
+                                            (rig.predictor.executedPath().holds.front() != 0) == hold;
+                if (g.selectedPress != hold || !mainIsExecuted) ++r.overlayMismatches;
+                bool saysOverride = g.label.find("SAFETY OVERRIDE") != std::string::npos;
+                if (saysOverride != (rec.verdict == SafetyVerdict::Overridden)) ++r.overlayMismatches;
+            }
+        }
+        r.wanted.push_back(static_cast<uint8_t>(a));
+        r.applied.push_back(hold ? 1 : 0);
+        if ((hold ? 1 : 0) != a) {
+            ++r.overridden;
+            if (r.firstOverrideTick < 0) r.firstOverrideTick = t;
+            if (o.x > calmAfterX) ++r.overriddenAfterCalm;
+        }
+        rig.held = hold;
+        w.step(hold);
+        if (w.dead()) {
+            r.died = true;
+            r.deathTick = t;
+            r.endX = w.x();
+            if (std::getenv("AIGD_SAFETY_DEBUG")) {
+                auto const& log = agent.safetyLog();
+                for (size_t i = log.size() > 30 ? log.size() - 30 : 0; i < log.size(); ++i) {
+                    auto const& s = log[i];
+                    std::printf("      t=%d x=%.1f y=%.1f vy=%.2f held=%d R:%s/%d/k%d P:%s/%d/k%d keep:%s/%d prop=%d exe=%d %s cur=%d | %s\n", s.tick,
+                                s.x, s.y, s.vy, s.holdingBefore, certaintyName(s.outcome[0]), s.ttc[0], s.keepFor[0],
+                                certaintyName(s.outcome[1]), s.ttc[1], s.keepFor[1], certaintyName(s.keep), s.keepTTC, s.proposed,
+                                s.executed, safetyVerdictName(s.verdict), s.predictionCurrent, s.reason.c_str());
+                }
+            }
+            agent.onDeath(w.observe(), w.death());
+            return r;
+        }
+        if (w.complete()) {
+            r.completed = true;
+            r.endX = w.x();
+            agent.onComplete(w.observe());
+            return r;
+        }
+    }
+    r.endX = w.x();
+    agent.abortAttempt(nullptr);
+    return r;
+}
+
+sim::Level shipCorridor(char const* name) {
+    sim::Level l;
+    l.name = name;
+    l.modePortal(1, GameMode::Ship);
+    l.block(3, 7.f, 60.f, 1); // ceiling at 7 blocks
+    return l;
+}
+
+void reportRun(char const* what, StubbornRun const& r) {
+    std::printf("    %s: %s at x=%.0f; input overridden on %d ticks (first at tick %d, %d after the danger), %d overlay / %d record mismatches\n",
+                what, r.completed ? "completed" : "DIED", r.endX, r.overridden, r.firstOverrideTick, r.overriddenAfterCalm,
+                r.overlayMismatches, r.recordMismatches);
+}
+
+void checkConsistent(StubbornRun const& r) {
+    CHECK(r.overlayMismatches == 0); // test G: overlay shows what is executed
+    CHECK(r.recordMismatches == 0);  // diagnostics never claim what did not happen
+}
+} // namespace
+
+TEST(control_A_cube_waiting_into_a_spike_jumps_instead) {
+    // The policy insists on not jumping; waiting will hit the spike, jumping
+    // (in time) clears it. The controller must jump.
+    PredictionRig rig;
+    warmUp(rig);
+    sim::Level level = spikeLevel("control-a", {14.f}, 24.f);
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = runStubborn(agent, mem, level, rig, [](Observation const&, bool) { return 0; }, 15.5f * kBlock);
+    reportRun("cube, policy 'never jump'", r);
+    CHECK(r.completed);
+    CHECK(r.overridden > 0);
+    CHECK(r.overriddenAfterCalm == 0); // not latched: the policy is back in control after the spike
+    checkConsistent(r);
+}
+
+TEST(control_A2_cube_jumping_into_a_spike_waits_instead) {
+    // The policy insists on jumping whenever on the ground; a jump right now
+    // lands on the spike, a later one clears it.
+    PredictionRig rig;
+    warmUp(rig);
+    sim::Level level = spikeLevel("control-a2", {4.4f}, 14.f);
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = runStubborn(agent, mem, level, rig, [](Observation const& o, bool) { return o.onGround ? 1 : 0; });
+    reportRun("cube, policy 'always jump'", r);
+    CHECK(r.completed);
+    CHECK(r.overridden > 0);
+    checkConsistent(r);
+}
+
+TEST(control_B_ship_holding_into_ceiling_spikes_releases_in_time) {
+    // Holding is safe at first; as the ship approaches spikes under the
+    // ceiling, keeping the button held becomes fatal. The controller must
+    // release before that becomes unavoidable.
+    PredictionRig rig;
+    warmUpMode(rig, GameMode::Ship);
+    sim::Level level = shipCorridor("control-b");
+    for (float b = 22.f; b < 30.f; b += 1.f) level.spike(b, 6.f);
+    level.finish(40.f);
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = runStubborn(agent, mem, level, rig, [](Observation const& o, bool) { return o.mode == GameMode::Ship ? 1 : 0; },
+                         31.f * kBlock);
+    reportRun("ship, policy 'hold' toward ceiling spikes", r);
+    CHECK(r.completed);
+    // Test F: the held button is really released, against the policy.
+    bool releasedAfterHolding = false;
+    for (size_t t = 1; t < r.applied.size(); ++t)
+        if (r.applied[t - 1] == 1 && r.applied[t] == 0 && r.wanted[t] == 1) releasedAfterHolding = true;
+    CHECK(releasedAfterHolding);
+    CHECK(r.overriddenAfterCalm == 0);
+    checkConsistent(r);
+}
+
+TEST(control_C_ship_flying_low_into_a_wall_climbs) {
+    // The policy keeps the ship down; a wall rises from the floor ahead.
+    PredictionRig rig;
+    warmUpMode(rig, GameMode::Ship);
+    sim::Level level = shipCorridor("control-c");
+    level.block(24.f, 0.f, 1.f, 3.f);
+    level.finish(40.f);
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = runStubborn(agent, mem, level, rig, [](Observation const&, bool) { return 0; });
+    reportRun("ship, policy 'release' toward a wall", r);
+    CHECK(r.completed);
+    bool pressed = false;
+    for (size_t t = 0; t < r.applied.size(); ++t)
+        if (r.applied[t] == 1 && r.wanted[t] == 0) pressed = true;
+    CHECK(pressed); // the actual input changed, against the policy
+    checkConsistent(r);
+}
+
+TEST(control_C2_ship_through_a_gap) {
+    // Wall from the floor and a block from the ceiling: a gap in the middle.
+    // Policy alternates stubbornly between "always hold" and "always release"
+    // every 120 ticks; neither is a way through.
+    PredictionRig rig;
+    warmUpMode(rig, GameMode::Ship);
+    sim::Level level = shipCorridor("control-c2");
+    level.block(24.f, 0.f, 1.f, 2.f);
+    level.block(24.f, 5.f, 1.f, 2.f);
+    level.block(34.f, 0.f, 1.f, 3.f);
+    level.finish(45.f);
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = runStubborn(agent, mem, level, rig, [](Observation const& o, bool) { return (o.tick / 120) % 2; });
+    reportRun("ship, alternating policy through a gap", r);
+    CHECK(r.completed);
+    checkConsistent(r);
+}
+
+TEST(control_D_stale_prediction_cannot_authorise_the_old_action) {
+    // Advice is computed for one state; then, in the same tick, the state
+    // is different. The answer must be for the new state, and so must the
+    // decision built on it.
+    PredictionRig rig;
+    warmUp(rig);
+    sim::Level level = spikeLevel("control-d", {8.f}, 14.f);
+    sim::World w(level);
+    Observation far = rig.observe(w);  // spike 7.5 blocks ahead: waiting is fine for a long time
+    rig.predictor.observe(far, false);
+    auto const adv1 = rig.predictor.advise(far, false);
+    Observation near = far;            // same tick, right before the spike
+    near.x = 8.f * kBlock - 40.f;
+    near.hazard.dx = 40.f;
+    auto const adv2 = rig.predictor.advise(near, false);
+    float firstX = rig.predictor.releasePath().points.empty() ? 0.f : rig.predictor.releasePath().points.front().x;
+    std::printf("    far: wait possible for %d steps | near, same tick: %d steps; path starts at x=%.1f (state x=%.1f)\n",
+                adv1.releaseKeepForSafe, adv2.releaseKeepForSafe, firstX, near.x);
+    CHECK(adv2.computedTick == near.tick && !adv2.reused);
+    CHECK(std::fabs(firstX - near.x) < 3.f);
+    CHECK(adv2.releaseKeepForSafe < adv1.releaseKeepForSafe);
+
+    // Through the agent: decide at `far`, then at `near` in the same tick.
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    agent.beginAttempt(far, false);
+    agent.act(far);
+    agent.act(near);
+    auto const& rec = agent.status().safety;
+    CHECK(rec.x == near.x && rec.predictionCurrent);
+    CHECK(rec.keepFor[0] == adv2.releaseKeepFor);
+    agent.abortAttempt(nullptr);
+}
+
+TEST(control_E_no_viable_alternative_is_reported_honestly) {
+    // Directly before a spike, too close to jump over it: every candidate
+    // collides. The controller must say so and not claim a safe path.
+    PredictionRig rig;
+    warmUp(rig);
+    sim::Level level = spikeLevel("control-e", {8.f}, 14.f);
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    sim::World w(level);
+    w.reset(8.f * kBlock - 28.f);
+    Observation o = rig.observe(w);
+    rig.predictor.observe(o, false);
+    agent.beginAttempt(o, false);
+    agent.act(o);
+    auto const& rec = agent.status().safety;
+    std::printf("    press %s (hit %d), release %s (hit %d) | %s | %s\n", certaintyName(rec.outcome[1]), rec.ttc[1],
+                certaintyName(rec.outcome[0]), rec.ttc[0], safetyVerdictName(rec.verdict), rec.reason.c_str());
+    CHECK(rec.outcome[0] == Certainty::Collision && rec.outcome[1] == Certainty::Collision);
+    CHECK(rec.verdict == SafetyVerdict::NoSafeOption);
+    CHECK(!rec.alternativeAvailable);
+    CHECK(rec.reason.find("No safe option") != std::string::npos);
+    OverlayGeometry g;
+    buildDecisionOverlay(rig.predictor, rec, o.tick, false, o.obstacles, g);
+    std::printf("    overlay: %s\n", g.label.c_str());
+    CHECK(g.label.find("NO SAFE OPTION") != std::string::npos);
+    CHECK(g.label.find("safe -") == std::string::npos);
+    CHECK(g.outcome == Certainty::Collision);
+    agent.abortAttempt(nullptr);
+}
+
+TEST(control_cost_per_step_with_safety_layer) {
+    // Wall-clock cost of a whole decision (observe, predict, decide, safety
+    // check) per physics step, for the learning agent with prediction.
+    for (GameMode m : {GameMode::Cube, GameMode::Ship, GameMode::Wave, GameMode::Spider}) {
+        PredictionRig rig;
+        warmUpMode(rig, m);
+        sim::Level level = sim::modeCourse(m);
+        LevelMemory mem = freshLevel(level);
+        PatternMemory pat;
+        Agent agent;
+        agent.attach(&mem, &pat);
+        agent.setPredictor(&rig.predictor);
+        sim::World w(level);
+        rig.held = false;
+        agent.beginAttempt(rig.observe(w), false);
+        auto t0 = std::chrono::steady_clock::now();
+        int ticks = 0;
+        uint64_t sims0 = rig.predictor.totalSimulations();
+        for (; ticks < 100000 && !w.dead() && !w.complete(); ++ticks) {
+            Observation o = rig.observe(w);
+            rig.predictor.observe(o, rig.held);
+            bool hold = agent.act(o);
+            rig.held = hold;
+            w.step(hold);
+        }
+        double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / std::max(1, ticks);
+        std::printf("    %-6s %s: %.0f us and %.1f simulations per physics step (%d steps; %.1f%% of a core at 1x, %.0f%% at 4x)\n",
+                    gameModeName(m), w.complete() ? "completed" : "died", us,
+                    double(rig.predictor.totalSimulations() - sims0) / std::max(1, ticks), ticks, us * 240.0 / 1e4, us * 960.0 / 1e4);
+        if (w.dead()) agent.onDeath(w.observe(), w.death());
+        else if (w.complete()) agent.onComplete(w.observe());
+        CHECK(us < 2000.0);
+    }
+}
+
+TEST(control_H_learning_still_works_with_the_safety_layer) {
+    // The safety layer changes what is executed, not how learning works: the
+    // agent with prediction still learns the levels, records outcome
+    // evidence per state, and keeps it through save/reload.
+    for (auto const& level : {sim::levelShip(), sim::levelBlocks()}) {
+        PredictionRig rig;
+        warmUp(rig);
+        LevelMemory mem = freshLevel(level);
+        PatternMemory pat;
+        Agent agent;
+        agent.attach(&mem, &pat);
+        agent.setPredictor(&rig.predictor);
+        auto r = train(agent, level, 300, &rig);
+        size_t evidence = countIf(mem.q, [](QEntry const& e) { return e.hasEvidence(); });
+        std::printf("    %-7s with prediction: completed after %d attempts, %zu states with evidence\n", level.name.c_str(),
+                    r.attemptsToComplete, evidence);
+        CHECK(r.attemptsToComplete > 0);
+        CHECK(evidence > 0);
+        LevelMemory loaded;
+        std::string err;
+        CHECK(storage::deserializeLevel(storage::serializeLevel(mem), loaded, &err));
+        CHECK(countIf(loaded.q, [](QEntry const& e) { return e.hasEvidence(); }) == evidence);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Benchmark (not run by default)
 
 static void runBench() {
@@ -2085,6 +2438,37 @@ static void diag(sim::Level const& level, int attempts) {
         }
     }
 }
+// Diagnostic with trajectory prediction (run with AIGD_DIAG_PRED=<level>):
+// the safety decisions before every death.
+TEST(diag_level_prediction) {
+    char const* which = std::getenv("AIGD_DIAG_PRED");
+    if (!which) return;
+    for (auto const& level : sim::allLevels()) {
+        if (level.name != which) continue;
+        PredictionRig rig;
+        warmUp(rig);
+        LevelMemory mem = freshLevel(level);
+        PatternMemory pat;
+        Agent agent;
+        agent.attach(&mem, &pat);
+        agent.setPredictor(&rig.predictor);
+        for (int i = 0; i < 50; ++i) {
+            auto r = runAttempt(agent, level, &rig);
+            std::printf("    #%d %s at x=%.1f | %s\n", i + 1, r.completed ? "COMPLETED" : "died", r.endX, agent.status().lastCredit.c_str());
+            if (r.completed) break;
+            auto const& log = agent.safetyLog();
+            for (size_t k = log.size() > 160 ? log.size() - 160 : 0; k < log.size(); ++k) {
+                auto const& s = log[k];
+                std::printf("      t=%d x=%.1f y=%.1f vy=%.2f %s held=%d R:%s/%d/k%d P:%s/%d/k%d prop=%d(%s) exe=%d %s | %s\n", s.tick, s.x, s.y,
+                            s.vy, gameModeName(s.mode), s.holdingBefore, certaintyName(s.outcome[0]), s.ttc[0], s.keepFor[0],
+                            certaintyName(s.outcome[1]), s.ttc[1], s.keepFor[1], s.proposed, decisionSourceName(s.proposedSource), s.executed,
+                            safetyVerdictName(s.verdict), s.reason.c_str());
+            }
+            std::printf("      prediction: %s\n", agent.status().predictionNote.c_str());
+        }
+    }
+}
+
 TEST(diag_level) {
     char const* which = std::getenv("AIGD_DIAG");
     if (!which) return;

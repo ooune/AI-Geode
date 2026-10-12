@@ -43,6 +43,10 @@ struct LearnerConfig {
     // --- Trajectory prediction ---
     bool usePrediction = true;        // plan with the physics model and block predicted collisions
     float imaginedScale = 0.5f;       // weight of "imagined" deaths learned from predictions
+    // Safety layer (all in physics steps, i.e. time, so they hold at any speed):
+    int safetySlackSteps = 3;         // change the input while at least this many steps remain to do so
+    int dangerWindowSteps = 16;       // re-check every step while a change may be needed within this many steps
+    int imminentRiskSteps = 12;       // a possible (uncertain) hit this soon counts as unsafe if the other action is safe
 
     // --- Input hygiene ---
     int minToggleTicks = 2;           // never change the button state faster than this

@@ -85,11 +85,20 @@ void StatusPanel::refresh() {
             } else if (!st.predictionValid) {
                 text += "\nPrediction: nothing to avoid ahead";
             } else {
-                text += fmt::format("\nPrediction: press {} | release {} | {} | avoided {} this attempt",
+                auto const& sf = st.safety;
+                text += fmt::format("\nPrediction: press {} | release {} | {}",
                                     outcome(st.pressOutcome, st.pressTTC), outcome(st.releaseOutcome, st.releaseTTC),
                                     st.predictionTrusted ? fmt::format("model ok, drift {:.3f}/step", pr.model().driftPerTick(ai.lastObservation().mode))
-                                                         : std::string("calibrating - not acting on it yet"),
-                                    st.shieldsThisAttempt);
+                                                         : std::string("calibrating - not acting on it yet"));
+                if (st.predictionTrusted) {
+                    text += fmt::format("\nExecuting: {} ({}) | safety: {}{} | overrides this attempt {}, no safe option {}",
+                                        sf.executed ? "button down" : "button up",
+                                        sf.executed == sf.proposed ? fmt::format("as proposed by {}", aigd::decisionSourceName(sf.proposedSource))
+                                                                   : fmt::format("{} wanted the other", aigd::decisionSourceName(sf.proposedSource)),
+                                        aigd::safetyVerdictName(sf.verdict), sf.predictionCurrent ? "" : " (stale prediction)",
+                                        st.overridesThisAttempt, st.noSafeOptionThisAttempt);
+                    if (!sf.reason.empty()) text += "\nSafety: " + sf.reason;
+                }
             }
         }
 

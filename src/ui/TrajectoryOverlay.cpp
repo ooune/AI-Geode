@@ -16,6 +16,8 @@ ccColor4F color(Style s) {
         case Style::Collision: return {1.f, 0.1f, 0.1f, 1.f};
         case Style::Hazard: return {1.f, 0.6f, 0.1f, 0.8f};
         case Style::HazardHit: return {1.f, 0.1f, 0.1f, 1.f};
+        case Style::Keep: return {0.85f, 0.45f, 1.f, 0.6f};
+        case Style::Stale: return {0.6f, 0.6f, 0.6f, 0.7f};
         default: return {1.f, 1.f, 1.f, 1.f};
     }
 }
@@ -57,7 +59,7 @@ void TrajectoryOverlay::render(aigd::OverlayGeometry const& g) {
         m_draw->drawRect(CCRect(b.l, b.b, b.r - b.l, b.t - b.b), none, w, color(b.style));
     }
     for (auto const& s : g.segments) {
-        float r = s.style == Style::Alternative ? 1.f : 1.6f;
+        float r = s.style == Style::Alternative || s.style == Style::Keep ? 1.f : 1.6f;
         m_draw->drawSegment({s.x0, s.y0}, {s.x1, s.y1}, r, color(s.style));
     }
     for (auto const& d : g.dots) {
