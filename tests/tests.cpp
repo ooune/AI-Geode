@@ -9,6 +9,9 @@
 
 #include <aigd/Agent.hpp>
 #include <aigd/FailureAnalyzer.hpp>
+#include <aigd/Overlay.hpp>
+#include <aigd/Physics.hpp>
+#include <aigd/Predictor.hpp>
 #include <aigd/Json.hpp>
 #include <aigd/StateKey.hpp>
 #include <aigd/Storage.hpp>
@@ -82,12 +85,32 @@ struct AttemptResult {
     bool completed;
 };
 
-AttemptResult runAttempt(Agent& agent, sim::Level const& level, int maxTicks = 100000) {
-    sim::World world(level);
-    agent.beginAttempt(world.observe(), false);
+// Trajectory prediction attached to a training run, fed exactly like the mod
+// feeds it in game: obstacles around the player + one observation per step.
+struct PredictionRig {
+    PhysicsModel model;
+    Predictor predictor{model};
+    std::vector<Obstacle> obstacles;
+    bool held = false;
+
+    Observation observe(sim::World const& world) {
+        Observation o = world.observe();
+        world.collectObstacles(o.x - 90.f, o.x + 480.f, obstacles);
+        o.obstacles = obstacles;
+        return o;
+    }
+};
+
+AttemptResult runAttempt(Agent& agent, sim::Level const& level, PredictionRig* rig = nullptr, int speedClass = 1,
+                         int maxTicks = 100000) {
+    sim::World world(level, speedClass);
+    agent.beginAttempt(rig ? rig->observe(world) : world.observe(), false);
+    if (rig) rig->held = false;
     for (int t = 0; t < maxTicks; ++t) {
-        Observation obs = world.observe();
+        Observation obs = rig ? rig->observe(world) : world.observe();
+        if (rig) rig->predictor.observe(obs, rig->held);
         bool hold = agent.act(obs);
+        if (rig) rig->held = hold;
         world.step(hold);
         if (world.dead()) {
             Observation last = world.observe();
@@ -109,10 +132,10 @@ struct TrainResult {
     std::vector<AttemptResult> attempts;
 };
 
-TrainResult train(Agent& agent, sim::Level const& level, int maxAttempts) {
+TrainResult train(Agent& agent, sim::Level const& level, int maxAttempts, PredictionRig* rig = nullptr) {
     TrainResult r;
     for (int i = 0; i < maxAttempts; ++i) {
-        auto a = runAttempt(agent, level);
+        auto a = runAttempt(agent, level, rig);
         r.attempts.push_back(a);
         if (a.completed) {
             r.attemptsToComplete = i + 1;
@@ -682,6 +705,430 @@ TEST(per_tick_cost_is_small) {
     );
     CHECK(usPerTick < 50.0);
     CHECK(msUpdate < 20.0);
+}
+
+// ---------------------------------------------------------------------------
+// Trajectory prediction
+
+namespace {
+// Calibrates the physics model the way the first seconds of a real attempt
+// would: flat ground with a jump every 150 steps.
+void warmUp(PredictionRig& rig, int speedClass = 1) {
+    sim::Level flat;
+    flat.name = "flat";
+    flat.finish(400);
+    sim::World w(flat, speedClass);
+    rig.held = false;
+    for (int t = 0; t < 2400 && !w.complete(); ++t) {
+        Observation o = rig.observe(w);
+        rig.predictor.observe(o, rig.held);
+        bool hold = (t % 150) < 2;
+        rig.held = hold;
+        w.step(hold);
+    }
+}
+
+sim::Level spikeLevel(char const* name, std::initializer_list<float> spikes, float length = 60.f) {
+    sim::Level l;
+    l.name = name;
+    for (float b : spikes) l.spike(b);
+    l.finish(length);
+    return l;
+}
+
+struct Truth {
+    bool died = false;
+    int32_t tick = 0;
+    float x = 0.f, y = 0.f;
+    bool landed = false;
+    float landX = 0.f, landY = 0.f;
+};
+
+// Ground truth from the simulator: press at step `pressAt` and hold until take-off.
+Truth groundTruth(sim::Level const& level, int pressAt, float passX, int speedClass = 1) {
+    sim::World w(level, speedClass);
+    Truth r;
+    int takeoffs = 0;
+    bool airborne = false;
+    for (int t = 0; t < 4000; ++t) {
+        bool onGround = w.observe().onGround;
+        bool hold = pressAt >= 0 && t >= pressAt && takeoffs < 1;
+        w.step(hold);
+        auto o = w.observe();
+        if (hold && onGround && !o.onGround) ++takeoffs;
+        if (!o.onGround) airborne = true;
+        if (airborne && o.onGround && !r.landed) {
+            r.landed = true;
+            r.landX = o.x;
+            r.landY = o.y;
+        }
+        if (w.dead()) {
+            r.died = true;
+            r.tick = o.tick;
+            r.x = w.death().x;
+            r.y = w.death().y;
+            return r;
+        }
+        if (w.x() > passX || w.complete()) {
+            r.tick = o.tick;
+            return r;
+        }
+    }
+    return r;
+}
+
+PredictedPath predict(PredictionRig& rig, sim::Level const& level, Plan plan, int speedClass = 1) {
+    sim::World w(level, speedClass);
+    Observation o = rig.observe(w);
+    PredictedPath p;
+    rig.predictor.simulate(Predictor::startFrom(o, false), o.obstacles, plan, p);
+    return p;
+}
+
+struct Sweep {
+    int agree = 0, falseSafe = 0, falseCollision = 0, uncertain = 0, total = 0;
+};
+
+Sweep sweepTimings(PredictionRig& rig, sim::Level const& level, int from, int to, float passX) {
+    Sweep s;
+    for (int k = from; k <= to; ++k) {
+        Truth t = groundTruth(level, k, passX);
+        PredictedPath p = predict(rig, level, Plan{k, false});
+        // only judge the prediction up to the point the ground truth covered
+        bool predHit = p.outcome == Certainty::Collision && p.collisionStep + 1 <= t.tick + 2;
+        bool predSafe = p.outcome == Certainty::Safe || (p.outcome == Certainty::Collision && !predHit);
+        ++s.total;
+        if (p.outcome == Certainty::Uncertain) ++s.uncertain;
+        else if (t.died && predHit) ++s.agree;
+        else if (!t.died && predSafe) ++s.agree;
+        else if (t.died) ++s.falseSafe;
+        else ++s.falseCollision;
+    }
+    return s;
+}
+} // namespace
+
+TEST(physics_calibration_learns_the_game) {
+    PredictionRig rig;
+    rig.predictor.setHorizon(400);
+    // Defaults are Geometry Dash's measured values; the simulator deliberately
+    // uses slightly different physics, so these must be learned.
+    CHECK(std::fabs(rig.model.cube(false).gravity - sim::World::kGravity) > 0.004f);
+    CHECK(!rig.model.calibrated(false));
+    warmUp(rig);
+    auto const& p = rig.model.cube(false);
+    std::printf("    learned: %s, vx=%.4f, drift %.4f/step\n", rig.model.describe().c_str(), rig.model.vxPerTick(1), rig.model.driftPerTick());
+    CHECK(rig.model.calibrated(false));
+    CHECK(std::fabs(p.gravity - sim::World::kGravity) < 0.002f);
+    CHECK(std::fabs(p.yScale - 1.f / sim::World::kVyScale) < 0.002f);
+    CHECK(std::fabs(p.takeoffVy - (sim::World::kJumpVy - sim::World::kGravity)) < 0.05f);
+    CHECK(std::fabs(p.floorY - sim::World::kHalf) < 0.5f);
+    CHECK(std::fabs(rig.model.vxPerTick(1) - aigd::unitsPerSecond(1) / 240.f) < 0.01f);
+    CHECK(rig.model.accuracySamples() > 10);
+    CHECK(rig.model.driftPerTick() < 0.02f);
+    CHECK(rig.predictor.trusted(false));
+}
+
+TEST(prediction_standing_still_before_spike) {
+    PredictionRig rig;
+    warmUp(rig);
+    rig.predictor.setHorizon(400);
+    auto level = spikeLevel("one", {6.f});
+    PredictedPath p = predict(rig, level, Plan{-1, false});
+    Truth t = groundTruth(level, -1, 400.f);
+    CHECK(t.died);
+    CHECK(p.outcome == Certainty::Collision);
+    std::printf("    predicted collision at step %d (x=%.1f), simulator died at step %d (x=%.1f)\n", p.collisionStep + 1, p.collisionX, t.tick, t.x);
+    CHECK(std::abs((p.collisionStep + 1) - t.tick) <= 1);
+    CHECK(std::fabs(p.collisionX - t.x) < 2.f);
+}
+
+TEST(prediction_jump_timings_single_spike) {
+    PredictionRig rig;
+    warmUp(rig);
+    rig.predictor.setHorizon(400);
+    auto level = spikeLevel("one", {6.f});
+    Sweep s = sweepTimings(rig, level, 20, 130, 320.f);
+    std::printf("    %d timings: %d agree, %d uncertain, %d false-safe, %d false-collision\n", s.total, s.agree, s.uncertain, s.falseSafe, s.falseCollision);
+    CHECK(s.falseSafe == 0);
+    CHECK(s.agree >= s.total * 85 / 100);
+    // both "too early" and "too late" timings exist in this range and are predicted
+    CHECK(groundTruth(level, 20, 320.f).died);   // far too early: lands on the spike
+    CHECK(groundTruth(level, 130, 320.f).died);  // too late: runs into it
+}
+
+TEST(prediction_jump_timings_consecutive_spikes) {
+    PredictionRig rig;
+    warmUp(rig);
+    rig.predictor.setHorizon(400);
+    auto level = spikeLevel("triple", {6.f, 7.f, 8.f});
+    Sweep s = sweepTimings(rig, level, 40, 130, 380.f);
+    int safeTimings = 0;
+    for (int k = 40; k <= 130; ++k) safeTimings += groundTruth(level, k, 380.f).died ? 0 : 1;
+    std::printf("    %d timings (%d survivable): %d agree, %d uncertain, %d false-safe, %d false-collision\n", s.total, safeTimings, s.agree,
+                s.uncertain, s.falseSafe, s.falseCollision);
+    CHECK(safeTimings > 0);
+    CHECK(s.falseSafe == 0);
+    CHECK(s.agree >= s.total * 85 / 100);
+}
+
+TEST(prediction_landing_positions) {
+    PredictionRig rig;
+    warmUp(rig);
+    rig.predictor.setHorizon(400);
+    // flat ground
+    {
+        auto level = spikeLevel("flat", {});
+        Truth t = groundTruth(level, 10, 600.f);
+        PredictedPath p = predict(rig, level, Plan{10, false});
+        CHECK(t.landed && p.landed);
+        std::printf("    flat: predicted landing x=%.2f y=%.2f, simulator x=%.2f y=%.2f\n", p.landX, p.landY, t.landX, t.landY);
+        CHECK(std::fabs(p.landX - t.landX) < 1.5f);
+        CHECK(std::fabs(p.landY - t.landY) < 0.5f);
+    }
+    // landing on a block before the next obstacle
+    {
+        sim::Level level;
+        level.name = "step";
+        level.block(8, 0, 4, 1);
+        level.spike(14);
+        level.finish(40);
+        int found = -1;
+        Truth t;
+        for (int k = 60; k < 200 && found < 0; ++k) {
+            t = groundTruth(level, k, 400.f);
+            if (!t.died && t.landed && std::fabs(t.landY - 45.f) < 0.5f) found = k;
+        }
+        CHECK(found >= 0);
+        if (found >= 0) {
+            PredictedPath p = predict(rig, level, Plan{found, false});
+            std::printf("    block top: predicted landing x=%.2f y=%.2f, simulator x=%.2f y=%.2f (press at %d)\n", p.landX, p.landY, t.landX, t.landY, found);
+            CHECK(p.landed);
+            CHECK(std::fabs(p.landY - 45.f) < 0.5f);
+            CHECK(std::fabs(p.landX - t.landX) < 1.5f);
+        }
+    }
+}
+
+TEST(prediction_different_speeds) {
+    for (int sc : {0, 2, 4}) {
+        PredictionRig rig;
+        warmUp(rig, sc);
+        rig.predictor.setHorizon(400);
+        auto level = spikeLevel("one", {10.f});
+        PredictedPath p = predict(rig, level, Plan{-1, false}, sc);
+        Truth t = groundTruth(level, -1, 600.f, sc);
+        std::printf("    speed %d: vx=%.3f, predicted hit step %d, simulator %d\n", sc, rig.model.vxPerTick(sc), p.collisionStep + 1, t.tick);
+        CHECK(p.outcome == Certainty::Collision);
+        CHECK(std::abs((p.collisionStep + 1) - t.tick) <= 1);
+        Sweep s = sweepTimings(rig, level, 0, 400 / (sc + 1), 600.f);
+        CHECK(s.falseSafe == 0);
+    }
+}
+
+TEST(prediction_gravity_changes) {
+    PredictionRig rig;
+    warmUp(rig);
+    rig.predictor.setHorizon(400);
+    // A gravity portal ahead is not simulated: the path must not be called safe.
+    {
+        sim::Level level;
+        level.name = "portal";
+        level.gravityPortal(6);
+        level.spike(12);
+        level.finish(40);
+        PredictedPath p = predict(rig, level, Plan{-1, false});
+        CHECK(p.outcome == Certainty::Uncertain);
+        CHECK(p.uncertainFrom > 0);
+    }
+    // Upside down (after a portal): "falls" up onto the underside of a ceiling.
+    {
+        sim::Level level;
+        level.name = "ceiling";
+        level.block(0, 4, 40, 1); // y 120..150
+        level.finish(40);
+        sim::World w(level);
+        w.place(60.f, 60.f, 0.f, false, true);
+        Observation o = rig.observe(w);
+        PredictedPath p;
+        rig.predictor.simulate(Predictor::startFrom(o, false), o.obstacles, Plan{-1, false}, p);
+        float landX = 0.f, landY = 0.f;
+        for (int t = 0; t < 200; ++t) {
+            w.step(false);
+            if (w.observe().onGround) {
+                landX = w.observe().x;
+                landY = w.observe().y;
+                break;
+            }
+        }
+        std::printf("    upside down: predicted landing x=%.2f y=%.2f, simulator x=%.2f y=%.2f\n", p.landX, p.landY, landX, landY);
+        CHECK(p.landed);
+        CHECK(std::fabs(p.landY - 105.f) < 0.5f && std::fabs(landY - 105.f) < 0.5f);
+        CHECK(std::fabs(p.landX - landX) < 1.5f);
+    }
+}
+
+TEST(prediction_overlay_matches_simulation) {
+    PredictionRig rig;
+    warmUp(rig);
+    rig.predictor.setHorizon(400);
+    auto level = spikeLevel("one", {6.f});
+    sim::World w(level);
+    Observation o = rig.observe(w);
+    PredictedPath main, alt;
+    rig.predictor.simulate(Predictor::startFrom(o, false), o.obstacles, Plan{-1, false}, main);
+    rig.predictor.simulate(Predictor::startFrom(o, false), o.obstacles, Plan{95, false}, alt);
+    OverlayGeometry g;
+    buildOverlay(main, &alt, o.obstacles, g, 4);
+    CHECK(g.outcome == Certainty::Collision);
+    CHECK(g.hasCollision);
+    CHECK(g.collisionX == main.collisionX && g.collisionY == main.collisionY);
+    CHECK(g.stepsToCollision == main.collisionStep + 1);
+    CHECK(g.label.find("collision in") != std::string::npos);
+    // every vertex of the main path drawing is a simulated point, in order, ending at the last one
+    std::vector<OverlayGeometry::Segment> mainSegs;
+    for (auto const& s : g.segments) if (s.style == OverlayGeometry::Style::PathDanger) mainSegs.push_back(s);
+    CHECK(!mainSegs.empty());
+    CHECK(mainSegs.front().x0 == main.points.front().x && mainSegs.front().y0 == main.points.front().y);
+    CHECK(mainSegs.back().x1 == main.points.back().x && mainSegs.back().y1 == main.points.back().y);
+    bool allOnPath = true;
+    for (auto const& s : mainSegs) {
+        bool found = false;
+        for (auto const& pt : main.points) found |= (pt.x == s.x1 && pt.y == s.y1);
+        allOnPath &= found;
+    }
+    CHECK(allOnPath);
+    // the hazard that is hit is marked, at its real hitbox
+    bool hitMarked = false;
+    for (auto const& b : g.boxes) {
+        if (b.style == OverlayGeometry::Style::HazardHit) {
+            auto const& h = o.obstacles[static_cast<size_t>(main.obstacle)];
+            hitMarked = b.l == h.l && b.r == h.r && b.b == h.b && b.t == h.t;
+        }
+    }
+    CHECK(hitMarked);
+    // alternative path drawn separately, safe path style when not colliding
+    size_t altSegs = 0;
+    for (auto const& s : g.segments) altSegs += s.style == OverlayGeometry::Style::Alternative ? 1 : 0;
+    CHECK(altSegs > 0);
+    buildOverlay(alt, nullptr, o.obstacles, g, 4);
+    CHECK(alt.outcome == Certainty::Safe);
+    CHECK(g.outcome == Certainty::Safe && !g.hasCollision);
+}
+
+TEST(planner_alone_clears_cube_levels) {
+    // Drive the simulator with nothing but the receding-horizon planner (no
+    // learning): re-plan every step, execute only the first action.
+    for (auto const& level : {sim::levelBasics(), sim::levelSpikes(), sim::levelBlocks()}) {
+        PredictionRig rig;
+        warmUp(rig);
+        sim::World w(level);
+        int firstPress = -1;
+        double micros = 0;
+        int advises = 0, sims = 0, ticks = 0;
+        for (int t = 0; t < 100000 && !w.dead() && !w.complete(); ++t) {
+            Observation o = rig.observe(w);
+            rig.predictor.observe(o, rig.held);
+            auto const& adv = rig.predictor.advise(o, rig.held);
+            bool hold = adv.valid && adv.bestPresses;
+            if (adv.valid) {
+                micros += adv.micros;
+                sims += adv.simulations;
+                ++advises;
+            }
+            if (hold && firstPress < 0) firstPress = t;
+            rig.held = hold;
+            w.step(hold);
+            ++ticks;
+        }
+        std::printf("    %-7s planner only: %s at %.1f%%, first press at step %d; %.1f us per physics step on average "
+                    "(%.1f simulations per step, %d evaluated steps)\n",
+                    level.name.c_str(), w.complete() ? "COMPLETED" : "died", w.observe().progress() * 100.f, firstPress,
+                    ticks ? micros / ticks : 0.0, ticks ? double(sims) / ticks : 0.0, advises);
+        CHECK(w.complete());
+        // it waits for the right moment instead of jumping straight away
+        CHECK(firstPress > 100);
+    }
+}
+
+TEST(prediction_makes_learning_faster) {
+    for (auto const& level : {sim::levelBasics(), sim::levelSpikes(), sim::levelBlocks(), sim::levelShip()}) {
+        LevelMemory m1 = freshLevel(level), m2 = freshLevel(level);
+        PatternMemory p1, p2;
+        Agent with, without;
+        PredictionRig rig;
+        with.attach(&m1, &p1);
+        with.setPredictor(&rig.predictor);
+        without.attach(&m2, &p2);
+        auto a = train(with, level, 1500, &rig);
+        auto b = train(without, level, 1500);
+        std::printf("    %-7s attempts to complete: %d with prediction (%llu collisions avoided), %d without\n", level.name.c_str(),
+                    a.attemptsToComplete, static_cast<unsigned long long>(with.status().shieldsTotal), b.attemptsToComplete);
+        CHECK(a.attemptsToComplete > 0);
+        if (level.name != "ship") CHECK(a.attemptsToComplete <= std::max(3, b.attemptsToComplete / 2));
+    }
+}
+
+TEST(prediction_learning_survives_reload_and_stays_consistent) {
+    auto level = sim::levelSpikes();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    PredictionRig rig;
+    Agent agent;
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = train(agent, level, 200, &rig);
+    CHECK(r.attemptsToComplete > 0);
+    int completed = 0;
+    for (int i = 0; i < 20; ++i) completed += runAttempt(agent, level, &rig).completed ? 1 : 0;
+    CHECK(completed >= 19);
+    // the calibration is plain data and round-trips through the pattern file
+    pat.physics = rig.model.calibration();
+    PatternMemory loaded;
+    std::string err;
+    CHECK(storage::deserializePatterns(storage::serializePatterns(pat), loaded, &err));
+    PhysicsModel m2;
+    m2.loadCalibration(loaded.physics);
+    CHECK(m2.calibrated(false));
+    CHECK(std::fabs(m2.cube(false).gravity - rig.model.cube(false).gravity) < 1e-5f);
+}
+
+TEST(misprediction_makes_predictor_cautious) {
+    PredictionRig rig;
+    warmUp(rig);
+    auto level = spikeLevel("one", {6.f});
+    sim::World w(level);
+    Observation o = rig.observe(w);
+    auto const& adv = rig.predictor.advise(o, false);
+    CHECK(adv.valid && adv.release == Certainty::Safe);
+    rig.predictor.noteExecuted(false);
+    float before = rig.predictor.caution();
+    // pretend the player died right after a "safe" prediction
+    rig.predictor.onDeath(o.tick + 1, o.x + 1.f, o.y);
+    CHECK(rig.predictor.mispredictions() == 1);
+    CHECK(rig.predictor.caution() > before);
+    CHECK(rig.predictor.lastDeathComparison().find("MISPREDICTION") != std::string::npos);
+    CHECK(rig.predictor.margin(10, false) > 0.5f);
+}
+
+TEST(prediction_is_not_trusted_before_calibration) {
+    PredictionRig rig; // GD defaults, no observations of this "game"
+    auto level = spikeLevel("one", {6.f});
+    sim::World w(level);
+    Observation o = rig.observe(w);
+    auto const& adv = rig.predictor.advise(o, false);
+    CHECK(adv.valid);
+    CHECK(!adv.trusted);
+    // an untrusted agent hook must not override anything
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent;
+    agent.attach(&mem, &pat);
+    PredictionRig fresh;
+    agent.setPredictor(&fresh.predictor);
+    agent.beginAttempt(o, false);
+    agent.act(o);
+    CHECK(!agent.status().shielded && !agent.status().planned);
 }
 
 // ---------------------------------------------------------------------------

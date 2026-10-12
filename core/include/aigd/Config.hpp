@@ -28,6 +28,10 @@ struct LearnerConfig {
     int stuckAttempts = 20;           // attempts without a new best before escalating
     int maxExperimentsPerHotspot = 10;
 
+    // --- Trajectory prediction ---
+    bool usePrediction = true;        // plan with the physics model and block predicted collisions
+    float imaginedScale = 0.5f;       // weight of "imagined" deaths learned from predictions
+
     // --- Input hygiene ---
     int minToggleTicks = 2;           // never change the button state faster than this
     int maxStickTicks = 24;           // re-evaluate at least this often

@@ -22,7 +22,7 @@ using aigd::GameMode;
 using aigd::KillerKind;
 using aigd::Observation;
 
-enum class ObjKind { Spike, Block, ShipPortal, CubePortal };
+enum class ObjKind { Spike, Block, ShipPortal, CubePortal, GravityPortal };
 
 struct Obj {
     ObjKind kind;
@@ -41,6 +41,7 @@ struct Level {
     }
     void shipPortal(float bx) { objs.push_back({ObjKind::ShipPortal, bx * 30.f, 0.f, 30.f, 600.f}); }
     void cubePortal(float bx) { objs.push_back({ObjKind::CubePortal, bx * 30.f, 0.f, 30.f, 600.f}); }
+    void gravityPortal(float bx) { objs.push_back({ObjKind::GravityPortal, bx * 30.f, 0.f, 30.f, 600.f}); }
     void finish(float blocks) {
         length = blocks * 30.f;
         std::sort(objs.begin(), objs.end(), [](Obj const& a, Obj const& b) { return a.x < b.x; });
@@ -61,6 +62,8 @@ public:
     static constexpr float kShipUp = 0.12f;
     static constexpr float kShipDown = 0.10f;
     static constexpr float kShipMax = 8.f;
+    static constexpr float kInner = 4.5f;         // inner hitbox half size (solids only kill here)
+    static Rect spikeHitbox(Obj const& o) { return Rect{o.x + 10.5f, o.y + 3.f, o.x + 19.5f, o.y + 18.f}; }
 
     explicit World(Level const& level, int speedClass = 1) : m_level(level), m_speedClass(speedClass) { reset(); }
 
@@ -70,6 +73,7 @@ public:
         m_vy = 0.f;
         m_mode = GameMode::Cube;
         m_onGround = true;
+        m_upsideDown = false;
         m_dead = false;
         m_complete = false;
         m_tick = 0;
@@ -78,7 +82,43 @@ public:
             if (o.x + o.w > startX) break;
             if (o.kind == ObjKind::ShipPortal) m_mode = GameMode::Ship;
             if (o.kind == ObjKind::CubePortal) m_mode = GameMode::Cube;
+            if (o.kind == ObjKind::GravityPortal) m_upsideDown = !m_upsideDown;
         }
+        m_portalsPassed = 0;
+        for (auto const& o : m_level.objs)
+            if (o.kind == ObjKind::GravityPortal && o.x + o.w <= startX) ++m_portalsPassed;
+    }
+
+    // Starts the player at an arbitrary state (for predictor tests).
+    void place(float x, float y, float vy, bool onGround, bool upsideDown = false) {
+        m_x = x;
+        m_y = y;
+        m_vy = vy;
+        m_onGround = onGround;
+        m_upsideDown = upsideDown;
+        m_portalsPassed = 0;
+        for (auto const& o : m_level.objs)
+            if (o.kind == ObjKind::GravityPortal && o.x + o.w * 0.5f <= x) ++m_portalsPassed;
+    }
+
+    // Collision shapes near x, sorted by left edge, in the form the predictor uses.
+    void collectObstacles(float x0, float x1, std::vector<aigd::Obstacle>& out) const {
+        out.clear();
+        for (auto const& o : m_level.objs) {
+            if (o.x > x1) break;
+            if (o.x + o.w < x0) continue;
+            aigd::Obstacle ob;
+            if (o.kind == ObjKind::Spike) {
+                Rect r = spikeHitbox(o);
+                ob = {r.l, r.b, r.r, r.t, aigd::Obstacle::Kind::Hazard};
+            } else if (o.kind == ObjKind::Block) {
+                ob = {o.x, o.y, o.x + o.w, o.y + o.h, aigd::Obstacle::Kind::Solid};
+            } else {
+                ob = {o.x, o.y, o.x + o.w, o.y + o.h, aigd::Obstacle::Kind::Uncertain};
+            }
+            out.push_back(ob);
+        }
+        std::sort(out.begin(), out.end(), [](aigd::Obstacle const& a, aigd::Obstacle const& b) { return a.l < b.l; });
     }
 
     Observation observe() const {
@@ -89,6 +129,7 @@ public:
         o.vy = m_vy;
         o.mode = m_mode;
         o.onGround = m_onGround;
+        o.upsideDown = m_upsideDown;
         o.dead = m_dead;
         o.playerSpeed = kSpeeds[m_speedClass];
         o.levelLength = m_level.length;
@@ -98,19 +139,24 @@ public:
     }
 
     // Advances one physics step with the button held or released.
+    // Cube rules follow GD: holding on the ground jumps (also right after a
+    // landing, on the next step); blocks are landed on from above (or from
+    // below when upside down) and only kill when the small inner hitbox
+    // enters them; spikes kill on contact with the outer hitbox.
     void step(bool hold) {
         if (m_dead || m_complete) return;
         ++m_tick;
         float vx = aigd::unitsPerSecond(m_speedClass) / aigd::kTicksPerSecond;
+        float sg = m_upsideDown ? -1.f : 1.f;
         float prevBottom = m_y - kHalf;
         float prevTop = m_y + kHalf;
 
         if (m_mode == GameMode::Cube) {
             if (m_onGround && hold) {
-                m_vy = kJumpVy;
+                m_vy = sg * kJumpVy;
                 m_onGround = false;
             }
-            if (!m_onGround) m_vy -= kGravity;
+            if (!m_onGround) m_vy -= sg * kGravity;
         } else {
             m_vy += hold ? kShipUp : -kShipDown;
             m_vy = std::clamp(m_vy, -kShipMax, kShipMax);
@@ -118,16 +164,17 @@ public:
         m_x += vx;
         m_y += m_vy / kVyScale;
 
-        // ground
+        // the level floor (stood on only when gravity is normal)
         bool grounded = false;
         if (m_y - kHalf <= 0.f) {
             m_y = kHalf;
             if (m_vy < 0.f) m_vy = 0.f;
-            grounded = true;
+            grounded = !m_upsideDown || m_mode != GameMode::Cube;
         }
 
         Rect player{m_x - kHalf, m_y - kHalf, m_x + kHalf, m_y + kHalf};
-        for (auto const& o : m_level.objs) {
+        for (size_t idx = 0; idx < m_level.objs.size(); ++idx) {
+            auto const& o = m_level.objs[idx];
             if (o.x > m_x + 60.f) break;
             if (o.x + o.w < m_x - 60.f) continue;
             if (o.kind == ObjKind::ShipPortal || o.kind == ObjKind::CubePortal) {
@@ -136,9 +183,21 @@ public:
                 }
                 continue;
             }
+            if (o.kind == ObjKind::GravityPortal) {
+                // flip once when the player centre passes the portal centre
+                int passed = 0;
+                for (auto const& g : m_level.objs)
+                    if (g.kind == ObjKind::GravityPortal && g.x + g.w * 0.5f <= m_x) ++passed;
+                if (passed > m_portalsPassed) {
+                    m_portalsPassed = passed;
+                    m_upsideDown = !m_upsideDown;
+                    m_onGround = false;
+                    grounded = false;
+                }
+                continue;
+            }
             if (o.kind == ObjKind::Spike) {
-                Rect hb{o.x + 10.5f, o.y + 3.f, o.x + 19.5f, o.y + 18.f};
-                if (player.overlaps(hb)) {
+                if (player.overlaps(spikeHitbox(o))) {
                     die(o, KillerKind::Hazard);
                     return;
                 }
@@ -146,34 +205,50 @@ public:
             }
             Rect blk{o.x, o.y, o.x + o.w, o.y + o.h};
             if (!player.overlaps(blk)) continue;
-            if (prevBottom >= blk.t - 2.f && m_vy <= 0.f) {
-                // landed on top
-                m_y = blk.t + kHalf;
+            Rect inner{m_x - kInner, m_y - kInner, m_x + kInner, m_y + kInner};
+            if (m_mode == GameMode::Ship) {
+                if (prevBottom >= blk.t - 2.f && m_vy <= 0.f) {
+                    m_y = blk.t + kHalf;
+                    m_vy = 0.f;
+                    grounded = true;
+                } else if (prevTop <= blk.b + 2.f && m_vy >= 0.f) {
+                    m_y = blk.b - kHalf; // ship slides along ceilings
+                    m_vy = 0.f;
+                } else {
+                    die(o, KillerKind::Solid);
+                    return;
+                }
+                player = Rect{m_x - kHalf, m_y - kHalf, m_x + kHalf, m_y + kHalf};
+                continue;
+            }
+            bool falling = sg * m_vy <= 0.f;
+            bool landTop = !m_upsideDown && falling && prevBottom >= blk.t - 2.f;
+            bool landBottom = m_upsideDown && falling && prevTop <= blk.b + 2.f;
+            if (landTop || landBottom) {
+                m_y = landTop ? blk.t + kHalf : blk.b - kHalf;
                 m_vy = 0.f;
                 grounded = true;
-                player = Rect{m_x - kHalf, m_y - kHalf, m_x + kHalf, m_y + kHalf};
-            } else if (m_mode == GameMode::Ship && prevTop <= blk.b + 2.f && m_vy >= 0.f) {
-                // ship slides along ceilings
-                m_y = blk.b - kHalf;
+            } else if (!falling && (m_upsideDown ? prevBottom >= blk.t - 2.f : prevTop <= blk.b + 2.f)) {
+                // rising into a block: bumped back unless the inner hitbox got in
+                if (inner.overlaps(blk)) {
+                    die(o, KillerKind::Solid);
+                    return;
+                }
+                m_y = m_upsideDown ? blk.t + kHalf : blk.b - kHalf;
                 m_vy = 0.f;
-                player = Rect{m_x - kHalf, m_y - kHalf, m_x + kHalf, m_y + kHalf};
-            } else {
+            } else if (inner.overlaps(blk)) {
                 die(o, KillerKind::Solid);
                 return;
             }
+            player = Rect{m_x - kHalf, m_y - kHalf, m_x + kHalf, m_y + kHalf};
         }
 
         // still supported? (walking off the edge of a block)
-        if (!grounded && m_mode == GameMode::Cube && m_vy <= 0.f) {
+        if (!grounded && m_mode == GameMode::Cube && sg * m_vy <= 0.f && m_onGround) {
             grounded = supported();
             if (grounded) m_vy = 0.f;
         }
         m_onGround = grounded;
-        if (m_mode == GameMode::Cube && m_onGround && hold) {
-            // GD 2.2: holding the button re-jumps immediately on landing.
-            m_vy = kJumpVy;
-            m_onGround = false;
-        }
 
         if (m_x >= m_level.length) m_complete = true;
     }
@@ -191,18 +266,22 @@ private:
     float m_x = 0, m_y = 0, m_vy = 0;
     GameMode m_mode = GameMode::Cube;
     bool m_onGround = true;
+    bool m_upsideDown = false;
+    int m_portalsPassed = 0;
     bool m_dead = false;
     bool m_complete = false;
     int32_t m_tick = 0;
     DeathInfo m_death;
 
     bool supported() const {
-        if (m_y - kHalf <= 0.5f) return true;
+        if (!m_upsideDown && m_y - kHalf <= 0.5f) return true;
         for (auto const& o : m_level.objs) {
             if (o.kind != ObjKind::Block) continue;
             if (o.x > m_x + kHalf) break;
             if (o.x + o.w <= m_x - kHalf) continue;
-            if (std::fabs((o.y + o.h) - (m_y - kHalf)) < 0.75f) return true;
+            float surface = m_upsideDown ? o.y : o.y + o.h;
+            float edge = m_upsideDown ? m_y + kHalf : m_y - kHalf;
+            if (std::fabs(surface - edge) < 0.75f) return true;
         }
         return false;
     }

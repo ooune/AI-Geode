@@ -1,5 +1,6 @@
 #pragma once
 
+#include <aigd/Physics.hpp>
 #include <aigd/Types.hpp>
 
 #include <cmath>
@@ -154,6 +155,7 @@ struct PatternMemory {
     static constexpr int kFormatVersion = 1;
     QTable q;
     std::map<uint32_t, TimingStat> leads;
+    PhysicsCalibration physics; // what the trajectory predictor learned about the game's physics
 };
 
 } // namespace aigd

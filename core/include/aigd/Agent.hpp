@@ -3,6 +3,7 @@
 #include <aigd/Config.hpp>
 #include <aigd/FailureAnalyzer.hpp>
 #include <aigd/Memory.hpp>
+#include <aigd/Predictor.hpp>
 #include <aigd/Trajectory.hpp>
 #include <aigd/Types.hpp>
 
@@ -64,6 +65,20 @@ struct AgentStatus {
     size_t tableSize = 0;
     size_t patternSize = 0;
     size_t decisions = 0;
+
+    // trajectory prediction
+    bool predictionValid = false;
+    bool predictionTrusted = false;
+    Certainty pressOutcome = Certainty::Safe;
+    Certainty releaseOutcome = Certainty::Safe;
+    int32_t pressTTC = -1;
+    int32_t releaseTTC = -1;
+    bool planned = false;
+    bool shielded = false;
+    uint32_t shieldsThisAttempt = 0;
+    uint32_t plannedThisAttempt = 0;
+    uint64_t shieldsTotal = 0;
+    std::string predictionNote;    // predicted vs. actual at the last death
 };
 
 class Agent {
@@ -76,6 +91,10 @@ public:
     // Memory is owned by the caller and must outlive the attachment.
     void attach(LevelMemory* level, PatternMemory* patterns);
     void detach();
+    // Optional trajectory predictor (not owned). Without it the agent learns
+    // purely from experience, as before.
+    void setPredictor(Predictor* predictor) { m_predictor = predictor; }
+    Predictor* predictor() const { return m_predictor; }
     bool attached() const { return m_level != nullptr; }
     LevelMemory* level() const { return m_level; }
 
@@ -159,6 +178,7 @@ private:
     LearnerConfig m_cfg;
     LevelMemory* m_level = nullptr;
     PatternMemory* m_patterns = nullptr;
+    Predictor* m_predictor = nullptr;
     std::mt19937 m_rng;
 
     // per attempt

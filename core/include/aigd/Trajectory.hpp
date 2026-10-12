@@ -23,6 +23,8 @@ struct Step {
     uint8_t action = 0;    // 0 = released, 1 = held
     bool forced = false;   // chosen by a timing experiment
     bool explored = false; // chosen by random exploration
+    bool planned = false;  // chosen by the trajectory planner (no learned preference yet)
+    bool shielded = false; // the predicted collision of the other action was avoided
 };
 
 // A contiguous stretch of steps with the button held.

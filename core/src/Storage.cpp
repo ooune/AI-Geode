@@ -276,6 +276,25 @@ std::string serializePatterns(PatternMemory const& P) {
         out += ']';
     }
     out += "],";
+    key(out, "physics");
+    out += '[';
+    {
+        bool firstNum = true;
+        auto num = [&](double v) {
+            if (!firstNum) out += ',';
+            firstNum = false;
+            appendNumber(out, v);
+        };
+        for (auto const& s : P.physics.size) {
+            num(s.gSum); num(s.gSq); num(s.gN); num(s.kYV); num(s.kVV); num(s.kN);
+            num(s.v0Sum); num(s.v0N); num(s.fallCap); num(s.fallCapN); num(s.floorY); num(s.floorN);
+        }
+        for (int i = 0; i < 5; ++i) {
+            num(P.physics.vxSum[i]);
+            num(P.physics.vxN[i]);
+        }
+    }
+    out += "],";
     key(out, "q");
     writeQTable(out, P.q);
     out += '}';
@@ -298,6 +317,22 @@ bool deserializePatterns(std::string_view text, PatternMemory& out, std::string*
         s.sumSq = row.at(2).asNumber();
         s.count = static_cast<uint32_t>(row.at(3).asInt());
         P.leads[static_cast<uint32_t>(row.at(0).asInt())] = s;
+    }
+    auto const& ph = d.get("physics");
+    if (ph.isArray() && ph.size() == 2 * 12 + 10) {
+        size_t i = 0;
+        auto next = [&]() { return ph.at(i++).asNumber(); };
+        for (auto& s : P.physics.size) {
+            s.gSum = next(); s.gSq = next(); s.gN = static_cast<uint32_t>(next());
+            s.kYV = next(); s.kVV = next(); s.kN = static_cast<uint32_t>(next());
+            s.v0Sum = next(); s.v0N = static_cast<uint32_t>(next());
+            s.fallCap = static_cast<float>(next()); s.fallCapN = static_cast<uint32_t>(next());
+            s.floorY = static_cast<float>(next()); s.floorN = static_cast<uint32_t>(next());
+        }
+        for (int k = 0; k < 5; ++k) {
+            P.physics.vxSum[k] = next();
+            P.physics.vxN[k] = static_cast<uint32_t>(next());
+        }
     }
     if (!readQTable(d.get("q"), P.q, error)) return false;
     out = std::move(P);

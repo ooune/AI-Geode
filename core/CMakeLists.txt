@@ -3,6 +3,9 @@ add_library(aigd_core STATIC
     src/Agent.cpp
     src/FailureAnalyzer.cpp
     src/Json.cpp
+    src/Overlay.cpp
+    src/Physics.cpp
+    src/Predictor.cpp
     src/Storage.cpp
     src/Types.cpp
 )

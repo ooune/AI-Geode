@@ -194,6 +194,8 @@ void Agent::beginAttempt(Observation const& first, bool fromCheckpoint) {
     m_rng.seed(m_cfg.seed ^ ((m_level->totalAttempts + 1) * 2654435761u));
     m_status.phase = AgentPhase::Playing;
     m_status.attempt = m_level->totalAttempts + 1;
+    m_status.shieldsThisAttempt = 0;
+    m_status.plannedThisAttempt = 0;
     m_status.lastChange = m_nextChange;
     m_status.progress = first.progress();
     refreshStatus();
@@ -241,12 +243,61 @@ bool Agent::act(Observation const& obs) {
         }
     }
 
+    // Trajectory prediction: simulate pressing vs. releasing before committing.
+    bool planned = false;
+    bool shielded = false;
+    bool advised = false;
+    if (m_predictor && m_cfg.usePrediction && !obs.obstacles.empty()) {
+        auto const& adv = m_predictor->advise(obs, holdingNow);
+        advised = true;
+        m_status.predictionValid = adv.valid;
+        m_status.predictionTrusted = adv.trusted;
+        if (adv.valid) {
+            m_status.pressOutcome = adv.press;
+            m_status.releaseOutcome = adv.release;
+            m_status.pressTTC = adv.pressTTC;
+            m_status.releaseTTC = adv.releaseTTC;
+        }
+        if (adv.valid && adv.trusted) {
+            // No learned preference here yet: follow the planner's best plan.
+            bool opinion = (e->visited(0) || e->visited(1)) && std::fabs(e->q[0] - e->q[1]) > 1e-3f;
+            if (!forced && !explored && !opinion) {
+                a = adv.bestPresses ? 1 : 0;
+                planned = true;
+            }
+            // Never execute an action whose every continuation is predicted to
+            // collide while the other action still has a way through. The
+            // rejected action is learned as an imagined death right away, so
+            // the timing does not have to be discovered by dying.
+            Certainty mine = a ? adv.press : adv.release;
+            Certainty other = a ? adv.release : adv.press;
+            if (mine == Certainty::Collision && other != Certainty::Collision) {
+                if (m_cfg.learningEnabled) {
+                    int32_t ttc = std::max(0, a ? adv.pressTTC : adv.releaseTTC);
+                    float target = -m_cfg.deathPenalty * std::pow(m_cfg.gammaPerTick, static_cast<float>(ttc));
+                    e->q[a] += m_cfg.alpha() * m_cfg.imaginedScale * (target - e->q[a]);
+                }
+                a = 1 - a;
+                shielded = true;
+                forced = false;
+                explored = false;
+            }
+        }
+    }
+
     // Never toggle faster than the configured minimum (prevents input spam).
     if (a != m_curAction && obs.tick - m_lastToggleTick < m_cfg.minToggleTicks) {
         a = m_curAction;
         forced = false;
         explored = false;
+        shielded = false;
     }
+    if (advised) m_predictor->noteExecuted(a == 1);
+    if (shielded) {
+        ++m_status.shieldsThisAttempt;
+        ++m_status.shieldsTotal;
+    }
+    if (planned) ++m_status.plannedThisAttempt;
 
     if (a != m_curAction) {
         m_lastToggleTick = obs.tick;
@@ -268,6 +319,8 @@ bool Agent::act(Observation const& obs) {
     s.action = static_cast<uint8_t>(a);
     s.forced = forced;
     s.explored = explored;
+    s.planned = planned;
+    s.shielded = shielded;
     m_steps.push_back(s);
 
     m_curKey = key;
@@ -279,6 +332,8 @@ bool Agent::act(Observation const& obs) {
     m_status.action = static_cast<uint8_t>(a);
     m_status.forced = forced;
     m_status.explored = explored;
+    m_status.planned = planned;
+    m_status.shielded = shielded;
     m_status.epsilon = epsilonAt(obs.x);
     m_status.decisions = m_steps.size();
     return a == 1;
@@ -474,6 +529,10 @@ void Agent::onDeath(Observation const& last, DeathInfo const& death) {
     ++h.deaths;
 
     FailureReport rep = analyzeFailure(m_steps, last, death, h.escalation);
+    if (m_predictor) {
+        m_predictor->onDeath(last.tick, death.x, death.y);
+        m_status.predictionNote = m_predictor->lastDeathComparison();
+    }
     h.lastKind = rep.kind;
     m_lastReport = rep;
 
@@ -689,7 +748,12 @@ bool Agent::initSearch(Search& s, FailureReport const& report, ActionTrace const
     if (isFlyingMode(mode) && (report.kind == FailureKind::ReleasedTooLong || report.kind == FailureKind::HeldTooLong ||
                                report.kind == FailureKind::HitWall)) {
         int32_t deathCell = xCell(report.deathX, cs);
-        s.type = report.kind == FailureKind::HeldTooLong ? ExperimentType::ReleaseRange : ExperimentType::HoldRange;
+        if (report.kind == FailureKind::HitWall) {
+            // Over or under is unknown: alternate as the search escalates.
+            s.type = (esc % 2 == 0) ? ExperimentType::HoldRange : ExperimentType::ReleaseRange;
+        } else {
+            s.type = report.kind == FailureKind::HeldTooLong ? ExperimentType::ReleaseRange : ExperimentType::HoldRange;
+        }
         s.blockEnd = deathCell + 1;
         s.blockStart = deathCell - 2 * d0 - esc * 4 * d0;
         s.shift = 0;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <string>
 
 namespace aigd {
@@ -34,6 +35,17 @@ struct Feature {
     float dy = 0.f;
 };
 
+// A collision shape near the player, in world units (same space as player x/y).
+struct Obstacle {
+    enum class Kind : uint8_t {
+        Hazard,    // kills on contact with the player's outer hitbox
+        Solid,     // can be landed on; kills if the player's inner hitbox enters it
+        Uncertain, // orbs, pads, portals, slopes...: effect not modelled
+    };
+    float l = 0.f, b = 0.f, r = 0.f, t = 0.f;
+    Kind kind = Kind::Hazard;
+};
+
 // Everything the agent may know about the current physics step. Filled by the
 // Geode observer from real game state (or by the simulator in tests).
 struct Observation {
@@ -51,6 +63,9 @@ struct Observation {
     Feature hazard;            // nearest dangerous object ahead
     Feature solid;             // nearest solid block ahead
     Feature orb;               // nearest clickable orb/ring ahead
+    // Collision shapes around the player, sorted by left edge. Points into a
+    // buffer owned by whoever filled the observation; valid for this step only.
+    std::span<Obstacle const> obstacles;
 
     float progress() const;    // 0..1
     float vyNorm() const { return upsideDown ? -vy : vy; }
