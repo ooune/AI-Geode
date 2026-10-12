@@ -1,0 +1,117 @@
+{
+	"geode": "5.11.1",
+	"gd": {
+		"win": "2.2081"
+	},
+	"id": "aqvose.ai-geode",
+	"name": "AI Geode",
+	"version": "v0.1.0",
+	"developer": "aqvose",
+	"description": "An AI player that learns Geometry Dash levels from its own deaths.",
+	"repository": "https://github.com/aqvose-prog/AI-Geode",
+	"dependencies": {
+		"geode.node-ids": ">=v1.23.3"
+	},
+	"settings": {
+		"title-ai": {
+			"type": "title",
+			"name": "AI Player"
+		},
+		"ai-enabled": {
+			"type": "bool",
+			"name": "AI Player",
+			"description": "Let the AI play levels by itself. While it is on, your own jump inputs are ignored in levels. Toggle at any time with the keybind below.",
+			"default": false
+		},
+		"toggle-ai": {
+			"type": "keybind",
+			"name": "Toggle AI",
+			"description": "Immediately turns the AI player on or off (releases the button at once).",
+			"default": "F8",
+			"category": "gameplay"
+		},
+		"learning-enabled": {
+			"type": "bool",
+			"name": "Learning",
+			"description": "Update the AI's memory after every attempt. When off, the AI replays what it already knows without changing it.",
+			"default": true
+		},
+		"learning-speed": {
+			"type": "float",
+			"name": "Learning Speed",
+			"description": "How aggressively values and timings change after a failure. Low = cautious and stable, high = fast but noisier.",
+			"default": 0.5,
+			"min": 0.0,
+			"max": 1.0,
+			"control": {
+				"slider": true,
+				"slider-step": 0.05,
+				"arrows": true,
+				"arrow-step": 0.1,
+				"input": true
+			}
+		},
+		"title-attempts": {
+			"type": "title",
+			"name": "Attempts"
+		},
+		"auto-retry": {
+			"type": "bool",
+			"name": "Auto Retry",
+			"description": "Automatically restart after a death while the AI is playing.",
+			"default": true
+		},
+		"respawn-delay": {
+			"type": "float",
+			"name": "Respawn Delay",
+			"description": "Seconds to wait after a death before the AI retries.",
+			"default": 0.5,
+			"min": 0.1,
+			"max": 2.0,
+			"control": {
+				"slider": true,
+				"slider-step": 0.1,
+				"arrows": true,
+				"arrow-step": 0.1,
+				"input": true
+			}
+		},
+		"practice-mode": {
+			"type": "bool",
+			"name": "Practice Mode Learning",
+			"description": "Play in practice mode and let the AI place its own checkpoints, so hard sections can be learned separately. It removes a checkpoint again if it keeps dying right after it.",
+			"default": false
+		},
+		"training-speed": {
+			"type": "float",
+			"name": "Training Speed",
+			"description": "Game speed multiplier while the AI is playing (physics stay deterministic at 240 steps per second; music will desync above 1x).",
+			"default": 1.0,
+			"min": 1.0,
+			"max": 4.0,
+			"control": {
+				"slider": true,
+				"slider-step": 0.25,
+				"arrows": true,
+				"arrow-step": 0.5,
+				"input": true
+			}
+		},
+		"title-display": {
+			"type": "title",
+			"name": "Display"
+		},
+		"show-panel": {
+			"type": "bool",
+			"name": "Show Status Panel",
+			"description": "Show the compact AI status panel in levels.",
+			"default": true
+		},
+		"show-debug": {
+			"type": "bool",
+			"name": "Show Debug Data",
+			"description": "Add the AI's current observation and decision values to the status panel.",
+			"default": false
+		}
+	}
+}

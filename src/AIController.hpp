@@ -1,0 +1,130 @@
+#pragma once
+
+#include "Observer.hpp"
+#include "SaveWorker.hpp"
+
+#include <aigd/Agent.hpp>
+#include <aigd/Memory.hpp>
+
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <vector>
+
+class PlayLayer;
+class PlayerObject;
+class GameObject;
+class GJBaseGameLayer;
+
+// Glue between Geometry Dash (hooks, settings, UI) and the Geode-independent
+// learning core. All methods must be called on the main thread.
+class AIController {
+public:
+    static AIController& get();
+
+    struct Settings {
+        bool aiEnabled = false;
+        bool learning = true;
+        bool autoRetry = true;
+        bool practice = false;
+        bool showPanel = true;
+        bool showDebug = false;
+        float learningSpeed = 0.5f;
+        float respawnDelay = 0.5f;
+        float trainingSpeed = 1.f;
+    };
+
+    void loadSettings();
+    Settings const& settings() const { return m_settings; }
+
+    // --- Level lifecycle (called from hooks) ---
+    void onLevelInit(PlayLayer* layer);
+    void onLevelQuit(PlayLayer* layer);
+    void onLayerDestroyed(PlayLayer* layer);
+    void beforeReset(PlayLayer* layer);
+    void afterReset(PlayLayer* layer);
+    void onPhysicsStep(PlayLayer* layer);
+    void onPlayerDestroyed(PlayLayer* layer, PlayerObject* player, GameObject* killer);
+    void onLevelComplete(PlayLayer* layer);
+    void onPostUpdate(PlayLayer* layer, float dt);
+    void onGameExit();
+
+    // --- Input arbitration ---
+    // True while the AI owns the jump button in this layer (user input is ignored).
+    bool controlsInput(GJBaseGameLayer* layer) const;
+    bool injecting() const { return m_injecting; }
+    bool shouldSkipDelayedReset(PlayLayer* layer) const;
+
+    // --- User actions ---
+    void setAIEnabled(bool enabled);
+    void toggleAI();
+    void resetLevelMemory();
+    void resetAllMemory();
+    void exportLevelMemory();
+    void importLevelMemory();
+    void openMemoryFolder() const;
+
+    // --- Status for UI ---
+    aigd::AgentStatus const& status() const { return m_agent.status(); }
+    aigd::LevelMemory const* levelMemory() const { return m_level.get(); }
+    aigd::PatternMemory const& patterns() const { return m_patterns; }
+    aigd::Observation const& lastObservation() const { return m_lastObs; }
+    bool inLevel() const { return m_layer != nullptr; }
+    bool supported() const { return m_supported; }
+    std::string const& unsupportedReason() const { return m_unsupportedReason; }
+    std::string const& notice() const { return m_notice; }
+    size_t indexedObjects() const { return m_observer.indexedObjects(); }
+
+private:
+    AIController();
+
+    std::filesystem::path levelsDir() const;
+    std::filesystem::path patternsPath() const;
+    std::filesystem::path levelPath(std::string const& key) const;
+    static std::string levelKey(PlayLayer* layer);
+
+    void ensurePatternsLoaded();
+    void applyAgentConfig();
+    void applyTimeScale(bool active);
+    void saveAsync();
+    void saveNow();
+    void press(PlayLayer* layer, bool down);
+    void endAttemptWithoutOutcome(PlayLayer* layer);
+    void manageCheckpoints(PlayLayer* layer, aigd::Observation const& obs);
+    int32_t currentTick(PlayLayer* layer) const;
+
+    Settings m_settings;
+    aigd::Agent m_agent;
+    std::unique_ptr<aigd::LevelMemory> m_level;
+    aigd::PatternMemory m_patterns;
+    bool m_patternsLoaded = false;
+    Observer m_observer;
+    SaveWorker m_saver;
+
+    PlayLayer* m_layer = nullptr;   // identity only, cleared when the layer goes away
+    bool m_supported = false;
+    std::string m_unsupportedReason;
+    std::string m_notice;
+
+    bool m_holding = false;
+    bool m_injecting = false;
+    int32_t m_lastTick = -1;
+    aigd::Observation m_lastObs;
+
+    bool m_deathPending = false;
+    float m_deathTimer = 0.f;
+    uint32_t m_resetToken = 0;
+    uint32_t m_attemptsSinceSave = 0;
+
+    // stall watchdog
+    float m_stallX = 0.f;
+    int32_t m_stallTick = 0;
+
+    // practice-mode checkpoints placed by the AI
+    std::vector<float> m_checkpointXs;
+    uint32_t m_deathsSinceCheckpointProgress = 0;
+    float m_bestSinceCheckpoint = 0.f;
+
+    float m_prevTimeScale = 1.f;
+    bool m_timeScaleApplied = false;
+};
