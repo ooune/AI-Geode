@@ -28,7 +28,7 @@ All settings live in the mod's Geode settings page. Most also appear in the in-g
 | **Auto Retry** + **Respawn Delay** | Restart automatically after a death. |
 | **Practice Mode Learning** | Plays in practice mode and places its own checkpoints (see below). |
 | **Training Speed** | 1–4× game speed while the AI plays. Physics stay at 240 steps/s, so learning is unaffected, but music desyncs. |
-| **Use Prediction** | Simulate the cube's path before each decision (see *Trajectory prediction*). Cube mode only. |
+| **Use Prediction** | Simulate the player's path before each decision, in every game mode (see *Trajectory prediction*). |
 | **Show Trajectory** / **Show Alternative Path** | Draw the predicted path in the level; optionally also the path for the other button state. |
 | **Prediction Horizon** | 0.3–1.5 s of simulated future (default 0.75 s). |
 | **Show Status Panel** / **Show Debug Data** | The in-level overlay, and its debug lines (observation, Q-values, memory sizes, physics calibration, planner cost, prediction error). |
@@ -103,27 +103,59 @@ Inputs go through `GJBaseGameLayer::handleButton` from a `processCommands` hook,
 8. **Stuck detection.** After 20 attempts without a new best, exploration widens around the trouble spot and the search reaches further back.
 9. **Timing statistics.** Every successful jump over a hazard records its lead distance per mode and speed. These statistics seed future "add a press" experiments on any level.
 
-### Trajectory prediction (cube)
+### Trajectory prediction (all game modes)
 Learning only from deaths is slow: every bad timing has to be tried once. The
 predictor simulates the cube's future instead, so most bad timings are rejected
 before they are tried.
 
-**Physics model** (`core/Physics`). Per 240 Hz step, airborne: `vy -= g`,
-`y += vy * k`, with `vy` capped at the fall speed; a jump sets `vy` to the
-take-off speed. The defaults were measured from GD 2.2081 itself (from saved
-traces: g = 0.2156, k = 0.225, take-off vy = 10.964, i.e. the 11.18 jump impulse
-minus one step of gravity; x = 1.298 units/step at 1×). An online calibrator
-refits gravity, k, take-off speed, fall cap, floor height and x speed per speed
-class from consecutive real observations. Single odd frames (orbs, pads,
-teleports) are rejected as outliers, and parameters only move after enough
-consistent samples. The calibration is saved in `patterns.json`.
+**Physics model** (`core/Physics`). One model per game mode and size.
 
-**Collision prediction** (`core/Predictor`). The simulation steps the cube
-forward against the game's own collision rectangles
+Per 240 Hz step, every mode accelerates vertically (`vy += acc`, with
+`y += vy * k` and velocity caps), with a separate acceleration for held and
+released. What the button does differs by mode:
+
+| Mode | Button |
+|---|---|
+| Cube | jump while touching the ground (holding re-jumps) |
+| Robot | jump while touching the ground, boosted while held for a limited time; letting go ends the boost |
+| Ship | changes the acceleration (up while held, down when released) |
+| UFO | each new press kicks upward, also in the air |
+| Ball | flips gravity while touching the ground |
+| Swing | each new press flips gravity, also in the air |
+| Spider | a new press on the ground teleports to the opposite surface and flips gravity |
+| Wave | sets the velocity directly: a 45°-style diagonal up while held, down when released |
+
+The cube defaults were measured from GD 2.2081 itself (saved traces: g = 0.2156,
+k = 0.225, take-off vy = 10.964, i.e. the 11.18 jump impulse minus one step of
+gravity; x = 1.298 units/step at 1×). The other modes start from rough guesses.
+
+An online calibrator learns every parameter from your own play:
+- gravity per mode, plus held/released acceleration (ship, robot);
+- velocity caps and k;
+- jump/flap impulse and post-flip speed;
+- wave slope and robot boost window;
+- level floor and x speed per speed class.
+
+It detects jumps, flaps, flips and teleports from the observed state changes.
+Single odd frames (orbs, pads, teleport portals) are rejected as outliers, and
+parameters only move after enough consistent samples. **A mode is only used for
+decisions once it is calibrated:** that takes a few of its own jumps, flaps,
+flips or teleports. The spider borrows the cube's gravity, because it rarely
+free-falls. The calibration is saved in `patterns.json`.
+
+**Floor and ceiling.** In corridor modes the playing area's floor and ceiling
+are learned by touching them. A contact only counts when no block explains it,
+and flying modes must stay pinned against the bound for several steps (a ship
+turning around mid-air also has zero speed for one step). A bound that has not
+been confirmed yet makes paths that touch it *uncertain*.
+
+**Collision prediction** (`core/Predictor`). The simulation steps the player
+forward, with gravity direction able to flip mid-path, against the game's own
+collision rectangles
 (`GameObject::getObjectRect`, so spike hitboxes are the real, small ones).
 - Hazards kill on contact with the outer hitbox.
-- Blocks are landed on from above (from below when upside down), bump the cube
-  when rising into them, and kill only if the small inner hitbox enters them.
+- Blocks are landed on from above (from below when upside down); flying modes
+  slide along them. They kill only if the small inner hitbox enters them.
 - Walking off edges and holding to re-jump on landing are modelled.
 - Each path is classed as **Collision** (overlap deeper than the error margin),
   **Uncertain** (a near miss within the margin, contact between steps, or
@@ -132,16 +164,24 @@ forward against the game's own collision rectangles
 - The margin grows with the measured model error and the distance into the
   future, so an inaccurate model makes the AI more cautious, not more confident.
 
-**Receding-horizon planner.** Before each decision it simulates:
-- *press now*, as a tap and as hold-through-landing;
-- *release now*: never press, or press after k steps. k is tried on a coarse
-  schedule, then refined to single steps around the best timing and wherever
-  the outcome flips.
+**Receding-horizon planner.** Before each decision it simulates the button
+being down vs. up now, each followed by continuations shaped for the mode:
+- cube/robot: hold until take-off, hold through the landing, or hold for 12, 30
+  or 60 steps (robot boost);
+- ship/wave: hold for d steps, hold from k steps on, or hover patterns;
+- UFO/swing: single taps or repeated taps every r steps;
+- ball/spider: single taps.
+
+Delays k are tried on a coarse schedule, then refined to single steps around
+the best timing and wherever the outcome flips. If the best "wait" plan would
+press within two steps anyway, it presses now rather than procrastinating.
 
 Only the first action of the best plan is executed. The next step re-plans from
-the new real state. Plans that would press only after the "never press" path
-has already collided are skipped, and while airborne with the button up the
-last plan is reused until about 20 steps before landing.
+the new real state, or every 2 steps for ship, wave, UFO and swing (never when a
+press is due within 2 steps). Plans that would press only after the "never
+press" path has already collided are skipped. While a cube, ball or spider is
+airborne with the button up, the last plan is reused until about 20 steps
+before landing.
 
 **How it feeds learning** (`Agent::act`):
 - Where the Q-table has no preference yet, the planner's best plan decides.
@@ -171,9 +211,8 @@ check it). It shows:
 - the obstacle the path runs into, with the steps until the hit;
 - optionally the alternative path, in blue.
 
-Other game modes (ship, ball, UFO, wave, robot, spider, swing) are not modelled.
-In those modes the overlay is hidden and learning works from experience as
-before.
+Until a mode is calibrated, its predictions are shown (marked as calibrating)
+but not acted on.
 
 ### Practice-mode learning
 With **Practice Mode Learning** on, the AI:
@@ -264,7 +303,7 @@ Add `--bench` to also run the multi-seed learning benchmark.
 
 ### Results
 
-Unit tests (last full run, before the final overlay/UI wiring commit): 31 tests, 430 checks, 0 failures.
+Unit tests: 36 tests, 539 checks, 0 failures.
 
 Trajectory prediction against the simulator:
 - calibration recovers the simulator's physics exactly (g 0.2200, k 0.2326,
@@ -277,8 +316,22 @@ Trajectory prediction against the simulator:
 - at 0.5×, 2× and 4× speed the collision step is within 1 of the real one;
 - the planner alone, without any learning, completes the basics, spikes and
   blocks levels with no deaths;
-- cost: about 100 µs per physics step on average (about 14 simulations per
-  step), i.e. about 2.4% of one core at 1× speed.
+- every mode (cube, ship, ball, UFO, wave, robot, spider, swing):
+  - calibration recovers the simulator's deliberately different constants;
+  - predicting 32 steps ahead with random inputs: mean and max error 0.00
+    units (103 samples per mode);
+  - every predicted collision was confirmed when replayed, and **no path
+    predicted safe died** (20–126 plans checked per mode);
+  - the planner alone, without learning, completes each mode's obstacle course;
+  - the learning agent with prediction completes each course on its first attempt;
+- cost per physics step on average: cube ~130 µs, ship/wave/UFO/swing
+  ~190–215 µs, ball/robot ~260–275 µs, spider ~330 µs. That is about 3–8% of
+  one core at 1× speed, and four times that at 4× training speed.
+
+**Caveat:** the simulator implements the same structural rules for each mode
+that the predictor assumes (which button does what), only with different
+numbers. These results show that the calibration and planning work. They do
+**not** prove the rules match Geometry Dash exactly; only in-game testing can.
 
 Attempts to first completion, same seed, with vs. without prediction:
 
@@ -287,7 +340,7 @@ Attempts to first completion, same seed, with vs. without prediction:
 | basics | 3 | 9 |
 | spikes | 3 | 16 |
 | blocks | 4 | 15 |
-| ship | 29 | 55 (ship itself is not modelled; the gain is from the cube parts) |
+| ship | 10 | 35 |
 
 The first one or two attempts are still learned the old way while the physics
 model calibrates.
@@ -333,12 +386,14 @@ sizes and landing tolerance are still unconfirmed.
 - **Platformer levels** are not supported: they need left/right input. The AI disables itself there and says why.
 - **Two-player levels**: only player 1 is controlled.
 - **Moving obstacles**: hazards moved by triggers are indexed by their starting x. A padded lookup tolerates small movements, but heavily animated levels give the cross-level pattern features less accurate input. The per-level table is unaffected, because it is keyed by the player's own state.
-- **Physics are only modelled for the cube.** Other modes learn by trying, so hard levels can take hundreds or thousands of attempts, and very precise sections (frame-perfect inputs, tight wave corridors) may never be beaten. The learned table's timing resolution is a 3-unit x cell, about 2 ticks at 1× speed. The planner itself works per tick.
+- **Hard levels still take many attempts**, and very precise sections (frame-perfect inputs, tight wave corridors) may never be beaten. The learned table's timing resolution is a 3-unit x cell, about 2 ticks at 1× speed. The planner itself works per tick.
 - **Trajectory prediction limits:**
   - player hitbox sizes (30 units, inner 9 units; mini 18/5.4) and the 2-unit landing tolerance are assumptions, not values read from the game;
   - orbs, pads, portals, speed changes, slopes and moving objects are not simulated: paths touching them are marked uncertain, and objects moved by triggers use their current position only;
-  - mini-cube physics start from guesses until calibrated;
-  - robot, ball and other modes are not predicted at all.
+  - all non-cube physics (and mini sizes) start from guesses until calibrated, and the button rule per mode is an assumption about GD that is not yet verified in game (for example whether a held spider re-teleports, or exactly when a robot's boost ends);
+  - the wave hitbox (12 units, inner 6) and the ship hitbox (24 units) are guesses;
+  - the game's own corridor bounds (`m_portalY` / `m_lastModeHeight`) are not used yet because their meaning is unconfirmed; bounds are learned by contact instead;
+  - the planner tries a limited set of input shapes, so a sequence it never tries (for example an unusual tap rhythm) cannot be found by planning, only by learning.
 - **Determinism**: GD 2.2's physics are deterministic for identical inputs, which the learning relies on. Mods that change input timing, such as *Click Between Frames*, or physics settings can make attempts less repeatable and learning slower.
 - The memory of a local/editor level is keyed by its content, so editing the level starts a fresh memory.
 - **Training Speed** above 1× desyncs the music.

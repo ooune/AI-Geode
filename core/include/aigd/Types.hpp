@@ -66,6 +66,11 @@ struct Observation {
     // Collision shapes around the player, sorted by left edge. Points into a
     // buffer owned by whoever filled the observation; valid for this step only.
     std::span<Obstacle const> obstacles;
+    // Playing-area floor/ceiling surfaces reported by the game for corridor
+    // modes (ship, UFO, ...). Only a hint: confirmed by actual contact.
+    bool hasBoundsHint = false;
+    float boundsHintBottom = 0.f;
+    float boundsHintTop = 0.f;
 
     float progress() const;    // 0..1
     float vyNorm() const { return upsideDown ? -vy : vy; }

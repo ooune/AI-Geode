@@ -781,7 +781,7 @@ PredictedPath predict(PredictionRig& rig, sim::Level const& level, Plan plan, in
     sim::World w(level, speedClass);
     Observation o = rig.observe(w);
     PredictedPath p;
-    rig.predictor.simulate(Predictor::startFrom(o, false), o.obstacles, plan, p);
+    rig.predictor.simulate(rig.predictor.startFrom(o, false), o.obstacles, plan, p);
     return p;
 }
 
@@ -813,16 +813,16 @@ TEST(physics_calibration_learns_the_game) {
     rig.predictor.setHorizon(400);
     // Defaults are Geometry Dash's measured values; the simulator deliberately
     // uses slightly different physics, so these must be learned.
-    CHECK(std::fabs(rig.model.cube(false).gravity - sim::World::kGravity) > 0.004f);
+    CHECK(std::fabs(-rig.model.cube(false).accRelease - sim::World::kGravity) > 0.004f);
     CHECK(!rig.model.calibrated(false));
     warmUp(rig);
     auto const& p = rig.model.cube(false);
     std::printf("    learned: %s, vx=%.4f, drift %.4f/step\n", rig.model.describe().c_str(), rig.model.vxPerTick(1), rig.model.driftPerTick());
     CHECK(rig.model.calibrated(false));
-    CHECK(std::fabs(p.gravity - sim::World::kGravity) < 0.002f);
+    CHECK(std::fabs(-p.accRelease - sim::World::kGravity) < 0.002f);
     CHECK(std::fabs(p.yScale - 1.f / sim::World::kVyScale) < 0.002f);
-    CHECK(std::fabs(p.takeoffVy - (sim::World::kJumpVy - sim::World::kGravity)) < 0.05f);
-    CHECK(std::fabs(p.floorY - sim::World::kHalf) < 0.5f);
+    CHECK(std::fabs(p.impulse - (sim::World::kJumpVy - sim::World::kGravity)) < 0.05f);
+    CHECK(std::fabs(rig.model.cubeFloorY(false) - sim::World::kHalf) < 0.5f);
     CHECK(std::fabs(rig.model.vxPerTick(1) - aigd::unitsPerSecond(1) / 240.f) < 0.01f);
     CHECK(rig.model.accuracySamples() > 10);
     CHECK(rig.model.driftPerTick() < 0.02f);
@@ -951,7 +951,7 @@ TEST(prediction_gravity_changes) {
         w.place(60.f, 60.f, 0.f, false, true);
         Observation o = rig.observe(w);
         PredictedPath p;
-        rig.predictor.simulate(Predictor::startFrom(o, false), o.obstacles, Plan{-1, false}, p);
+        rig.predictor.simulate(rig.predictor.startFrom(o, false), o.obstacles, Plan{-1, false}, p);
         float landX = 0.f, landY = 0.f;
         for (int t = 0; t < 200; ++t) {
             w.step(false);
@@ -976,8 +976,8 @@ TEST(prediction_overlay_matches_simulation) {
     sim::World w(level);
     Observation o = rig.observe(w);
     PredictedPath main, alt;
-    rig.predictor.simulate(Predictor::startFrom(o, false), o.obstacles, Plan{-1, false}, main);
-    rig.predictor.simulate(Predictor::startFrom(o, false), o.obstacles, Plan{95, false}, alt);
+    rig.predictor.simulate(rig.predictor.startFrom(o, false), o.obstacles, Plan{-1, false}, main);
+    rig.predictor.simulate(rig.predictor.startFrom(o, false), o.obstacles, Plan{95, false}, alt);
     OverlayGeometry g;
     buildOverlay(main, &alt, o.obstacles, g, 4);
     CHECK(g.outcome == Certainty::Collision);
@@ -1090,7 +1090,7 @@ TEST(prediction_learning_survives_reload_and_stays_consistent) {
     PhysicsModel m2;
     m2.loadCalibration(loaded.physics);
     CHECK(m2.calibrated(false));
-    CHECK(std::fabs(m2.cube(false).gravity - rig.model.cube(false).gravity) < 1e-5f);
+    CHECK(std::fabs(m2.cube(false).accRelease - rig.model.cube(false).accRelease) < 1e-5f);
 }
 
 TEST(misprediction_makes_predictor_cautious) {
@@ -1129,6 +1129,311 @@ TEST(prediction_is_not_trusted_before_calibration) {
     agent.beginAttempt(o, false);
     agent.act(o);
     CHECK(!agent.status().shielded && !agent.status().planned);
+}
+
+// ---------------------------------------------------------------------------
+// Trajectory prediction for every game mode
+
+namespace {
+constexpr GameMode kAllModes[] = {GameMode::Cube, GameMode::Ship, GameMode::Ball, GameMode::Ufo,
+                                  GameMode::Wave, GameMode::Robot, GameMode::Spider, GameMode::Swing};
+
+// A mode-sensible random input pattern (what a player of that mode does).
+struct InputPattern {
+    GameMode mode;
+    uint32_t state;
+    int left = 0;
+    bool hold = false;
+
+    uint32_t next() {
+        state = state * 1664525u + 1013904223u;
+        return state >> 8;
+    }
+    int range(int lo, int hi) { return lo + static_cast<int>(next() % static_cast<uint32_t>(hi - lo + 1)); }
+
+    bool step() {
+        if (--left > 0) return hold;
+        switch (mode) {
+            case GameMode::Ship:
+            case GameMode::Wave:
+                hold = !hold;
+                left = range(8, 40);
+                break;
+            case GameMode::Ufo:
+                hold = !hold;
+                left = hold ? 2 : range(20, 45);
+                break;
+            case GameMode::Ball:
+            case GameMode::Swing:
+            case GameMode::Spider:
+                hold = !hold;
+                left = hold ? 2 : range(40, 90);
+                break;
+            case GameMode::Robot:
+                hold = !hold;
+                left = hold ? range(5, 60) : range(30, 80);
+                break;
+            default: // cube
+                hold = !hold;
+                left = hold ? 2 : range(60, 140);
+                break;
+        }
+        return hold;
+    }
+};
+
+// Flat corridor in one mode (floor + a ceiling of blocks), long enough to
+// calibrate on.
+sim::Level corridor(GameMode m, float length = 600.f) {
+    sim::Level l;
+    l.name = std::string("corridor-") + gameModeName(m);
+    l.modePortal(1, m);
+    if (m != GameMode::Cube && m != GameMode::Robot) l.block(3, m == GameMode::Ball || m == GameMode::Swing || m == GameMode::Spider ? 5.f : 7.f, length, 1);
+    l.finish(length);
+    return l;
+}
+
+void warmUp(PredictionRig& rig, int speedClass);
+
+void warmUpMode(PredictionRig& rig, GameMode m, int steps = 6000, uint32_t seed = 7) {
+    if (m == GameMode::Spider) warmUp(rig, 1); // spiders borrow the cube's gravity (they rarely free-fall)
+    sim::Level lvl = corridor(m);
+    sim::World w(lvl);
+    InputPattern in{m, seed};
+    rig.held = false;
+    for (int t = 0; t < steps && !w.dead() && !w.complete(); ++t) {
+        Observation o = rig.observe(w);
+        rig.predictor.observe(o, rig.held);
+        bool hold = w.mode() == m ? in.step() : false;
+        rig.held = hold;
+        w.step(hold);
+    }
+}
+
+struct Accuracy {
+    double meanErr = 0, maxErr = 0;
+    int samples = 0;
+};
+
+// Start from many states of a random run and predict 32 steps ahead with the
+// inputs that are then actually used; compare with where the simulator ends up.
+Accuracy measureAccuracy(PredictionRig& rig, GameMode m, uint32_t seed = 99) {
+    sim::Level lvl = corridor(m);
+    sim::World w(lvl);
+    InputPattern in{m, seed};
+    Accuracy a;
+    std::vector<uint8_t> holds;
+    bool held = false;
+    for (int t = 0; t < 4000 && !w.dead() && !w.complete(); ++t) {
+        Observation o = rig.observe(w);
+        rig.predictor.observe(o, held);
+        if (t > 200 && t % 37 == 0 && w.mode() == m) {
+            sim::World future = w;
+            InputPattern fin = in;
+            holds.clear();
+            for (int k = 0; k < 32; ++k) {
+                bool h = fin.step();
+                holds.push_back(h ? 1 : 0);
+                future.step(h);
+            }
+            if (!future.dead()) {
+                PredictedPath p;
+                rig.predictor.simulate(rig.predictor.startFrom(o, held), o.obstacles, Plan{}, p, holds);
+                if (static_cast<int>(p.points.size()) == 32) {
+                    auto f = future.observe();
+                    double err = std::hypot(p.points.back().x - f.x, p.points.back().y - f.y);
+                    if (std::getenv("AIGD_ACC_DEBUG") && err > 3.0) {
+                        std::printf("      start x=%.1f y=%.2f vy=%.2f ground=%d held=%d | pred y=%.2f real y=%.2f | holds ", o.x, o.y, o.vy,
+                                    (int)o.onGround, (int)held, p.points.back().y, f.y);
+                        for (auto hh : holds) std::printf("%d", (int)hh);
+                        std::printf(" | floor %.1f%s ceil %d %.1f\n", rig.predictor.bounds().floor, rig.predictor.bounds().floorEstimated ? "?" : "",
+                                    (int)rig.predictor.bounds().hasCeil, rig.predictor.bounds().ceil);
+                    }
+                    a.meanErr += err;
+                    a.maxErr = std::max(a.maxErr, err);
+                    ++a.samples;
+                }
+            }
+        }
+        bool hold = w.mode() == m ? in.step() : false;
+        held = hold;
+        w.step(hold);
+    }
+    if (a.samples) a.meanErr /= a.samples;
+    return a;
+}
+} // namespace
+
+TEST(all_modes_calibrate_to_the_game) {
+    for (GameMode m : kAllModes) {
+        PredictionRig rig;
+        CHECK(!rig.model.calibrated(m, false));
+        if (m == GameMode::Spider) warmUp(rig); // spiders borrow the cube's gravity (they rarely free-fall)
+        warmUpMode(rig, m);
+        auto const& p = rig.model.params(m, false);
+        auto S = sim::World::spec(m);
+        std::printf("    %-6s %s\n", gameModeName(m), rig.model.describe(m).c_str());
+        CHECK_MSG(rig.model.calibrated(m, false), "%s not calibrated", gameModeName(m));
+        switch (m) {
+            case GameMode::Ship:
+                CHECK(std::fabs(p.accHold - S.accHold) < 0.01f);
+                CHECK(std::fabs(p.accRelease - S.accRelease) < 0.01f);
+                break;
+            case GameMode::Ufo:
+                CHECK(std::fabs(p.impulse - S.impulse) < 0.05f);
+                CHECK(std::fabs(p.accRelease - S.accRelease) < 0.01f);
+                break;
+            case GameMode::Ball:
+            case GameMode::Swing:
+                CHECK(std::fabs(p.accRelease - S.accRelease) < 0.01f);
+                CHECK(std::fabs(p.flipVy - S.flipVy) < 0.1f);
+                break;
+            case GameMode::Wave:
+                CHECK(std::fabs(p.waveVy - S.slope) < 0.02f);
+                break;
+            case GameMode::Robot:
+                CHECK(std::fabs(p.impulse - (S.impulse + S.accHold)) < 0.05f);
+                CHECK(std::fabs(p.accHold - S.accHold) < 0.01f);
+                CHECK(std::fabs(p.accRelease - S.accRelease) < 0.01f);
+                CHECK(std::abs(p.boostSteps - (S.boostSteps - 1)) <= 2);
+                break;
+            case GameMode::Spider:
+                CHECK(std::fabs(p.accRelease - S.accRelease) < 0.01f);
+                break;
+            default:
+                CHECK(std::fabs(p.accRelease - S.accRelease) < 0.01f);
+                break;
+        }
+        if (m != GameMode::Wave && m != GameMode::Spider) CHECK(std::fabs(p.yScale - 1.f / sim::World::kVyScale) < 0.003f);
+    }
+}
+
+TEST(all_modes_predict_32_steps_ahead) {
+    for (GameMode m : kAllModes) {
+        PredictionRig rig;
+        if (m == GameMode::Spider) warmUp(rig);
+        warmUpMode(rig, m);
+        Accuracy a = measureAccuracy(rig, m);
+        std::printf("    %-6s %d samples: mean error %.2f, max %.2f units after 32 steps (resim drift %.4f/step)\n", gameModeName(m),
+                    a.samples, a.meanErr, a.maxErr, rig.model.driftPerTick(m));
+        CHECK(a.samples >= 20);
+        CHECK_MSG(a.meanErr < 1.0, "%s mean error %.2f", gameModeName(m), a.meanErr);
+        CHECK_MSG(a.maxErr < 5.0, "%s max error %.2f", gameModeName(m), a.maxErr);
+        CHECK(rig.predictor.trusted(m, false));
+    }
+}
+
+TEST(all_modes_planner_alone_clears_course) {
+    // No learning: re-plan every step with the receding-horizon planner only.
+    for (GameMode m : kAllModes) {
+        PredictionRig rig;
+        warmUpMode(rig, m);
+        sim::Level level = sim::modeCourse(m);
+        sim::World w(level);
+        double micros = 0;
+        int ticks = 0, sims = 0;
+        for (int t = 0; t < 100000 && !w.dead() && !w.complete(); ++t) {
+            Observation o = rig.observe(w);
+            rig.predictor.observe(o, rig.held);
+            auto const& adv = rig.predictor.advise(o, rig.held);
+            bool hold = adv.valid ? adv.bestPresses : (w.mode() == GameMode::Ship ? o.y < 90.f : false);
+            if (adv.valid) {
+                micros += adv.micros;
+                sims += adv.simulations;
+            }
+            rig.held = hold;
+            w.step(hold);
+            ++ticks;
+            if (w.dead() && std::getenv("AIGD_PLAN_DEBUG")) {
+                auto const& pp = rig.predictor.pressPath();
+                auto const& rp = rig.predictor.releasePath();
+                std::printf("      died at x=%.1f y=%.2f (obs y=%.2f vy=%.2f ground=%d) valid=%d trusted=%d press=%s(at %d hold %d rep %d, ttc %d) "
+                            "release=%s(at %d hold %d rep %d, ttc %d) best=%s sims=%d bounds floor %.1f%s ceil %d %.1f%s\n",
+                            w.death().x, w.death().y, o.y, o.vy, (int)o.onGround, (int)adv.valid, (int)adv.trusted,
+                            certaintyName(adv.press), pp.plan.pressAt, pp.plan.holdFor, pp.plan.repeatEvery, pp.collisionStep,
+                            certaintyName(adv.release), rp.plan.pressAt, rp.plan.holdFor, rp.plan.repeatEvery, rp.collisionStep,
+                            adv.bestPresses ? "press" : "release", adv.simulations, rig.predictor.bounds().floor,
+                            rig.predictor.bounds().floorEstimated ? "?" : "", (int)rig.predictor.bounds().hasCeil, rig.predictor.bounds().ceil,
+                            rig.predictor.bounds().ceilEstimated ? "?" : "");
+            }
+        }
+        std::printf("    %-6s planner only: %s at %.1f%%, %.1f us and %.1f simulations per step\n", gameModeName(m),
+                    w.complete() ? "COMPLETED" : "died", w.observe().progress() * 100.f, ticks ? micros / ticks : 0.0,
+                    ticks ? double(sims) / ticks : 0.0);
+        CHECK_MSG(w.complete(), "%s course not completed by the planner", gameModeName(m));
+    }
+}
+
+TEST(all_modes_collision_predictions_are_never_falsely_safe) {
+    // From many states on each course, the outcome of the planner's own best
+    // plan is compared with what really happens when that plan is executed
+    // open-loop: a path predicted "safe" must not die within its horizon.
+    for (GameMode m : kAllModes) {
+        PredictionRig rig;
+        warmUpMode(rig, m);
+        sim::Level level = sim::modeCourse(m);
+        sim::World w(level);
+        InputPattern in{m, 4242};
+        int checked = 0, falseSafe = 0, predictedHits = 0, confirmedHits = 0;
+        for (int t = 0; t < 6000 && !w.dead() && !w.complete(); ++t) {
+            Observation o = rig.observe(w);
+            rig.predictor.observe(o, rig.held);
+            if (t % 23 == 0 && w.mode() == m) {
+                auto const& adv = rig.predictor.advise(o, rig.held, false); // fresh plans from this exact state
+                if (adv.valid && adv.trusted) {
+                    for (PredictedPath const* p : {&rig.predictor.pressPath(), &rig.predictor.releasePath()}) {
+                        // replay exactly the simulated button states in a copy of the world
+                        sim::World f = w;
+                        for (size_t k = 0; k < p->holds.size() && !f.dead(); ++k) f.step(p->holds[k] != 0);
+                        ++checked;
+                        if (p->outcome == Certainty::Safe && f.dead()) {
+                            ++falseSafe;
+                            if (std::getenv("AIGD_FS_DEBUG")) {
+                                size_t k = static_cast<size_t>(f.observe().tick - o.tick) - 1;
+                                std::printf("      false safe: start x=%.1f y=%.2f vy=%.2f ground=%d plan(at %d hold %d rep %d rejump %d) died step %zu at (%.1f,%.2f) killer dx %.1f dy %.1f; predicted (%.1f,%.2f)\n",
+                                            o.x, o.y, o.vy, (int)o.onGround, p->plan.pressAt, p->plan.holdFor, p->plan.repeatEvery, (int)p->plan.rejump, k,
+                                            f.death().x, f.death().y, f.death().killerDx, f.death().killerDy,
+                                            k < p->points.size() ? p->points[k].x : -1.f, k < p->points.size() ? p->points[k].y : -1.f);
+                            }
+                        }
+                        if (p->outcome == Certainty::Collision) {
+                            ++predictedHits;
+                            if (f.dead()) ++confirmedHits;
+                        }
+                    }
+                }
+            }
+            bool hold = w.mode() == m ? in.step() : false;
+            rig.held = hold;
+            w.step(hold);
+        }
+        std::printf("    %-6s %d plans checked: %d predicted collisions (%d confirmed), %d falsely safe\n", gameModeName(m), checked,
+                    predictedHits, confirmedHits, falseSafe);
+        CHECK(checked > 0);
+        CHECK_MSG(falseSafe == 0, "%s: %d paths predicted safe died", gameModeName(m), falseSafe);
+    }
+}
+
+TEST(all_modes_overlay_and_agent_hook_work) {
+    // The agent uses prediction in every mode once calibrated.
+    for (GameMode m : kAllModes) {
+        PredictionRig rig;
+        warmUpMode(rig, m);
+        sim::Level level = sim::modeCourse(m);
+        LevelMemory mem = freshLevel(level);
+        PatternMemory pat;
+        Agent agent;
+        agent.attach(&mem, &pat);
+        agent.setPredictor(&rig.predictor);
+        auto r = train(agent, level, 300, &rig);
+        std::printf("    %-6s learning with prediction: completed after %d attempts (%llu collisions avoided)\n", gameModeName(m),
+                    r.attemptsToComplete, static_cast<unsigned long long>(agent.status().shieldsTotal));
+        CHECK(r.attemptsToComplete > 0);
+        // overlay geometry is produced for the current plan
+        OverlayGeometry g;
+        buildOverlay(rig.predictor.bestPath(), &rig.predictor.alternativePath(), {}, g);
+        CHECK(!g.label.empty());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,3 +1559,4 @@ TEST(diag_level) {
         if (l.name == which) diag(l, 400);
     }
 }
+

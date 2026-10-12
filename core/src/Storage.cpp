@@ -276,7 +276,8 @@ std::string serializePatterns(PatternMemory const& P) {
         out += ']';
     }
     out += "],";
-    key(out, "physics");
+    // physics calibration: 22 numbers per mode/size slot, then 5 x (vx sum, n)
+    key(out, "physics2");
     out += '[';
     {
         bool firstNum = true;
@@ -285,9 +286,15 @@ std::string serializePatterns(PatternMemory const& P) {
             firstNum = false;
             appendNumber(out, v);
         };
-        for (auto const& s : P.physics.size) {
-            num(s.gSum); num(s.gSq); num(s.gN); num(s.kYV); num(s.kVV); num(s.kN);
-            num(s.v0Sum); num(s.v0N); num(s.fallCap); num(s.fallCapN); num(s.floorY); num(s.floorN);
+        for (auto const& c : P.physics.modes) {
+            for (auto const* st : {&c.accHold, &c.accRelease, &c.impulse, &c.flipVy, &c.waveVy}) {
+                num(st->sum);
+                num(st->n);
+            }
+            num(c.kYV); num(c.kVV); num(c.kN);
+            num(c.maxUp); num(c.maxDown); num(c.capUpN); num(c.capDownN);
+            num(c.flips); num(c.teleports);
+            num(c.floorY); num(c.floorN); num(c.boostMax);
         }
         for (int i = 0; i < 5; ++i) {
             num(P.physics.vxSum[i]);
@@ -318,20 +325,25 @@ bool deserializePatterns(std::string_view text, PatternMemory& out, std::string*
         s.count = static_cast<uint32_t>(row.at(3).asInt());
         P.leads[static_cast<uint32_t>(row.at(0).asInt())] = s;
     }
-    auto const& ph = d.get("physics");
-    if (ph.isArray() && ph.size() == 2 * 12 + 10) {
+    auto const& ph = d.get("physics2");
+    if (ph.isArray() && ph.size() == PhysicsCalibration::kSlots * 22 + 10) {
         size_t i = 0;
         auto next = [&]() { return ph.at(i++).asNumber(); };
-        for (auto& s : P.physics.size) {
-            s.gSum = next(); s.gSq = next(); s.gN = static_cast<uint32_t>(next());
-            s.kYV = next(); s.kVV = next(); s.kN = static_cast<uint32_t>(next());
-            s.v0Sum = next(); s.v0N = static_cast<uint32_t>(next());
-            s.fallCap = static_cast<float>(next()); s.fallCapN = static_cast<uint32_t>(next());
-            s.floorY = static_cast<float>(next()); s.floorN = static_cast<uint32_t>(next());
+        auto nextU = [&]() { return static_cast<uint32_t>(next()); };
+        for (auto& c : P.physics.modes) {
+            for (auto* st : {&c.accHold, &c.accRelease, &c.impulse, &c.flipVy, &c.waveVy}) {
+                st->sum = next();
+                st->n = nextU();
+            }
+            c.kYV = next(); c.kVV = next(); c.kN = nextU();
+            c.maxUp = static_cast<float>(next()); c.maxDown = static_cast<float>(next());
+            c.capUpN = nextU(); c.capDownN = nextU();
+            c.flips = nextU(); c.teleports = nextU();
+            c.floorY = static_cast<float>(next()); c.floorN = nextU(); c.boostMax = nextU();
         }
         for (int k = 0; k < 5; ++k) {
             P.physics.vxSum[k] = next();
-            P.physics.vxN[k] = static_cast<uint32_t>(next());
+            P.physics.vxN[k] = nextU();
         }
     }
     if (!readQTable(d.get("q"), P.q, error)) return false;

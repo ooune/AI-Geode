@@ -2,17 +2,25 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 
 namespace aigd {
 
 namespace {
-constexpr float kNear = 40.f;          // obstacles further than this from the player are ignored per step
-constexpr float kLandTolerance = 2.f;  // how far into a block top a falling player may sink and still land
+constexpr float kNear = 40.f;            // obstacles further than this from the player are ignored per step
+constexpr float kLandTolerance = 2.f;    // how far into a surface a player may sink and still be put on it
+constexpr float kEstimatedBoundZone = 10.f; // touching an unconfirmed floor/ceiling makes a path uncertain
 constexpr int kCoarseDelays[] = {1, 2, 4, 6, 9, 12, 16, 20, 25, 31, 38, 46, 55, 65, 76, 88, 100, 115, 130, 150, 170};
 
 float overlap(float a0, float a1, float b0, float b1) { return std::min(a1, b1) - std::max(a0, b0); }
+
+bool continuousControl(GameMode m) { return m == GameMode::Ship || m == GameMode::Wave; }
+bool tapControl(GameMode m) { return m == GameMode::Ufo || m == GameMode::Swing; }
+// Modes where the button only acts while touching the ground, so in the air
+// nothing changes until shortly before landing.
+bool groundOnly(GameMode m) { return m == GameMode::Cube || m == GameMode::Ball || m == GameMode::Spider; }
 } // namespace
 
 char const* certaintyName(Certainty c) {
@@ -25,45 +33,53 @@ char const* certaintyName(Certainty c) {
 }
 
 Predictor::Predictor(PhysicsModel& model) : m_model(model) {
-    for (auto* p : {&m_press, &m_release, &m_tmp, &m_resim}) p->points.reserve(512);
+    for (auto* p : {&m_press, &m_release, &m_tmp, &m_resim}) {
+        p->points.reserve(512);
+        p->holds.reserve(512);
+    }
     m_holdBuf.reserve(kHistory);
 }
 
-SimStart Predictor::startFrom(Observation const& obs, bool holding) {
+SimStart Predictor::startFrom(Observation const& obs, bool holding) const {
     SimStart s;
     s.x = obs.x;
     s.y = obs.y;
     s.vy = obs.vy;
+    s.mode = obs.mode;
     s.onGround = obs.onGround;
     s.upsideDown = obs.upsideDown;
     s.mini = obs.mini;
     s.holding = holding;
     s.speedClass = obs.speedClass();
     s.tick = obs.tick;
+    s.bounds = m_bounds;
+    if (obs.mode == GameMode::Robot && m_robotAlive)
+        s.robotBoostLeft = std::max(0, m_model.params(obs.mode, obs.mini).boostSteps - m_robotSince);
     return s;
 }
 
-bool Predictor::trusted(bool mini) const {
-    return m_model.calibrated(mini) && m_model.driftPerTick() < 0.15f && m_caution < 3.f;
+bool Predictor::trusted(GameMode mode, bool mini) const {
+    return m_model.calibrated(mode, mini) && m_model.driftPerTick(mode) < 0.15f && m_caution < 3.f;
 }
 
-float Predictor::margin(int step, bool mini) const {
-    float base = trusted(mini) ? 0.5f : 3.f;
-    return std::min(12.f, (base + m_model.driftPerTick() * static_cast<float>(step)) * m_caution);
+float Predictor::margin(int step, GameMode mode, bool mini) const {
+    float base = trusted(mode, mini) ? 0.5f : 3.f;
+    return std::min(12.f, (base + m_model.driftPerTick(mode) * static_cast<float>(step)) * m_caution);
 }
 
 void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles, Plan const& plan, PredictedPath& out,
                          std::span<uint8_t const> holds) const {
-    CubePhysics const& P = m_model.cube(s.mini);
+    ModePhysics const& P = m_model.params(s.mode, s.mini);
     float const vx = m_model.vxPerTick(s.speedClass);
-    // Simulate in gravity-normalised coordinates (up = away from gravity).
-    float const sg = s.upsideDown ? -1.f : 1.f;
-    bool const hasFloor = !s.upsideDown;
     float const h = P.halfSize;
     float const in = P.innerHalf;
     int const steps = holds.empty() ? m_horizon : static_cast<int>(holds.size());
+    Bounds const& B = s.bounds;
+    float const floorC = B.floor + h;  // player centre when resting on the floor
+    float const ceilC = B.ceil - h;    // ... against the ceiling
 
     out.points.clear();
+    out.holds.clear();
     out.plan = plan;
     out.outcome = Certainty::Safe;
     out.collisionStep = -1;
@@ -77,33 +93,49 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
     for (auto const& o : obstacles) maxW = std::max(maxW, o.r - o.l);
 
     float x = s.x;
-    float y = s.y * sg;
-    float vy = s.vy * sg;
+    float y = s.y;
+    float vy = s.vy;
+    float g = s.upsideDown ? -1.f : 1.f; // gravity direction: +1 pulls down
     bool onGround = s.onGround;
+    bool prevHold = s.holding;
+
     bool pressActive = false;
-    int takeoffs = 0;
-    int const targetTakeoffs = plan.rejump ? 2 : 1;
+    int32_t pressStart = 0;
+    int32_t nextPress = plan.pressAt;
+    int effects = 0;
+    int const target = plan.rejump ? 2 : 1;
+    int32_t sinceTakeoff = 1 << 20;
+    bool boostAlive = false; // robot: letting go ends the boost for this jump
+    if (s.robotBoostLeft > 0) {
+        boostAlive = true;
+        sinceTakeoff = P.boostSteps - s.robotBoostLeft;
+    }
+    // edge-triggered modes: a plain press is a short tap
+    bool const tapRelease = P.press == PressAction::ImpulseOnEdge || P.press == PressAction::FlipOnEdge ||
+                            P.press == PressAction::TeleportOnGround;
+
     bool potential = false;
     bool definite = false;
-    // margin(step) = min(12, (base + drift * step) * caution), hoisted out of the loop
-    float const m0 = (trusted(s.mini) ? 0.5f : 3.f) * m_caution;
-    float const dm = m_model.driftPerTick() * m_caution;
+    float const m0 = (trusted(s.mode, s.mini) ? 0.5f : 3.f) * m_caution;
+    float const dm = m_model.driftPerTick(s.mode) * m_caution;
     size_t first = 0;
     size_t const nObs = obstacles.size();
 
     auto recordHit = [&](int step, int idx, bool isDefinite) {
-        if (isDefinite) {
-            definite = true;
-        } else if (potential) {
-            return; // keep the first potential contact
-        } else {
-            potential = true;
-        }
+        if (isDefinite) definite = true;
+        else if (potential) return;
+        else potential = true;
         out.collisionStep = step;
         out.collisionX = x;
-        out.collisionY = y * sg;
+        out.collisionY = y;
         out.obstacle = idx;
         out.hit = obstacles[static_cast<size_t>(idx)];
+    };
+    auto boundContact = [&](int step, bool estimated) {
+        if (estimated && out.uncertainFrom < 0) {
+            potential = true;
+            out.uncertainFrom = step;
+        }
     };
 
     for (int step = 0; step < steps; ++step) {
@@ -111,52 +143,157 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
         if (!holds.empty()) {
             hold = holds[static_cast<size_t>(step)] != 0;
         } else {
-            if (plan.pressAt >= 0 && step == plan.pressAt) pressActive = true;
+            if (nextPress >= 0 && step == nextPress) {
+                pressActive = true;
+                pressStart = step;
+                effects = 0;
+                nextPress = plan.repeatEvery > 0 ? step + plan.repeatEvery : -1;
+            }
+            if (pressActive) {
+                int32_t heldFor = step - pressStart;
+                if (plan.holdFor > 0 && heldFor >= plan.holdFor) pressActive = false;
+                else if (plan.holdFor == 0 && tapRelease && heldFor >= 2) pressActive = false;
+                else if (plan.holdFor == 0 && !tapRelease && effects >= target && heldFor >= 2) pressActive = false;
+            }
             hold = pressActive;
         }
+        bool const edge = hold && !prevHold;
+        prevHold = hold;
+        out.holds.push_back(hold ? 1 : 0);
 
         float const prevBottom = y - h;
         float const prevTop = y + h;
         float const px = x;
         float const py = y;
         bool const wasAir = !onGround;
+        float vyN = vy * g;
+        bool effect = false;
+        bool teleported = false;
+        bool stop = false;
 
-        if (onGround && hold) {
-            vy = P.takeoffVy;
-            onGround = false;
-            ++takeoffs;
-        } else if (!onGround) {
-            vy -= P.gravity;
-            if (vy < -P.maxFall) vy = -P.maxFall;
+        switch (P.press) {
+            case PressAction::JumpOnGround:
+                if (onGround && hold) {
+                    vyN = P.impulse;
+                    onGround = false;
+                    effect = true;
+                    sinceTakeoff = 0;
+                    boostAlive = true;
+                } else if (!onGround) {
+                    if (!hold) boostAlive = false;
+                    bool boost = s.mode == GameMode::Robot && hold && boostAlive && sinceTakeoff < P.boostSteps;
+                    vyN += boost ? P.accHold : P.accRelease;
+                }
+                break;
+            case PressAction::ImpulseOnEdge:
+                if (edge) {
+                    vyN = P.impulse;
+                    onGround = false;
+                    effect = true;
+                } else if (!onGround) {
+                    vyN += P.accRelease;
+                }
+                break;
+            case PressAction::FlipOnGround:
+            case PressAction::FlipOnEdge: {
+                bool trigger = P.press == PressAction::FlipOnEdge ? edge : (onGround && hold);
+                if (trigger) {
+                    g = -g;
+                    vyN = P.flipVy;
+                    onGround = false;
+                    effect = true;
+                } else if (!onGround) {
+                    vyN += P.accRelease;
+                }
+                break;
+            }
+            case PressAction::TeleportOnGround:
+                if (onGround && edge) {
+                    // the nearest surface on the other side (blocks or the playing-area bound)
+                    bool found = false;
+                    bool estimated = false;
+                    float dest = 0.f;
+                    for (size_t j = 0; j < nObs; ++j) {
+                        Obstacle const& o = obstacles[j];
+                        if (o.kind != Obstacle::Kind::Solid || o.l >= x + h || o.r <= x - h) continue;
+                        if (g > 0.f && o.b >= y + h - 1.f) {
+                            float c = o.b - h;
+                            if (!found || c < dest) dest = c, found = true;
+                        } else if (g < 0.f && o.t <= y - h + 1.f) {
+                            float c = o.t + h;
+                            if (!found || c > dest) dest = c, found = true;
+                        }
+                    }
+                    if (g > 0.f && B.hasCeil && (!found || ceilC < dest)) dest = ceilC, found = true, estimated = B.ceilEstimated;
+                    if (g < 0.f && B.hasFloor && (!found || floorC > dest)) dest = floorC, found = true, estimated = B.floorEstimated;
+                    if (!found) {
+                        out.uncertainFrom = step;
+                        stop = true;
+                        break;
+                    }
+                    y = dest;
+                    g = -g;
+                    vyN = 0.f;
+                    onGround = true;
+                    effect = true;
+                    teleported = true;
+                    boundContact(step, estimated);
+                } else if (!onGround) {
+                    vyN += P.accRelease;
+                }
+                break;
+            case PressAction::None:
+                vyN += hold ? P.accHold : P.accRelease;
+                if (vyN > 0.f) onGround = false;
+                break;
+            case PressAction::SetVelocity:
+                vyN = (hold ? 1.f : -1.f) * P.waveVy * vx / P.yScale;
+                if (vyN > 0.f) onGround = false;
+                break;
         }
-        y += vy * P.yScale;
+        if (stop) {
+            out.steps = step;
+            break;
+        }
+        if (effect) ++effects;
+        if (!effect) ++sinceTakeoff;
+        if (P.press != PressAction::SetVelocity) vyN = std::clamp(vyN, -P.maxDown, P.maxUp);
+        vy = vyN * g;
+        if (!teleported) y += vy * P.yScale;
         x += vx;
-        if (holds.empty() && pressActive && takeoffs >= targetTakeoffs) pressActive = false;
 
         bool supported = false;
-        if (hasFloor && y <= P.floorY) {
-            y = P.floorY;
+        // playing-area bounds (GD's ground / ceiling)
+        if (B.hasFloor && y <= floorC) {
+            y = floorC;
             if (vy < 0.f) vy = 0.f;
-            onGround = true;
-            supported = true;
+            if (g > 0.f) {
+                onGround = true;
+                supported = true;
+            }
+            boundContact(step, B.floorEstimated);
+        }
+        if (B.hasCeil && y >= ceilC) {
+            y = ceilC;
+            if (vy > 0.f) vy = 0.f;
+            if (g < 0.f) {
+                onGround = true;
+                supported = true;
+            }
+            boundContact(step, B.ceilEstimated);
         }
 
         float const m = std::min(12.f, m0 + dm * static_cast<float>(step));
         float const sweep = 0.5f * std::max(std::fabs(x - px), std::fabs(y - py));
-        // x only increases, so the first candidate obstacle only moves forward
         float const lo = x - h - kNear - maxW;
         while (first < nObs && obstacles[first].l < lo) ++first;
-        bool stop = false;
         for (size_t idxu = first; idxu < nObs && !stop; ++idxu) {
             Obstacle const& o = obstacles[idxu];
             if (o.l > x + h + kNear) break;
             if (o.r < x - h - kNear) continue;
             int const idx = static_cast<int>(idxu);
-            float const ol = o.l, orr = o.r;
-            float const ob = sg > 0.f ? o.b : -o.t;
-            float const ot = sg > 0.f ? o.t : -o.b;
-            float const ox = overlap(x - h, x + h, ol, orr);
-            float const oy = overlap(y - h, y + h, ob, ot);
+            float const ox = overlap(x - h, x + h, o.l, o.r);
+            float const oy = overlap(y - h, y + h, o.b, o.t);
 
             switch (o.kind) {
                 case Obstacle::Kind::Uncertain:
@@ -178,28 +315,30 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
                 }
                 case Obstacle::Kind::Solid: {
                     if (ox <= 0.f) break;
-                    // Falling onto the top: land.
-                    if (vy <= 0.f && prevBottom >= ot - kLandTolerance && y - h < ot) {
-                        y = ot + h;
-                        vy = 0.f;
-                        onGround = true;
-                        supported = true;
-                        break;
-                    }
-                    float const ix = overlap(x - in, x + in, ol, orr);
-                    float const iy = overlap(y - in, y + in, ob, ot);
-                    // Rising into the underside: bump, die if the inner hitbox gets in.
-                    if (vy > 0.f && prevTop <= ob + kLandTolerance && y + h > ob) {
+                    float const ix = overlap(x - in, x + in, o.l, o.r);
+                    float const iy = overlap(y - in, y + in, o.b, o.t);
+                    // how close the inner hitbox came to the block (a side-on graze is risky)
+                    out.clearance = std::min(out.clearance, std::max(-ix, -iy));
+                    // Reaching a top or bottom surface: stand on it / slide along it,
+                    // unless the small inner hitbox is already inside the block.
+                    bool fromAbove = vy <= 0.f && prevBottom >= o.t - kLandTolerance && y - h < o.t;
+                    bool fromBelow = vy >= 0.f && prevTop <= o.b + kLandTolerance && y + h > o.b;
+                    if (fromAbove || fromBelow) {
                         if (ix > m && iy > m) {
                             recordHit(step, idx, true);
                             stop = true;
-                        } else {
-                            y = ob - h;
-                            vy = 0.f;
+                            break;
+                        }
+                        y = fromAbove ? o.t + h : o.b - h;
+                        vy = 0.f;
+                        if ((fromAbove && g > 0.f) || (fromBelow && g < 0.f)) {
+                            onGround = true;
+                            supported = true;
                         }
                         break;
                     }
-                    if (onGround && std::fabs((y - h) - ot) < 0.5f) supported = true;
+                    if (onGround && ((g > 0.f && std::fabs((y - h) - o.t) < 0.5f) || (g < 0.f && std::fabs((y + h) - o.b) < 0.5f)))
+                        supported = true;
                     if (ix > m && iy > m) {
                         recordHit(step, idx, true);
                         stop = true;
@@ -211,26 +350,25 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
             }
         }
 
-        out.points.push_back({x, y * sg});
+        out.points.push_back({x, y});
         out.steps = step + 1;
-        if (definite || out.uncertainFrom >= 0) break;
+        if (definite || stop) break;
 
-        // Walking off an edge: nothing under us any more.
+        // Walking off an edge: nothing under us (in the gravity direction) any more.
         if (onGround && !supported) {
-            bool sup = hasFloor && std::fabs(y - P.floorY) < 0.5f;
+            bool sup = (g > 0.f && B.hasFloor && std::fabs(y - floorC) < 0.5f) || (g < 0.f && B.hasCeil && std::fabs(y - ceilC) < 0.5f);
             for (size_t j = first; j < nObs && !sup; ++j) {
                 Obstacle const& o = obstacles[j];
                 if (o.l > x + h) break;
                 if (o.kind != Obstacle::Kind::Solid || o.r <= x - h) continue;
-                float const ot = sg > 0.f ? o.t : -o.b;
-                if (std::fabs((y - h) - ot) < 0.5f) sup = true;
+                if (g > 0.f ? std::fabs((y - h) - o.t) < 0.5f : std::fabs((y + h) - o.b) < 0.5f) sup = true;
             }
             if (!sup) onGround = false;
         }
         if (wasAir && onGround && !out.landed) {
             out.landed = true;
             out.landX = x;
-            out.landY = y * sg;
+            out.landY = y;
         }
     }
 
@@ -242,7 +380,10 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
 float Predictor::score(PredictedPath const& p) const {
     if (p.outcome == Certainty::Collision) return -1000.f + static_cast<float>(p.collisionStep);
     float base = p.outcome == Certainty::Safe ? 1000.f : 500.f;
-    if (p.outcome == Certainty::Uncertain && p.collisionStep >= 0) base += static_cast<float>(p.collisionStep) * 0.5f;
+    if (p.outcome == Certainty::Uncertain) {
+        int32_t when = p.collisionStep >= 0 ? p.collisionStep : p.uncertainFrom;
+        if (when >= 0) base += static_cast<float>(when) * 0.5f;
+    }
     return base + std::min(p.clearance, 30.f);
 }
 
@@ -257,12 +398,17 @@ void Predictor::evaluate(SimStart const& s, std::span<Obstacle const> obs, Plan 
     }
 }
 
-Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding) {
-    if (obs.tick == m_adviceTick && holding == m_adviceHolding) return m_advice;
-    // In the air with the button up nothing changes the outcome until shortly
-    // before landing (a press then buffers the next jump): keep the last plan.
-    if (!holding && !obs.onGround && obs.tick <= m_reuseUntilTick && m_advice.valid && !m_advice.bestPresses &&
-        obs.tick > m_adviceTick) {
+Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding, bool allowReuse) {
+    if (allowReuse && obs.tick == m_adviceTick && holding == m_adviceHolding) return m_advice;
+    // Reuse the last plan where re-planning cannot change anything (or every
+    // other step for continuously controlled modes).
+    bool reuse = false;
+    bool const imminent = !m_advice.bestPresses && m_advice.bestPressAt >= 0 && m_advice.bestPressAt <= 2 + (obs.tick - m_computedTick);
+    if (allowReuse && m_advice.valid && obs.tick > m_adviceTick && holding == m_adviceHolding && obs.mode == m_computedMode && !imminent) {
+        if (groundOnly(obs.mode) && !holding && !obs.onGround && obs.tick <= m_reuseUntilTick && !m_advice.bestPresses) reuse = true;
+        if ((continuousControl(obs.mode) || tapControl(obs.mode)) && obs.tick - m_computedTick < 2) reuse = true;
+    }
+    if (reuse) {
         m_adviceTick = obs.tick;
         m_advice.simulations = 0;
         m_advice.micros = 0.f;
@@ -273,10 +419,16 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding)
     auto const t0 = std::chrono::steady_clock::now();
     m_advice = Advice{};
     m_adviceTick = obs.tick;
+    m_computedTick = obs.tick;
+    m_computedMode = obs.mode;
     m_adviceHolding = holding;
     if (!supports(obs.mode) || obs.obstacles.empty()) return m_advice;
 
-    SimStart const s = startFrom(obs, holding);
+    SimStart s = startFrom(obs, holding);
+    int const savedHorizon = m_horizon;
+    // flying modes: a shorter look-ahead (they re-plan every couple of steps anyway)
+    if (continuousControl(s.mode) || tapControl(s.mode)) m_horizon = std::min(m_horizon, 120);
+
     float const reach = s.x + static_cast<float>(m_horizon) * m_model.vxPerTick(s.speedClass) + kNear;
     bool relevant = false;
     for (auto const& o : obs.obstacles) {
@@ -286,69 +438,133 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding)
             break;
         }
     }
-    if (!relevant) return m_advice;
+    if (!relevant) {
+        m_horizon = savedHorizon;
+        return m_advice;
+    }
     m_advice.valid = true;
-    m_advice.trusted = trusted(s.mini);
+    m_advice.trusted = trusted(s.mode, s.mini);
 
-    // Branch 1: button down this step (tap, or hold through the landing).
-    bool havePress = false;
-    evaluate(s, obs.obstacles, Plan{0, false}, m_tmp, m_press, havePress);
-    evaluate(s, obs.obstacles, Plan{0, true}, m_tmp, m_press, havePress);
+    auto const& span = obs.obstacles;
+    bool havePress = false, haveRelease = false;
+    auto press = [&](Plan p) { evaluate(s, span, p, m_tmp, m_press, havePress); };
 
-    // Branch 2: button up this step; never press, or press k steps later.
-    // Coarse timings first, then refine around the best one and around the
-    // places where the outcome changes (finer resolution near the boundary).
-    bool haveRelease = false;
-    evaluate(s, obs.obstacles, Plan{-1, false}, m_tmp, m_release, haveRelease);
+    // ---- branch 1: button down this step ----
+    switch (s.mode) {
+        case GameMode::Cube:
+            press({0, 0, 0, false});
+            press({0, 0, 0, true});
+            break;
+        case GameMode::Robot:
+            for (int d : {0, 12, 30, 60}) press({0, d, 0, false});
+            break;
+        case GameMode::Ship:
+        case GameMode::Wave:
+            for (int d : {2, 6, 12, 24, 48, -1}) press({0, d, 0, false});
+            for (auto [hh, r] : {std::pair{4, 10}, {6, 12}, {10, 20}}) press({0, hh, r, false});
+            break;
+        case GameMode::Ufo:
+            for (int r : {0, 18, 30, 45}) press({0, 0, r, false});
+            break;
+        case GameMode::Swing:
+            for (int r : {0, 25, 45}) press({0, 0, r, false});
+            break;
+        default: // ball, spider
+            press({0, 0, 0, false});
+            break;
+    }
+
+    // ---- branch 2: button up this step; never press, or press k steps later ----
+    evaluate(s, span, Plan{-1, 0, 0, false}, m_tmp, m_release, haveRelease);
     // Pressing at step k behaves exactly like never pressing up to step k: if
     // "never" already collides by then, so does every later k (no need to simulate).
     int32_t const neverHit = m_release.outcome == Certainty::Collision ? m_release.collisionStep : INT32_MAX;
-    std::array<std::pair<int, Certainty>, std::size(kCoarseDelays)> coarse{};
-    size_t nCoarse = 0;
+
+    // continuation shapes tried for each delay
+    std::array<Plan, 3> shapes{};
+    size_t nShapes = 0;
+    switch (s.mode) {
+        case GameMode::Robot: shapes[nShapes++] = {0, 0, 0, false}; shapes[nShapes++] = {0, 30, 0, false}; break;
+        case GameMode::Ship:
+        case GameMode::Wave: shapes[nShapes++] = {0, -1, 0, false}; shapes[nShapes++] = {0, 8, 0, false}; break;
+        case GameMode::Ufo: shapes[nShapes++] = {0, 0, 0, false}; shapes[nShapes++] = {0, 0, 24, false}; break;
+        case GameMode::Swing: shapes[nShapes++] = {0, 0, 0, false}; shapes[nShapes++] = {0, 0, 30, false}; break;
+        default: shapes[nShapes++] = {0, 0, 0, false}; break;
+    }
+
+    struct Tried {
+        int k;
+        size_t shape;
+        Certainty outcome;
+    };
+    std::array<Tried, 64> tried{};
+    size_t nTried = 0;
     for (int k : kCoarseDelays) {
         if (k >= m_horizon) break;
-        if (k > neverHit) {
-            coarse[nCoarse++] = {k, Certainty::Collision};
-            continue;
+        for (size_t si = 0; si < nShapes; ++si) {
+            // second shapes only for the nearer delays (where they matter most)
+            if (si > 0 && k > 40) continue;
+            Plan p = shapes[si];
+            p.pressAt = k;
+            Certainty out;
+            if (k > neverHit) {
+                out = Certainty::Collision;
+            } else {
+                evaluate(s, span, p, m_tmp, m_release, haveRelease);
+                bool kept = m_release.plan.pressAt == k && m_release.plan.holdFor == p.holdFor && m_release.plan.repeatEvery == p.repeatEvery;
+                out = kept ? m_release.outcome : m_tmp.outcome;
+            }
+            if (nTried < tried.size()) tried[nTried++] = {k, si, out};
         }
-        evaluate(s, obs.obstacles, Plan{k, false}, m_tmp, m_release, haveRelease);
-        // After evaluate() the path for k is either the new best or left in m_tmp.
-        coarse[nCoarse++] = {k, m_release.plan.pressAt == k ? m_release.outcome : m_tmp.outcome};
     }
-    std::array<int, 16> refine{};
+    // Refine: single-step resolution around the best delay and wherever the
+    // outcome changes between neighbouring coarse delays.
+    std::array<std::pair<int, size_t>, 16> refine{};
     size_t nRefine = 0;
-    auto addRefine = [&](int k) {
-        if (k < 1 || k >= m_horizon || nRefine >= refine.size()) return;
-        for (size_t i = 0; i < nCoarse; ++i) if (coarse[i].first == k) return;
-        for (size_t i = 0; i < nRefine; ++i) if (refine[i] == k) return;
-        refine[nRefine++] = k;
+    auto addRefine = [&](int k, size_t si) {
+        if (k < 1 || k >= m_horizon || k > neverHit || nRefine >= refine.size()) return;
+        for (size_t i = 0; i < nTried; ++i) if (tried[i].k == k && tried[i].shape == si) return;
+        for (size_t i = 0; i < nRefine; ++i) if (refine[i].first == k && refine[i].second == si) return;
+        refine[nRefine++] = {k, si};
     };
-    int bestK = m_release.plan.pressAt;
-    if (bestK > 0) {
-        addRefine(bestK - 1);
-        addRefine(bestK + 1);
-        addRefine(bestK - 2);
-        addRefine(bestK + 2);
+    if (m_release.plan.pressAt > 0) {
+        size_t si = 0;
+        for (size_t i = 0; i < nShapes; ++i)
+            if (shapes[i].holdFor == m_release.plan.holdFor && shapes[i].repeatEvery == m_release.plan.repeatEvery) si = i;
+        for (int d : {-2, -1, 1, 2}) addRefine(m_release.plan.pressAt + d, si);
     }
-    for (size_t i = 1; i < nCoarse; ++i) {
-        if (coarse[i].second != coarse[i - 1].second) addRefine((coarse[i].first + coarse[i - 1].first) / 2);
+    for (size_t i = 1; i < nTried; ++i) {
+        for (size_t j = i; j-- > 0;) {
+            if (tried[j].shape != tried[i].shape) continue;
+            if (tried[j].outcome != tried[i].outcome) addRefine((tried[i].k + tried[j].k) / 2, tried[i].shape);
+            break;
+        }
     }
     for (size_t i = 0; i < nRefine; ++i) {
-        if (refine[i] > neverHit) continue;
-        evaluate(s, obs.obstacles, Plan{refine[i], false}, m_tmp, m_release, haveRelease);
+        Plan p = shapes[refine[i].second];
+        p.pressAt = refine[i].first;
+        evaluate(s, span, p, m_tmp, m_release, haveRelease);
     }
-    if (m_release.plan.pressAt > 0) evaluate(s, obs.obstacles, Plan{m_release.plan.pressAt, true}, m_tmp, m_release, haveRelease);
+    if ((s.mode == GameMode::Cube || s.mode == GameMode::Robot) && m_release.plan.pressAt > 0) {
+        Plan p = m_release.plan;
+        p.rejump = true;
+        evaluate(s, span, p, m_tmp, m_release, haveRelease);
+    }
 
     m_advice.press = m_press.outcome;
     m_advice.release = m_release.outcome;
     m_advice.pressTTC = m_press.outcome == Certainty::Collision ? m_press.collisionStep : -1;
     m_advice.releaseTTC = m_release.outcome == Certainty::Collision ? m_release.collisionStep : -1;
-    // Prefer not pressing unless pressing now is clearly better: waiting keeps options open.
-    m_bestPresses = score(m_press) > score(m_release) + 1.f;
+    // Prefer not pressing unless pressing now is clearly better: waiting keeps
+    // options open. But if the best "wait" plan presses within two steps anyway,
+    // waiting gains nothing and risks being too late: press unless waiting is
+    // clearly better.
+    bool const reallyWaits = m_release.plan.pressAt < 0 || m_release.plan.pressAt >= 3;
+    m_bestPresses = reallyWaits ? score(m_press) > score(m_release) + 1.f : score(m_press) + 1.f >= score(m_release);
     m_advice.bestPresses = m_bestPresses;
     m_advice.bestPressAt = m_bestPresses ? 0 : m_release.plan.pressAt;
-    if (!s.onGround && !holding && !m_bestPresses && m_release.landed) {
-        // steps until the predicted landing (points are one per step)
+
+    if (groundOnly(s.mode) && !s.onGround && !holding && !m_bestPresses && m_release.landed) {
         int32_t landStep = 0;
         for (auto const& pt : m_release.points) {
             ++landStep;
@@ -356,6 +572,7 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding)
         }
         if (landStep > 24) m_reuseUntilTick = obs.tick + landStep - 20;
     }
+    m_horizon = savedHorizon;
     m_advice.micros = std::chrono::duration<float, std::micro>(std::chrono::steady_clock::now() - t0).count();
     return m_advice;
 }
@@ -399,9 +616,98 @@ void Predictor::onDeath(int32_t tick, float x, float y) {
     m_expectValid = false;
 }
 
+void Predictor::updateBounds(Observation const& obs, bool held) {
+    ModePhysics const& P = m_model.params(obs.mode, obs.mini);
+    float const h = P.halfSize;
+    bool const hintChanged = obs.hasBoundsHint &&
+                             (std::fabs(obs.boundsHintBottom - m_boundsHintBottom) > 1.f || std::fabs(obs.boundsHintTop - m_boundsHintTop) > 1.f);
+    if (obs.mode != m_boundsMode || hintChanged) {
+        // New mode / corridor: start from the hint (unconfirmed) or the plain level floor.
+        bool first = m_boundsMode == GameMode::Count;
+        m_boundsMode = obs.mode;
+        if (first) {
+            m_bounds = Bounds{};
+            m_bounds.floor = m_model.cubeFloorY(false) - 15.f;
+        }
+        // Without a hint the previous floor/ceiling stay, but must be re-confirmed.
+        if (obs.mode != GameMode::Cube) {
+            m_bounds.floorEstimated = true;
+            m_bounds.ceilEstimated = true;
+        } else {
+            m_bounds.hasCeil = false;
+        }
+        if (obs.hasBoundsHint && obs.mode != GameMode::Cube) {
+            m_bounds.floor = obs.boundsHintBottom;
+            m_bounds.hasCeil = obs.boundsHintTop > obs.boundsHintBottom + 2.f * h;
+            m_bounds.ceil = obs.boundsHintTop;
+            m_bounds.ceilEstimated = true;
+        }
+        m_boundsHintBottom = obs.boundsHintBottom;
+        m_boundsHintTop = obs.boundsHintTop;
+    }
+
+    // Confirm a bound by touching it where no block explains the contact.
+    auto blockAt = [&](bool below) {
+        for (auto const& o : obs.obstacles) {
+            if (o.kind != Obstacle::Kind::Solid || o.l >= obs.x + h || o.r <= obs.x - h) continue;
+            if (below && std::fabs(o.t - (obs.y - h)) < 1.f) return true;
+            if (!below && std::fabs(o.b - (obs.y + h)) < 1.f) return true;
+        }
+        return false;
+    };
+    bool const resting = std::fabs(obs.vy) < 0.01f;
+    bool bottom = false, top = false;
+    if (obs.onGround) {
+        (obs.upsideDown ? top : bottom) = true;
+    } else if (obs.mode == GameMode::Ship || obs.mode == GameMode::Wave) {
+        // flying pressed against a bound: no movement for several steps (a single
+        // zero-velocity step also happens when the ship turns around mid-air)
+        bool pinned = resting && std::fabs(obs.y - m_lastY) < 0.01f;
+        m_pressedSteps = pinned ? m_pressedSteps + 1 : 0;
+        if (m_pressedSteps >= 3) (held != obs.upsideDown ? top : bottom) = true;
+    }
+    m_lastY = obs.y;
+    if (bottom || top) {
+        bool atBottom = bottom;
+        if (atBottom && !blockAt(true)) {
+            float surf = obs.y - h;
+            if (m_bounds.floorEstimated || surf < m_bounds.floor) {
+                m_bounds.floor = surf;
+                m_bounds.floorEstimated = false;
+                m_bounds.hasFloor = true;
+            }
+        } else if (!atBottom && !blockAt(false)) {
+            float surf = obs.y + h;
+            if (!m_bounds.hasCeil || m_bounds.ceilEstimated || surf > m_bounds.ceil) {
+                m_bounds.ceil = surf;
+                m_bounds.ceilEstimated = false;
+                m_bounds.hasCeil = true;
+            }
+        }
+    }
+}
+
 void Predictor::observe(Observation const& obs, bool heldDuringStep) {
-    Rec r{obs.x, obs.y, obs.vy, obs.onGround, obs.upsideDown, obs.mini, heldDuringStep, obs.dead, obs.mode, 0, obs.tick};
-    r.speedClass = obs.speedClass();
+    // robot boost bookkeeping (needed to simulate from the middle of a jump)
+    if (obs.mode == GameMode::Robot) {
+        Rec const* last = m_histCount ? &m_hist[(m_histHead + kHistory - 1) % kHistory] : nullptr;
+        if (last && last->tick + 1 == obs.tick && last->onGround && !obs.onGround && heldDuringStep) {
+            m_robotSince = 0;
+            m_robotAlive = true;
+        } else if (!obs.onGround) {
+            ++m_robotSince;
+            if (!heldDuringStep) m_robotAlive = false;
+        } else {
+            m_robotAlive = false;
+        }
+    } else {
+        m_robotAlive = false;
+    }
+    int32_t boostLeft = obs.mode == GameMode::Robot && m_robotAlive
+                            ? std::max(0, m_model.params(obs.mode, obs.mini).boostSteps - m_robotSince) : 0;
+    Rec r{obs.x, obs.y, obs.vy, obs.onGround, obs.upsideDown, obs.mini, heldDuringStep, obs.dead, obs.mode, obs.speedClass(), obs.tick,
+          obs.playerSpeed, boostLeft};
+    if (!obs.dead) updateBounds(obs, heldDuringStep);
 
     if (m_histCount > 0) {
         Rec const& p = m_hist[(m_histHead + kHistory - 1) % kHistory];
@@ -416,13 +722,13 @@ void Predictor::observe(Observation const& obs, bool heldDuringStep) {
             prev.dead = p.dead;
             prev.mode = p.mode;
             prev.tick = p.tick;
-            prev.playerSpeed = obs.playerSpeed;
-            if (p.speedClass != r.speedClass) prev.playerSpeed = 0.f; // forces a mismatch: skip vx sample
-            m_model.observeStep(prev, obs, heldDuringStep);
+            prev.playerSpeed = p.playerSpeed;
+            m_model.observeStep(prev, obs, heldDuringStep, p.held);
 
-            // One-step prediction error (diagnostics).
-            if (supports(p.mode) && p.mode == obs.mode && !p.dead && !obs.dead) {
-                SimStart s{p.x, p.y, p.vy, p.onGround, p.upsideDown, p.mini, heldDuringStep, r.speedClass, p.tick};
+            // one-step prediction error (diagnostics)
+            if (p.mode == obs.mode && p.mini == obs.mini && !p.dead && !obs.dead) {
+                SimStart s{p.x, p.y, p.vy, p.mode, p.onGround, p.upsideDown, p.mini, p.held, p.speedClass, p.tick, m_bounds,
+                           p.robotBoostLeft};
                 uint8_t hold = heldDuringStep ? 1 : 0;
                 simulate(s, obs.obstacles, Plan{}, m_resim, std::span<uint8_t const>(&hold, 1));
                 if (!m_resim.points.empty()) {
@@ -448,28 +754,28 @@ void Predictor::observe(Observation const& obs, bool heldDuringStep) {
         bool ok = supports(s0.mode);
         for (int i = 0; i <= kResimSteps && ok; ++i) {
             Rec const& q = at(static_cast<size_t>(i));
-            ok = q.mode == s0.mode && q.mini == s0.mini && q.upsideDown == s0.upsideDown && !q.dead && q.speedClass == s0.speedClass;
+            ok = q.mode == s0.mode && q.mini == s0.mini && !q.dead && q.speedClass == s0.speedClass;
         }
         if (ok) {
             m_holdBuf.clear();
             for (int i = kResimSteps - 1; i >= 0; --i) m_holdBuf.push_back(at(static_cast<size_t>(i)).held ? 1 : 0);
-            SimStart s{s0.x, s0.y, s0.vy, s0.onGround, s0.upsideDown, s0.mini, false, s0.speedClass, s0.tick};
+            SimStart s{s0.x, s0.y, s0.vy, s0.mode, s0.onGround, s0.upsideDown, s0.mini, s0.held, s0.speedClass, s0.tick, m_bounds,
+                       s0.robotBoostLeft};
             simulate(s, obs.obstacles, Plan{}, m_resim, m_holdBuf);
             Rec const& end = at(0);
             float err;
-            if (m_resim.outcome == Certainty::Collision || static_cast<int>(m_resim.points.size()) < kResimSteps) {
-                err = 20.f; // the model thought we would die (or hit something unmodelled) but we did not
-                if (m_resim.uncertainFrom >= 0) err = -1.f; // unmodelled object: not the model's fault
+            if (m_resim.uncertainFrom >= 0) {
+                err = -1.f; // unmodelled object involved: not the model's fault
+            } else if (m_resim.outcome == Certainty::Collision || static_cast<int>(m_resim.points.size()) < kResimSteps) {
+                err = 20.f; // the model thought we would die but we did not
             } else {
                 auto const& e = m_resim.points.back();
                 err = std::hypot(e.x - end.x, e.y - end.y);
             }
-            if (err >= 0.f) m_model.recordAccuracy(err, kResimSteps);
+            if (err >= 0.f) m_model.recordAccuracy(s0.mode, err, kResimSteps);
         }
     }
 
-    // A predicted-safe expectation that ran its course without a death slowly
-    // restores trust.
     if (m_expectValid && obs.tick > m_expectTick + m_expectSteps) {
         if (m_expectOutcome == Certainty::Safe) m_caution = std::max(1.f, m_caution * 0.98f);
         m_expectValid = false;

@@ -104,7 +104,7 @@
 		"prediction-enabled": {
 			"type": "bool",
 			"name": "Use Prediction",
-			"description": "Simulate the cube's path before each decision: avoid predicted collisions, pick jump timings by simulation, and learn rejected timings without dying. Cube mode only; other modes learn from experience as before.",
+			"description": "Simulate the player's path before each decision (every game mode): avoid predicted collisions, pick timings by simulation, and learn rejected timings without dying. Each mode is used once its physics have been calibrated from your own play.",
 			"default": true
 		},
 		"show-trajectory": {

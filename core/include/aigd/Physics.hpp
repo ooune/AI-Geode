@@ -8,57 +8,90 @@
 
 namespace aigd {
 
-// Cube physics per 240 Hz step. Defaults were measured from Geometry Dash
-// 2.2081 (normal-size cube): vy drops by 0.2156 per step, y changes by
-// vy * 0.225, and the first airborne step after a jump has vy = 10.964
-// (11.180 jump impulse minus one step of gravity).
-struct CubePhysics {
-    float takeoffVy = 10.9644f;  // vy after the take-off step
-    float gravity = 0.215595f;   // vy lost per airborne step
-    float yScale = 0.225f;       // y += vy * yScale per step
-    float maxFall = 15.f;        // terminal falling speed (|vy|)
-    float halfSize = 15.f;       // outer hitbox half extent
-    float innerHalf = 4.5f;      // inner hitbox half extent (solids kill only here)
-    float floorY = 105.f;        // player centre when standing on the level floor
+// What the jump button does in a game mode.
+enum class PressAction : uint8_t {
+    None,              // ship: holding changes acceleration only
+    JumpOnGround,      // cube, robot: jump while touching the ground (holding re-jumps)
+    ImpulseOnEdge,     // UFO: every new press gives an upward kick, also in the air
+    FlipOnGround,      // ball: flip gravity while touching the ground
+    FlipOnEdge,        // swing: every new press flips gravity, also in the air
+    TeleportOnGround,  // spider: a new press on the ground jumps instantly to the opposite surface
+    SetVelocity,       // wave: held = move diagonally up, released = down
 };
 
-// Running sums used to calibrate the model; plain data so it can be saved.
+// Per-step vertical physics of one game mode (and size). All vertical values
+// are gravity-normalised: positive = away from the surface gravity pulls to.
+struct ModePhysics {
+    PressAction press = PressAction::JumpOnGround;
+    float accHold = -0.215595f;    // velocity change per airborne step while held
+    float accRelease = -0.215595f; // ... while released
+    float maxUp = 30.f;            // velocity caps
+    float maxDown = 15.f;
+    float yScale = 0.225f;         // y += vy * yScale per step
+    float impulse = 10.9644f;      // velocity after a jump/flap step
+    float flipVy = 0.f;            // velocity (new gravity frame) right after a flip
+    float waveVy = 5.77f;          // wave: |vy| while moving
+    int boostSteps = 0;            // robot: accHold applies only this long after take-off
+    float halfSize = 15.f;         // outer hitbox half extent (assumption, not read from the game)
+    float innerHalf = 4.5f;        // inner hitbox half extent (assumption)
+};
+
+struct RunningStat {
+    double sum = 0.0;
+    uint32_t n = 0;
+    void add(double v) {
+        sum += v;
+        ++n;
+    }
+    double mean(double fallback) const { return n ? sum / n : fallback; }
+};
+
+// Running sums used to calibrate one mode/size; plain data so it can be saved.
+struct ModeCalibration {
+    RunningStat accHold, accRelease, impulse, flipVy, waveVy;
+    double kYV = 0.0, kVV = 0.0;
+    uint32_t kN = 0;
+    float maxUp = 0.f, maxDown = 0.f;
+    uint32_t capUpN = 0, capDownN = 0;
+    uint32_t flips = 0, teleports = 0;
+    float floorY = 0.f;   // cube only: the level floor (GD's ground)
+    uint32_t floorN = 0;
+    uint32_t boostMax = 0; // robot: longest boost seen after a take-off (steps)
+};
+
 struct PhysicsCalibration {
-    struct Size {
-        double gSum = 0, gSq = 0;
-        uint32_t gN = 0;
-        double kYV = 0, kVV = 0;
-        uint32_t kN = 0;
-        double v0Sum = 0;
-        uint32_t v0N = 0;
-        float fallCap = 0.f;
-        uint32_t fallCapN = 0;
-        float floorY = 0.f;
-        uint32_t floorN = 0;
-    };
-    std::array<Size, 2> size; // [0] normal, [1] mini
+    static constexpr size_t kSlots = static_cast<size_t>(GameMode::Count) * 2;
+    std::array<ModeCalibration, kSlots> modes{};
     std::array<double, 5> vxSum{};
     std::array<uint32_t, 5> vxN{};
+
+    static size_t slot(GameMode m, bool mini) { return static_cast<size_t>(m) * 2 + (mini ? 1 : 0); }
 };
 
-// Physics model of the player that is fitted to what the game actually does.
-// Parameters only move once enough consistent samples exist, and single odd
-// frames (orbs, pads, teleports) are rejected as outliers.
+// Physics model of the player for every game mode, fitted to what the game
+// actually does. Defaults are GD 2.2081 values where measured (cube) and
+// rough guesses elsewhere; a mode is only "calibrated" (trusted) once enough
+// of its own events have been observed. Single odd frames (orbs, pads,
+// teleport portals) are rejected as outliers.
 class PhysicsModel {
 public:
     PhysicsModel();
 
-    CubePhysics const& cube(bool mini) const { return m_params[mini ? 1 : 0]; }
+    ModePhysics const& params(GameMode mode, bool mini) const { return m_params[PhysicsCalibration::slot(mode, mini)]; }
+    ModePhysics const& cube(bool mini) const { return params(GameMode::Cube, mini); }
+    float cubeFloorY(bool mini) const;
     float vxPerTick(int speedClass) const;
-    bool calibrated(bool mini) const;
+    bool calibrated(GameMode mode, bool mini) const;
+    bool calibrated(bool mini) const { return calibrated(GameMode::Cube, mini); }
+    static ModePhysics defaults(GameMode mode, bool mini);
 
-    // Feed two consecutive observations (one physics step apart) and whether
-    // the jump button was held during that step.
-    void observeStep(Observation const& prev, Observation const& cur, bool heldDuringStep);
+    // Two consecutive observations (one physics step apart) and the button
+    // state during that step / the step before (to detect new presses).
+    void observeStep(Observation const& prev, Observation const& cur, bool heldDuringStep, bool heldBefore);
 
-    // Accuracy of multi-step re-simulation (position error after n steps).
-    void recordAccuracy(float error, int steps);
-    float driftPerTick() const { return m_drift; }
+    void recordAccuracy(GameMode mode, float error, int steps);
+    float driftPerTick(GameMode mode) const;
+    float driftPerTick() const { return driftPerTick(GameMode::Cube); }
     float lastResimError() const { return m_lastResimError; }
     uint32_t accuracySamples() const { return m_accuracyN; }
 
@@ -66,16 +99,19 @@ public:
     void loadCalibration(PhysicsCalibration const& cal);
     void reset();
 
-    std::string describe() const;
+    std::string describe(GameMode mode) const;
+    std::string describe() const { return describe(GameMode::Cube); }
 
 private:
-    void refit(int i);
+    void refit(size_t slot);
 
     PhysicsCalibration m_cal;
-    std::array<CubePhysics, 2> m_params;
-    float m_drift = 0.25f;   // pessimistic until measured
+    std::array<ModePhysics, PhysicsCalibration::kSlots> m_params;
+    std::array<float, static_cast<size_t>(GameMode::Count)> m_drift{};
+    std::array<uint32_t, static_cast<size_t>(GameMode::Count)> m_driftN{};
     float m_lastResimError = 0.f;
     uint32_t m_accuracyN = 0;
+    int32_t m_robotSinceTakeoff = 1 << 20;
 };
 
 } // namespace aigd

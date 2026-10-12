@@ -84,7 +84,7 @@ void StatusPanel::refresh() {
             } else {
                 text += fmt::format("\nPrediction: press {} | release {} | {} | avoided {} this attempt",
                                     outcome(st.pressOutcome, st.pressTTC), outcome(st.releaseOutcome, st.releaseTTC),
-                                    st.predictionTrusted ? fmt::format("model ok, drift {:.3f}/step", pr.model().driftPerTick())
+                                    st.predictionTrusted ? fmt::format("model ok, drift {:.3f}/step", pr.model().driftPerTick(ai.lastObservation().mode))
                                                          : std::string("calibrating - not acting on it yet"),
                                     st.shieldsThisAttempt);
             }
@@ -113,7 +113,7 @@ void StatusPanel::refresh() {
                 auto const& adv = pr.lastAdvice();
                 text += fmt::format(
                     "\n[physics] {} | step error {:.2f}u (pred y {:.2f} / real {:.2f}) | 32-step error {:.2f}u",
-                    pr.model().describe(), pr.lastStepError(), pr.lastPredictedY(), pr.lastActualY(), pr.model().lastResimError()
+                    pr.model().describe(ai.lastObservation().mode), pr.lastStepError(), pr.lastPredictedY(), pr.lastActualY(), pr.model().lastResimError()
                 );
                 text += fmt::format(
                     "\n[planner] {} sims in {:.0f}us | {} obstacles | best: {} | mispredictions {} (caution {:.2f}) | {}{}",

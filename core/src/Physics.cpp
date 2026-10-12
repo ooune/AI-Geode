@@ -7,18 +7,78 @@
 namespace aigd {
 
 namespace {
-CubePhysics defaults(bool mini) {
-    CubePhysics p;
-    if (mini) {
-        // Not measured yet: scaled guesses, the calibrator replaces them quickly.
-        p.takeoffVy = 9.18f;
-        p.halfSize = 9.f;
-        p.innerHalf = 2.7f;
-        p.floorY = 99.f;
+// Modes where holding the button does not change the falling acceleration, so
+// held and released samples measure the same thing.
+bool pooledGravity(GameMode m) {
+    return m != GameMode::Ship && m != GameMode::Robot && m != GameMode::Wave;
+}
+
+bool acceptSample(RunningStat const& s, double v, double fallback, double relTol, double absTol) {
+    if (s.n < 20) return true;
+    double mean = s.mean(fallback);
+    return std::fabs(v - mean) < std::max(absTol, relTol * std::fabs(mean));
+}
+} // namespace
+
+ModePhysics PhysicsModel::defaults(GameMode mode, bool mini) {
+    // Cube values were measured from GD 2.2081; everything else is a starting
+    // guess that the calibrator replaces from real observations.
+    ModePhysics p;
+    float scale = mini ? 0.6f : 1.f;
+    p.halfSize = 15.f * scale;
+    p.innerHalf = 4.5f * scale;
+    switch (mode) {
+        case GameMode::Cube:
+            p.press = PressAction::JumpOnGround;
+            if (mini) p.impulse = 9.18f;
+            break;
+        case GameMode::Robot:
+            p.press = PressAction::JumpOnGround;
+            p.impulse = 7.f;
+            p.accHold = -0.08f;
+            p.boostSteps = 60;
+            break;
+        case GameMode::Ship:
+            p.press = PressAction::None;
+            p.accHold = 0.18f;
+            p.accRelease = -0.18f;
+            p.maxUp = 8.f;
+            p.maxDown = 8.f;
+            p.halfSize = 12.f * scale;
+            break;
+        case GameMode::Ufo:
+            p.press = PressAction::ImpulseOnEdge;
+            p.impulse = 7.f;
+            p.accHold = p.accRelease = -0.13f;
+            p.maxDown = 10.f;
+            break;
+        case GameMode::Ball:
+            p.press = PressAction::FlipOnGround;
+            p.accHold = p.accRelease = -0.15f;
+            p.flipVy = -2.f;
+            p.maxDown = 12.f;
+            break;
+        case GameMode::Wave:
+            p.press = PressAction::SetVelocity;
+            p.waveVy = mini ? 2.f : 1.f; // slope: |dy| per unit of dx
+            p.halfSize = 6.f * scale;
+            p.innerHalf = 3.f * scale;
+            break;
+        case GameMode::Spider:
+            p.press = PressAction::TeleportOnGround;
+            p.maxDown = 15.f;
+            break;
+        case GameMode::Swing:
+            p.press = PressAction::FlipOnEdge;
+            p.accHold = p.accRelease = -0.13f;
+            p.flipVy = -1.f;
+            p.maxDown = 9.f;
+            break;
+        default:
+            break;
     }
     return p;
 }
-} // namespace
 
 PhysicsModel::PhysicsModel() {
     reset();
@@ -26,16 +86,24 @@ PhysicsModel::PhysicsModel() {
 
 void PhysicsModel::reset() {
     m_cal = PhysicsCalibration{};
-    m_params = {defaults(false), defaults(true)};
-    m_drift = 0.25f;
+    for (size_t i = 0; i < PhysicsCalibration::kSlots; ++i) {
+        m_params[i] = defaults(static_cast<GameMode>(i / 2), (i % 2) == 1);
+    }
+    m_drift.fill(0.25f);
+    m_driftN.fill(0);
     m_lastResimError = 0.f;
     m_accuracyN = 0;
 }
 
 void PhysicsModel::loadCalibration(PhysicsCalibration const& cal) {
     m_cal = cal;
-    refit(0);
-    refit(1);
+    for (size_t i = 0; i < PhysicsCalibration::kSlots; ++i) refit(i);
+}
+
+float PhysicsModel::cubeFloorY(bool mini) const {
+    auto const& c = m_cal.modes[PhysicsCalibration::slot(GameMode::Cube, mini)];
+    float def = mini ? 99.f : 105.f;
+    return c.floorN ? std::min(def, c.floorY) : def;
 }
 
 float PhysicsModel::vxPerTick(int speedClass) const {
@@ -44,21 +112,34 @@ float PhysicsModel::vxPerTick(int speedClass) const {
     return unitsPerSecond(i) / kTicksPerSecond;
 }
 
-bool PhysicsModel::calibrated(bool mini) const {
-    auto const& s = m_cal.size[mini ? 1 : 0];
-    return s.v0N >= 2 && s.gN >= 20 && s.kN >= 20;
+bool PhysicsModel::calibrated(GameMode mode, bool mini) const {
+    auto const& c = m_cal.modes[PhysicsCalibration::slot(mode, mini)];
+    uint32_t pooled = c.accHold.n + c.accRelease.n;
+    switch (mode) {
+        case GameMode::Cube: return c.impulse.n >= 2 && pooled >= 20 && c.kN >= 20;
+        case GameMode::Robot: return c.impulse.n >= 2 && c.accRelease.n >= 20 && c.accHold.n >= 10 && c.kN >= 20;
+        case GameMode::Ship: return c.accHold.n >= 20 && c.accRelease.n >= 20 && c.kN >= 20;
+        case GameMode::Ufo: return c.impulse.n >= 2 && pooled >= 20 && c.kN >= 20;
+        case GameMode::Ball:
+        case GameMode::Swing: return c.flips >= 2 && pooled >= 20 && c.kN >= 20;
+        case GameMode::Spider: {
+            // a spider rarely free-falls; its gravity can come from the cube's
+            auto const& cube = m_cal.modes[PhysicsCalibration::slot(GameMode::Cube, mini)];
+            return c.teleports >= 2 && ((pooled >= 20 && c.kN >= 20) || (cube.accHold.n + cube.accRelease.n >= 20 && cube.kN >= 20));
+        }
+        case GameMode::Wave: return c.waveVy.n >= 10;
+        default: return false;
+    }
 }
 
-void PhysicsModel::observeStep(Observation const& prev, Observation const& cur, bool held) {
-    if (prev.mode != GameMode::Cube || cur.mode != GameMode::Cube) return;
-    if (prev.mini != cur.mini || prev.upsideDown != cur.upsideDown) return;
+void PhysicsModel::observeStep(Observation const& prev, Observation const& cur, bool held, bool heldBefore) {
+    if (prev.mode != cur.mode || prev.mini != cur.mini) return;
     if (cur.tick - prev.tick != 1 || prev.dead || cur.dead) return;
+    size_t const slot = PhysicsCalibration::slot(cur.mode, cur.mini);
+    auto& c = m_cal.modes[slot];
+    ModePhysics const& p = m_params[slot];
 
-    int i = cur.mini ? 1 : 0;
-    auto& s = m_cal.size[i];
-    auto const& p = m_params[i];
-
-    // horizontal speed
+    // horizontal speed (all modes move right at the speed-portal speed)
     float dx = cur.x - prev.x;
     if (prev.speedClass() == cur.speedClass() && dx > 0.f && dx < 4.f) {
         int sc = cur.speedClass();
@@ -69,86 +150,162 @@ void PhysicsModel::observeStep(Observation const& prev, Observation const& cur, 
         }
     }
 
-    float sign = cur.upsideDown ? -1.f : 1.f;
-    float vp = prev.vy * sign;
-    float vc = cur.vy * sign;
-    float dy = (cur.y - prev.y) * sign;
-    bool bothAir = !prev.onGround && !cur.onGround;
+    float const gp = prev.upsideDown ? -1.f : 1.f;
+    float const gc = cur.upsideDown ? -1.f : 1.f;
+    float const vp = prev.vy * gp;
+    float const vc = cur.vy * gc;
+    float const dyN = (cur.y - prev.y) * gp;
+    bool const edge = held && !heldBefore;
+    bool const bothAir = !prev.onGround && !cur.onGround;
 
-    // gravity: velocity lost per airborne step (not at the fall cap)
-    if (bothAir && vc < vp && std::fabs(vc) < p.maxFall * 0.98f) {
-        float d = vp - vc;
-        double mean = s.gN ? s.gSum / s.gN : p.gravity;
-        bool ok = d > 0.02f && d < 1.f && (s.gN < 20 || std::fabs(d - mean) < std::max(0.02, 0.1 * mean));
-        if (ok) {
-            s.gSum += d;
-            s.gSq += static_cast<double>(d) * d;
-            ++s.gN;
+    if (prev.upsideDown != cur.upsideDown) {
+        // Gravity flipped during this step: a ball/swing flip or a spider teleport.
+        if (p.press == PressAction::TeleportOnGround && std::fabs(cur.y - prev.y) > 20.f) {
+            ++c.teleports;
+        } else if (p.press == PressAction::FlipOnGround || p.press == PressAction::FlipOnEdge) {
+            if (acceptSample(c.flipVy, vc, p.flipVy, 0.25, 0.3)) {
+                c.flipVy.add(vc);
+                ++c.flips;
+            }
+        }
+        refit(slot);
+        return;
+    }
+
+    if (p.press == PressAction::SetVelocity) {
+        // wave: straight diagonal lines; slope = |dy| / dx
+        if (bothAir && dx > 0.5f && std::fabs(dyN) > 0.05f) {
+            double slope = std::fabs(dyN) / dx;
+            if (acceptSample(c.waveVy, slope, p.waveVy, 0.05, 0.02)) c.waveVy.add(slope);
+        }
+        refit(slot);
+        return;
+    }
+
+    // Press events
+    if (p.press == PressAction::JumpOnGround && prev.onGround && !cur.onGround && held && vc > 1.f) {
+        if (c.impulse.n < 2 || acceptSample(c.impulse, vc, p.impulse, 0.15, 0.2)) c.impulse.add(vc);
+        m_robotSinceTakeoff = 0;
+        refit(slot);
+        return;
+    }
+    if (cur.mode == GameMode::Robot && bothAir) ++m_robotSinceTakeoff;
+    if (p.press == PressAction::ImpulseOnEdge && edge && vc - vp > 1.f) {
+        if (c.impulse.n < 2 || acceptSample(c.impulse, vc, p.impulse, 0.15, 0.2)) c.impulse.add(vc);
+        refit(slot);
+        return;
+    }
+
+    if (bothAir) {
+        float d = vc - vp;
+        // velocity caps: no more acceleration although airborne
+        if (std::fabs(d) < 0.005f && std::fabs(vc) > 1.f) {
+            if (vc > 0.f) {
+                c.maxUp = c.capUpN ? std::max(c.maxUp, vc) : vc;
+                ++c.capUpN;
+            } else {
+                c.maxDown = c.capDownN ? std::max(c.maxDown, -vc) : -vc;
+                ++c.capDownN;
+            }
+        } else if (std::fabs(d) < 1.f) {
+            if (cur.mode == GameMode::Robot) {
+                // robot: holding only boosts briefly after take-off; keep the two apart
+                if (held && d > p.accRelease + 0.03f) {
+                    if (acceptSample(c.accHold, d, p.accHold, 0.2, 0.02)) c.accHold.add(d);
+                    if (m_robotSinceTakeoff < 1000) c.boostMax = std::max<uint32_t>(c.boostMax, static_cast<uint32_t>(m_robotSinceTakeoff));
+                } else if (!held) {
+                    if (acceptSample(c.accRelease, d, p.accRelease, 0.1, 0.02)) c.accRelease.add(d);
+                }
+            } else if (pooledGravity(cur.mode)) {
+                // the same gravity whatever the button does: pool both
+                RunningStat& s = c.accRelease;
+                double mean = (c.accHold.sum + c.accRelease.sum) / std::max<uint32_t>(1, c.accHold.n + c.accRelease.n);
+                if (c.accHold.n + c.accRelease.n < 20 || std::fabs(d - mean) < std::max(0.02, 0.1 * std::fabs(mean))) s.add(d);
+            } else {
+                RunningStat& s = held ? c.accHold : c.accRelease;
+                if (acceptSample(s, d, held ? p.accHold : p.accRelease, 0.1, 0.02)) s.add(d);
+            }
+        }
+        if (std::fabs(vc) > 0.5f) {
+            float ratio = dyN / vc;
+            double k = c.kVV > 0 ? c.kYV / c.kVV : p.yScale;
+            if (ratio > 0.05f && ratio < 1.f && (c.kN < 20 || std::fabs(ratio - k) < 0.1 * k)) {
+                c.kYV += static_cast<double>(dyN) * vc;
+                c.kVV += static_cast<double>(vc) * vc;
+                ++c.kN;
+            }
         }
     }
 
-    // vertical scale: y change per unit of velocity
-    if (bothAir && std::fabs(vc) > 0.5f) {
-        float ratio = dy / vc;
-        double k = s.kVV > 0 ? s.kYV / s.kVV : p.yScale;
-        bool ok = ratio > 0.05f && ratio < 1.f && (s.kN < 20 || std::fabs(ratio - k) < 0.1 * k);
-        if (ok) {
-            s.kYV += static_cast<double>(dy) * vc;
-            s.kVV += static_cast<double>(vc) * vc;
-            ++s.kN;
-        }
+    if (cur.mode == GameMode::Cube && !cur.upsideDown && cur.onGround && prev.onGround && std::fabs(cur.vy) < 0.01f) {
+        if (c.floorN == 0 || cur.y < c.floorY) c.floorY = cur.y;
+        ++c.floorN;
     }
-
-    // jump impulse: velocity on the first airborne step after pressing on the ground
-    if (prev.onGround && !cur.onGround && held && vc > 1.f) {
-        double mean = s.v0N ? s.v0Sum / s.v0N : vc;
-        if (s.v0N < 2 || std::fabs(vc - mean) < 0.15 * mean) {
-            s.v0Sum += vc;
-            ++s.v0N;
-        }
-    }
-
-    // terminal velocity: falling without accelerating any more
-    if (bothAir && vc < -3.f && std::fabs(vp - vc) < 0.005f) {
-        s.fallCap = s.fallCapN ? std::max(s.fallCap, -vc) : -vc;
-        ++s.fallCapN;
-    }
-
-    // level floor: the lowest height the player stands at
-    if (!cur.upsideDown && cur.onGround && prev.onGround && std::fabs(cur.vy) < 0.01f) {
-        if (s.floorN == 0 || cur.y < s.floorY) s.floorY = cur.y;
-        ++s.floorN;
-    }
-
-    refit(i);
+    refit(slot);
 }
 
-void PhysicsModel::refit(int i) {
-    auto const& s = m_cal.size[i];
-    CubePhysics p = defaults(i == 1);
-    if (s.gN >= 10) p.gravity = static_cast<float>(s.gSum / s.gN);
-    if (s.kN >= 10 && s.kVV > 0) p.yScale = static_cast<float>(s.kYV / s.kVV);
-    if (s.v0N >= 1) p.takeoffVy = static_cast<float>(s.v0Sum / s.v0N);
-    if (s.fallCapN >= 3) p.maxFall = s.fallCap;
-    if (s.floorN >= 1) p.floorY = std::min(p.floorY, s.floorY);
-    m_params[i] = p;
+void PhysicsModel::refit(size_t slot) {
+    auto const mode = static_cast<GameMode>(slot / 2);
+    bool const mini = (slot % 2) == 1;
+    auto const& c = m_cal.modes[slot];
+    ModePhysics p = defaults(mode, mini);
+    if (pooledGravity(mode)) {
+        uint32_t n = c.accHold.n + c.accRelease.n;
+        auto const& cube = m_cal.modes[PhysicsCalibration::slot(GameMode::Cube, mini)];
+        uint32_t cn = cube.accHold.n + cube.accRelease.n;
+        if (n >= 10) p.accHold = p.accRelease = static_cast<float>((c.accHold.sum + c.accRelease.sum) / n);
+        else if (mode == GameMode::Spider && cn >= 10) {
+            p.accHold = p.accRelease = static_cast<float>((cube.accHold.sum + cube.accRelease.sum) / cn);
+            if (cube.kN >= 10 && cube.kVV > 0) p.yScale = static_cast<float>(cube.kYV / cube.kVV);
+        }
+    } else {
+        if (c.accHold.n >= 10) p.accHold = static_cast<float>(c.accHold.mean(p.accHold));
+        if (c.accRelease.n >= 10) p.accRelease = static_cast<float>(c.accRelease.mean(p.accRelease));
+    }
+    if (c.kN >= 10 && c.kVV > 0) p.yScale = static_cast<float>(c.kYV / c.kVV);
+    if (c.impulse.n >= 1) p.impulse = static_cast<float>(c.impulse.mean(p.impulse));
+    if (c.flipVy.n >= 1) p.flipVy = static_cast<float>(c.flipVy.mean(p.flipVy));
+    if (c.waveVy.n >= 5) p.waveVy = static_cast<float>(c.waveVy.mean(p.waveVy));
+    if (c.capUpN >= 3) p.maxUp = c.maxUp;
+    if (c.capDownN >= 3) p.maxDown = c.maxDown;
+    if (mode == GameMode::Robot && c.boostMax > 0) p.boostSteps = static_cast<int>(c.boostMax);
+    m_params[slot] = p;
 }
 
-void PhysicsModel::recordAccuracy(float error, int steps) {
+void PhysicsModel::recordAccuracy(GameMode mode, float error, int steps) {
     if (steps <= 0) return;
+    auto i = static_cast<size_t>(mode);
     float perTick = error / static_cast<float>(steps);
-    // Slow exponential average: one odd window cannot swing the trust level.
-    m_drift = m_accuracyN == 0 ? perTick : m_drift * 0.9f + perTick * 0.1f;
+    // slow average: one odd window cannot swing the trust level
+    m_drift[i] = m_driftN[i] == 0 ? perTick : m_drift[i] * 0.9f + perTick * 0.1f;
+    ++m_driftN[i];
     m_lastResimError = error;
     ++m_accuracyN;
 }
 
-std::string PhysicsModel::describe() const {
-    auto const& p = m_params[0];
-    auto const& s = m_cal.size[0];
-    char buf[200];
-    std::snprintf(buf, sizeof(buf), "g=%.4f v0=%.3f k=%.4f cap=%.1f floor=%.1f (n %u/%u/%u)%s", p.gravity, p.takeoffVy, p.yScale,
-                  p.maxFall, p.floorY, s.gN, s.kN, s.v0N, calibrated(false) ? "" : " [calibrating]");
+float PhysicsModel::driftPerTick(GameMode mode) const {
+    return m_drift[static_cast<size_t>(mode)];
+}
+
+std::string PhysicsModel::describe(GameMode mode) const {
+    auto const& p = params(mode, false);
+    auto const& c = m_cal.modes[PhysicsCalibration::slot(mode, false)];
+    char buf[240];
+    char const* tag = calibrated(mode, false) ? "" : " [calibrating]";
+    switch (p.press) {
+        case PressAction::SetVelocity:
+            std::snprintf(buf, sizeof(buf), "%s slope=%.3f (n %u)%s", gameModeName(mode), p.waveVy, c.waveVy.n, tag);
+            break;
+        case PressAction::None:
+            std::snprintf(buf, sizeof(buf), "%s up=%.3f down=%.3f caps +%.1f/-%.1f k=%.4f (n %u/%u)%s", gameModeName(mode), p.accHold,
+                          p.accRelease, p.maxUp, p.maxDown, p.yScale, c.accHold.n, c.accRelease.n, tag);
+            break;
+        default:
+            std::snprintf(buf, sizeof(buf), "%s g=%.4f hold=%.4f impulse=%.3f flip=%.2f k=%.4f cap=%.1f floor=%.1f (n %u/%u, %u flips, %u tp)%s",
+                          gameModeName(mode), -p.accRelease, p.accHold, p.impulse, p.flipVy, p.yScale, p.maxDown, cubeFloorY(false),
+                          c.accRelease.n + c.accHold.n, c.impulse.n, c.flips, c.teleports, tag);
+            break;
+    }
     return buf;
 }
 
