@@ -307,6 +307,20 @@ TEST(failure_analysis) {
         CHECK(analyzeFailure(steps, last, d, 0).kind == FailureKind::ReleasedTooLong);
         d.killerDy = 0.f;
         CHECK(analyzeFailure(steps, last, d, 0).kind == FailureKind::HitWall);
+        // Edges beat centres: a floor pillar whose centre is above a low ship
+        // is not evidence of holding too long.
+        d.hasExtent = true;
+        d.killerDy = 25.f;
+        d.killerTop = 60.f;
+        d.killerBottom = -15.f;
+        CHECK(analyzeFailure(steps, last, d, 0).kind == FailureKind::HitWall);
+        d.killerTop = 90.f;
+        d.killerBottom = 10.f;
+        CHECK(analyzeFailure(steps, last, d, 0).kind == FailureKind::HeldTooLong);
+        d.killerTop = -10.f;
+        d.killerBottom = -40.f;
+        CHECK(analyzeFailure(steps, last, d, 0).kind == FailureKind::ReleasedTooLong);
+        d.hasExtent = false;
         last.mode = GameMode::Cube;
     }
     // Escalation points at an earlier press, not the last one

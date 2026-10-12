@@ -13,7 +13,7 @@ namespace {
 constexpr float kTieEpsilon = 1e-6f;
 constexpr float kCommitMargin = 0.05f;
 constexpr int32_t kMaxShiftCells = 24;
-constexpr int32_t kMaxFlyingShiftCells = 40;
+constexpr int32_t kMaxFlyingShiftCells = 60;
 constexpr size_t kTraceSamples = 240;
 
 std::string fmt(char const* f, ...) {
@@ -43,9 +43,16 @@ int desire(ExperimentType type, FailureKind kind) {
                 default: return 0;
             }
         case ExperimentType::ShiftStart:
+        case ExperimentType::HoldRange:
             switch (kind) {
                 case FailureKind::ReleasedTooLong: return -1;
                 case FailureKind::HeldTooLong: return +1;
+                default: return 0;
+            }
+        case ExperimentType::ReleaseRange:
+            switch (kind) {
+                case FailureKind::HeldTooLong: return -1;
+                case FailureKind::ReleasedTooLong: return +1;
                 default: return 0;
             }
         default: return 0;
@@ -679,6 +686,16 @@ bool Agent::initSearch(Search& s, FailureReport const& report, ActionTrace const
     }
     int32_t tapLen = isFlyingMode(mode) ? 6 : 2;
 
+    if (isFlyingMode(mode) && (report.kind == FailureKind::ReleasedTooLong || report.kind == FailureKind::HeldTooLong ||
+                               report.kind == FailureKind::HitWall)) {
+        int32_t deathCell = xCell(report.deathX, cs);
+        s.type = report.kind == FailureKind::HeldTooLong ? ExperimentType::ReleaseRange : ExperimentType::HoldRange;
+        s.blockEnd = deathCell + 1;
+        s.blockStart = deathCell - 2 * d0 - esc * 4 * d0;
+        s.shift = 0;
+        return true;
+    }
+
     switch (report.kind) {
         case FailureKind::NoJump:
             if (esc == 0 || block < 0) useInsert(report.deathX + kBlock * 0.5f - lead, tapLen);
@@ -708,7 +725,8 @@ bool Agent::initSearch(Search& s, FailureReport const& report, ActionTrace const
             break;
         case FailureKind::HitWall:
         case FailureKind::Unknown:
-            if (block >= 0) useBlock(ExperimentType::ShiftBlock, +d0);
+            if (block >= 0 && isFlyingMode(mode)) useBlock(ExperimentType::ShiftEnd, +d0);
+            else if (block >= 0) useBlock(ExperimentType::ShiftBlock, +d0);
             else useInsert(report.deathX + kBlock * 0.5f - lead, tapLen);
             break;
         default:
@@ -747,7 +765,9 @@ void Agent::feedback(Search& s, FailureKind kind, bool worse, float endX, float 
     }
     s.lastEndX = endX;
     s.lastEndY = endY;
-    int32_t limit = (s.type == ExperimentType::ShiftEnd || s.type == ExperimentType::ShiftStart) ? kMaxFlyingShiftCells : kMaxShiftCells;
+    bool flyingType = s.type == ExperimentType::ShiftEnd || s.type == ExperimentType::ShiftStart ||
+                      s.type == ExperimentType::HoldRange || s.type == ExperimentType::ReleaseRange;
+    int32_t limit = flyingType ? kMaxFlyingShiftCells : kMaxShiftCells;
     // Direction suggested by how the experiment attempt died. This is used even
     // when the result was worse than before, because "worse, and now clearly too
     // late" still says which way to go.
@@ -769,7 +789,12 @@ void Agent::feedback(Search& s, FailureKind kind, bool worse, float endX, float 
     bool hasHi = s.hi != INT32_MAX;
     if (d == 0) {
         // No directional information: alternate +a, -a, +2a, -2a ...
-        next = s.shift > 0 ? -s.shift : -s.shift + s.step;
+        if (s.shift > 0) {
+            next = -s.shift;
+        } else {
+            next = -s.shift + s.step;
+            s.step = s.step + (s.step + 1) / 2;
+        }
         if (next == 0) next = s.step;
     } else if (hasLo && hasHi) {
         if (s.hi - s.lo <= 1) {
@@ -841,6 +866,15 @@ void Agent::buildExperiment(Search const& s, ActionTrace const& base, FailureRep
             else set(s.blockEnd + 1, s.blockEnd + s.shift, 1);
             ex.description = fmt("Release at %.1f%% %.0f units %s", at, units, s.shift > 0 ? "later (hold longer)" : "earlier");
             break;
+        case ExperimentType::HoldRange:
+        case ExperimentType::ReleaseRange: {
+            uint8_t v = s.type == ExperimentType::HoldRange ? 1 : 0;
+            set(s.blockStart + s.shift, s.blockEnd, v);
+            float before = (report.deathX - static_cast<float>(s.blockStart + s.shift) * cs);
+            ex.description = fmt("%s continuously from %.0f units before the obstacle at %.1f%%", v ? "Hold" : "Release", before,
+                                 report.deathProgress * 100.f);
+            break;
+        }
         case ExperimentType::InsertPress: {
             set(s.blockStart + s.shift, s.blockStart + s.shift + s.insertLen - 1, 1);
             float before = (report.deathX - static_cast<float>(s.blockStart + s.shift) * cs) / kBlock;

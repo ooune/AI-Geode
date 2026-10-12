@@ -66,6 +66,12 @@ struct DeathInfo {
     KillerKind killer = KillerKind::Unknown;
     float killerDx = 0.f;      // killer centre relative to player, gravity-normalised dy
     float killerDy = 0.f;
+    // Vertical extent of the killer relative to the player centre (gravity-
+    // normalised). A tall pillar from the floor has its centre above a low ship
+    // but must be flown over, so the edges matter more than the centre.
+    bool hasExtent = false;
+    float killerTop = 0.f;
+    float killerBottom = 0.f;
 };
 
 enum class FailureKind : uint8_t {

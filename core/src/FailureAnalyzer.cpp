@@ -89,6 +89,18 @@ FailureReport analyzeFailure(
         haveKiller = true;
     }
 
+    // Which way would have avoided the obstacle? +1 = should have been higher,
+    // -1 = should have been lower, 0 = unknown.
+    int needDir = 0;
+    if (death.hasKiller && death.hasExtent) {
+        if (death.killerBottom > 0.f) needDir = -1;        // entirely above us
+        else if (death.killerTop < 0.f) needDir = +1;      // entirely below us
+        else needDir = 0; // straddles our height: over or under is ambiguous (floor/ceiling unknown)
+    } else if (haveKiller) {
+        if (killerDy > 8.f) needDir = -1;
+        else if (killerDy < -8.f) needDir = +1;
+    }
+
     float vyN = last.vyNorm();
     // Escalation shifts suspicion to earlier presses: the cause of a death is not
     // necessarily the last thing the AI did.
@@ -101,8 +113,8 @@ FailureReport analyzeFailure(
     int esc = static_cast<int>(std::min<uint32_t>(escalation, 3));
 
     if (isFlyingMode(last.mode)) {
-        bool above = haveKiller ? killerDy > 8.f : vyN > 0.f;
-        bool below = haveKiller ? killerDy < -8.f : vyN < 0.f;
+        bool above = haveKiller ? needDir < 0 : vyN > 0.f;
+        bool below = haveKiller ? needDir > 0 : vyN < 0.f;
         if (above) {
             rep.kind = FailureKind::HeldTooLong;
             rep.responsibleBlock = pickBlock(esc);
@@ -131,7 +143,7 @@ FailureReport analyzeFailure(
         } else if (!recentPress || landedSincePress) {
             rep.kind = FailureKind::NoJump;
             rep.responsibleBlock = esc > 0 ? pickBlock(esc - 1) : -1;
-        } else if (haveKiller && killerDy > 20.f) {
+        } else if (haveKiller && (death.hasExtent ? death.killerBottom > 0.f : killerDy > 20.f)) {
             rep.kind = FailureKind::HeldTooLong;
             rep.responsibleBlock = pickBlock(esc);
         } else if (!last.onGround && vyN > 0.5f) {
@@ -144,7 +156,7 @@ FailureReport analyzeFailure(
     }
 
     char buf[256];
-    char const* where = !haveKiller ? "" : (killerDy > 8.f ? " (obstacle above)" : (killerDy < -8.f ? " (obstacle below)" : " (obstacle ahead)"));
+    char const* where = !haveKiller ? "" : (needDir < 0 ? " (obstacle above)" : (needDir > 0 ? " (obstacle below)" : " (obstacle ahead)"));
     std::snprintf(
         buf, sizeof(buf), "%s died at %.1f%%: %s%s%s",
         gameModeName(last.mode), rep.deathProgress * 100.f, failureKindName(rep.kind), where,

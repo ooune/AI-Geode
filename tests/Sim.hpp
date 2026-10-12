@@ -216,6 +216,11 @@ private:
         m_death.killerDx = (o.x + o.w * 0.5f) - m_x;
         float cy = o.kind == ObjKind::Spike ? o.y + 10.f : o.y + o.h * 0.5f;
         m_death.killerDy = cy - m_y;
+        m_death.hasExtent = true;
+        float bottom = o.kind == ObjKind::Spike ? o.y + 3.f : o.y;
+        float top = o.kind == ObjKind::Spike ? o.y + 18.f : o.y + o.h;
+        m_death.killerTop = top - m_y;
+        m_death.killerBottom = bottom - m_y;
     }
 
     Feature nearest(ObjKind kind) const {

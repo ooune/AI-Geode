@@ -14,7 +14,10 @@
 
 namespace aigd {
 
-enum class ExperimentType : uint8_t { None = 0, ShiftBlock, ShiftStart, ShiftEnd, InsertPress };
+// HoldRange / ReleaseRange are for flying modes, where altitude is the sum of
+// many inputs: "hold continuously from N cells before the obstacle" lets the
+// search move N instead of nudging one short tap.
+enum class ExperimentType : uint8_t { None = 0, ShiftBlock, ShiftStart, ShiftEnd, InsertPress, HoldRange, ReleaseRange };
 
 // A controlled change to the best known way of playing a short section: e.g.
 // "press 2 cells later than last time". Experiments are proposed by the failure

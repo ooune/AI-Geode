@@ -150,6 +150,11 @@ aigd::DeathInfo Observer::deathInfo(PlayLayer* layer, PlayerObject* player, Game
         d.hasKiller = true;
         d.killerDx = rect.getMidX() - d.x;
         d.killerDy = (rect.getMidY() - d.y) * sign;
+        float top = (rect.getMaxY() - d.y) * sign;
+        float bottom = (rect.getMinY() - d.y) * sign;
+        d.hasExtent = true;
+        d.killerTop = std::max(top, bottom);
+        d.killerBottom = std::min(top, bottom);
         auto kind = classify(killer->m_objectType);
         d.killer = !kind ? aigd::KillerKind::Unknown : (*kind == 0 ? aigd::KillerKind::Hazard : aigd::KillerKind::Solid);
     }
