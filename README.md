@@ -29,7 +29,7 @@ All settings live in the mod's Geode settings page. Most also appear in the in-g
 | **Practice Mode Learning** | Plays in practice mode and places its own checkpoints (see below). |
 | **Training Speed** | 1–4× game speed while the AI plays. Physics stay at 240 steps/s, so learning is unaffected, but music desyncs. |
 | **Use Prediction** | Simulate the player's path before each decision, in every game mode (see *Trajectory prediction*). |
-| **Show Trajectory** / **Show Alternative Path** | Draw the predicted path in the level; optionally also the path for the other button state. |
+| **Show Trajectory** / **Show Alternative Path** | Draw the predicted path of the action being executed, labelled with the action and its safety; optionally also the path for the other button state. |
 | **Prediction Horizon** | 0.3–1.5 s of simulated future (default 0.75 s). |
 | **Show Status Panel** / **Show Debug Data** | The in-level overlay, and its debug lines (observation, Q-values, memory sizes, physics calibration, planner cost, prediction error). |
 
@@ -217,14 +217,48 @@ press" path has already collided are skipped. While a cube, ball or spider is
 airborne with the button up, the last plan is reused until about 20 steps
 before landing.
 
-**How it feeds learning** (`Agent::act`):
-- Where the Q-table has no preference yet, the planner's best plan decides.
-- If the chosen action is predicted to collide (every continuation) while the
-  other action still has a way through, it is blocked. The blocked action is
-  written into the Q-table as an *imagined death*, so that timing is learned
-  without dying.
-- Real outcomes still drive all normal learning. Predicted safety is never
-  treated as proof.
+A plan is only ever reused when nothing can have changed. Advice is returned only for exactly the state it was computed for (position, velocity, mode, button). It is never reused across steps while the executed input would have to change within 16 steps or may collide, nor once the player has left the path predicted for the executed input (more than 0.5 units off).
+
+For each branch the predictor also reports:
+- how long the button can stay in that state while some plan still does not collide, and while a plan is still fully *safe*: the latest moment the input must change;
+- the path of simply **keeping the current button state**.
+
+**Where the Q-table has no preference yet**, the planner's best plan decides.
+
+### Safety layer: prediction controls the executed input (v0.2.1)
+
+**The bug.** The overlay could show a safe path while the AI kept an input that crashed, and the last-moment warning came too late. The cause, traced in the code:
+
+1. **Optimistic safety.** An action's predicted outcome is its *best continuation*: "hold now" counts as safe if "hold 2 steps, then release" is safe. The old check only blocked an action whose *every* continuation collides. But the next decision comes from the learned values again, not from that continuation. So the AI kept holding while "release in 2 steps" stayed possible, until holding was doomed. By then releasing usually was too (both ship tests below died this way).
+2. **Decisions skipped.** While the discretised state did not change (up to 24 steps), `act()` kept the previous input without looking at the prediction at all.
+3. **Stale advice.** The advice cache was keyed by tick and button only, so a different state in the same tick got the old result. Ship, wave, UFO and swing reused the previous step's plan.
+4. **Debounce.** The minimum time between input changes could undo a safety switch, while the status still said "Collision avoided".
+5. **Overlay.** The overlay drew the planner's favourite plan, not the action being executed.
+
+The input path itself (`act()` → `handleButton` whenever the button state changes) was correct.
+
+**The fix** (`Agent::act`, after the policy, planner and debounce have proposed an action):
+- **The check judges the action that will really be executed.** Each candidate is ranked:
+  - 0: predicted collision;
+  - 1: no safe continuation, with a near miss within 12 steps;
+  - 2: safe, but the input would have to change within the next 3 steps (`safetySlackSteps`). This applies when keeping the current input, or to any input in ship/wave. The planner's own choice is exempt, since it follows its plan and re-plans every step;
+  - 3: safe with time to spare.
+- **If the proposed action is not rank 3 and the other one ranks higher, the other one is executed**, overriding the policy, the planner and the debounce. The button really changes; tests check the applied input.
+- If both collide, the one that collides later is executed and the decision is reported as **NO SAFE OPTION**, never as safe.
+- **While a change may be needed within 16 steps (`dangerWindowSteps`), every step is checked** with a freshly computed prediction, instead of keeping the input while the state key is unchanged. The same happens when the player leaves the predicted path.
+- **Nothing is latched.** As soon as the executed action is safe with time to spare, the policy is in control again.
+- All windows are in physics steps (time), so they hold at every game speed. A mode change (portal) changes the state, so it is always a new decision.
+
+**Diagnostics.** Every safety-critical decision is recorded (`SafetyRecord`), with:
+- the player state;
+- the predicted outcome, time to collision and remaining time to change for both actions, and for keeping the input;
+- the proposed action and who proposed it, and the executed action;
+- the verdict (safe / kept / SAFETY OVERRIDE / NO SAFE OPTION), and whether the prediction was current or stale;
+- whether an alternative existed, and the reason in words, e.g. *"Safety override: keeping hold leaves 1 step(s) to change course; executing release instead: release is safe (input can stay for 120 steps)"*.
+
+The status panel shows the current record. On every death, the last 8 records are written to the Geode log. The controller logs an error if the input it sent ever differs from the recorded decision.
+
+**What it cannot do.** It cannot save the player once no action can avoid the collision any more, for example a cube already in the air over a spike. It acts as early as the prediction allows, so its reach is limited by the prediction horizon and the model's accuracy.
 
 **Checking the model against reality.**
 - Every 16 steps the last 32 real steps are re-simulated with the inputs that
@@ -240,10 +274,14 @@ before landing.
 **Overlay** (`src/ui/TrajectoryOverlay`). One `CCDrawNode` in the level's object
 layer is redrawn once per frame from geometry built in the core (so tests can
 check it). It shows:
-- the path: green = safe, yellow = uncertain, red = collision;
+- **the path of the action actually being executed** (never a plan that is not being followed): green = safe, yellow = uncertain, red = collision, grey = not computed for the current step;
+- in purple, what keeping the previous button state would have done, when the executed input differs from it (e.g. right after a safety override);
 - the predicted landing point and nearby spike hitboxes;
 - the obstacle the path runs into, with the steps until the hit;
-- optionally the alternative path, in blue.
+- optionally the other action's path, in blue;
+- a label with the executed action and its safety, e.g. `HOLD - safe`, `RELEASE - UNSAFE, hit in 7 - NO SAFE OPTION`, `... - SAFETY OVERRIDE`, `... - calibrating, not used`, `... - prediction 1 step(s) old`.
+
+With nothing relevant ahead, no path is drawn.
 
 Until a mode is calibrated, its predictions are shown (marked as calibrating)
 but not acted on.
@@ -331,6 +369,17 @@ Add `--bench` to also run the multi-seed learning benchmark.
 - **learned policy surviving save + reload**: a fresh agent with learning disabled completes the level from the saved file, while an untrained one does not;
 - cross-level transfer through pattern memory;
 - per-tick cost;
+- **prediction controls the executed input** (real agent + predictor + simulated game input). A "stubborn" learned policy insists on one action each step, and the tests check:
+  - **A**: a cube that will not jump before a spike, and one that wants to jump straight onto a spike, both survive;
+  - **B**: a ship held toward spikes under the ceiling releases in time. Holding was safe at first; the held button is really released (**F**);
+  - **C**: a ship kept low toward a wall climbs; also through a gap, with a policy alternating between "always hold" and "always release";
+  - **D**: advice computed for one state is not reused for a different state in the same step, and the decision is based on the new state;
+  - **E**: with every candidate colliding, the decision and the overlay say *NO SAFE OPTION* and never "safe";
+  - **G**: on every step of these runs, the overlay's main path is the executed action's, its override label matches the record, and every record matches the input really applied;
+  - no override after the danger has passed (not latched);
+  - **H**: learning with prediction still completes ship and blocks, records per-state evidence and keeps it through save/reload;
+  - the cost of a whole decision per step;
+  - on the code before the fix, B, C and D failed (both ships crashed) and E reported nothing;
 - trajectory prediction against the simulator:
   - physics calibration learning the simulator's (deliberately different) constants;
   - standing still before a spike;
@@ -349,7 +398,7 @@ Add `--bench` to also run the multi-seed learning benchmark.
 
 ### Results
 
-Unit tests: 48 tests, 1890 checks, 0 failures.
+Unit tests: 58 tests, 1935 checks, 0 failures.
 
 Trajectory prediction against the simulator:
 - calibration recovers the simulator's physics exactly (g 0.2200, k 0.2326,
@@ -370,9 +419,12 @@ Trajectory prediction against the simulator:
     predicted safe died** (20–126 plans checked per mode);
   - the planner alone, without learning, completes each mode's obstacle course;
   - the learning agent with prediction completes each course on its first attempt;
-- cost per physics step on average: cube ~130 µs, ship/wave/UFO/swing
-  ~190–215 µs, ball/robot ~260–275 µs, spider ~330 µs. That is about 3–8% of
-  one core at 1× speed, and four times that at 4× training speed.
+- cost per physics step on average, planner alone: cube ~140 µs, ship/wave/UFO/swing
+  ~215–240 µs, ball/robot ~285–300 µs, spider ~365 µs. That is about 10% more than
+  before the safety layer (one extra simulation, less plan reuse near danger);
+- cost of a whole decision of the learning agent with the safety layer (debug
+  build): cube 95 µs, spider 182 µs, wave 217 µs, ship 227 µs per step. That is
+  2–5% of one core at 1× speed and 9–22% at 4× training speed.
 
 **Caveat:** the simulator implements the same structural rules for each mode
 that the predictor assumes (which button does what), only with different
@@ -380,7 +432,9 @@ numbers. These results show that the calibration and planning work. They do
 **not** prove the rules match Geometry Dash exactly; only in-game testing can.
 
 With prediction, every simulator level is completed on attempt 1 (basics,
-spikes, blocks) or attempt 9–17 (ship) over 3 seeds.
+spikes, blocks) or attempt 3 (ship) over 3 seeds. Before the safety layer, ship
+took 9–17 attempts. In the 5-seed benchmark, ship with prediction went from 10
+to 5 attempts; every other line is unchanged.
 
 Per-tick cost: about 0.7 µs per decision in the simulator. The end-of-attempt update (values, credit assignment and evidence) over about 1,200 decisions takes about 0.4 ms. Saving is done on a background thread.
 
@@ -433,7 +487,32 @@ Later in-game runs on Stereo Madness (before trajectory prediction) reached
 - ship deaths misclassified by obstacle centre, fixed by using obstacle edges;
 - ship climbs needing a hold-range search instead of a single tap.
 
-**The 2.0 learning changes (failure memory, credit assignment, state-matched replay) have not been tested in game yet**, only in the simulator.
+**The 2.0 learning changes (failure memory, credit assignment, state-matched replay) and the v0.2.1 safety layer have not been tested in game yet**, only in the simulator.
+
+### In-game test procedure for the safety layer (v0.2.1)
+
+Install: keep a copy of the working v0.2.0 package, then put
+`aqvose.ai-geode-v0.2.1.geode` into Geometry Dash's `geode/mods` folder
+(replacing `aqvose.ai-geode.geode`) and restart the game. To go back, put the
+v0.2.0 package back the same way. Memory files stay compatible both ways
+(format 2).
+
+Setup:
+- settings *Use Prediction*, *Show Trajectory*, *Show Status Panel* and *Show Debug Data* on, *Training Speed* 1×;
+- use a level (e.g. made in the editor) with a ship portal near the start and, a few blocks later, a wall rising from the floor to half the corridor height, then a row of spikes hanging from the ceiling, then a gap between two blocks. Repeat the same section three times;
+- calibrate the ship first: let the AI fly a few attempts until the panel no longer says *calibrating*.
+
+Check, on several attempts:
+1. **The overlay follows the executed action.** The label's HOLD/RELEASE changes exactly when the ship's input changes (the ship visibly starts climbing or falling). The coloured path starts at the ship and matches its next movement.
+2. **An override changes the real input.** Approaching the wall low, the label should show *SAFETY OVERRIDE* with the purple "keep input" path running into the wall. The ship must start climbing at that moment, and the panel's *Executing* line must say *button down* even if the policy *wanted the other*.
+3. **No blind continuation.** Under the hanging spikes, the ship must not stay pinned to the ceiling until the path turns red: release must happen while the path is still green or yellow.
+4. **Panel and overlay agree.** The panel's *Safety* line gives the reason. On a death, the Geode log shows the last *Safety t=...* lines: the executed action, and whether every option was predicted to collide (NO SAFE OPTION) or the prediction was wrong (*MISPREDICTION* in the *Prediction check* line).
+5. **The policy gets control back.** After the obstacle the label shows plain *HOLD - safe* / *RELEASE - safe*, without the override label.
+6. **Learning still happens.** Deaths are still analysed (*Cause:* line in the panel), and attempts get further over time.
+
+Report:
+- any death where the log's last record says *safe* or *kept* with a current prediction: that is a model error;
+- any input mismatch error in the log: that would be a controller bug.
 
 **Trajectory prediction has not been verified in game yet.** Its accuracy on the
 real game is measured by the debug panel (step error, 32-step error, drift,
@@ -456,6 +535,8 @@ sizes and landing tolerance are still unconfirmed.
   - the wave hitbox (12 units, inner 6) and the ship hitbox (24 units) are guesses;
   - the game's own corridor bounds (`m_portalY` / `m_lastModeHeight`) are not used yet because their meaning is unconfirmed; bounds are learned by contact instead;
   - the planner tries a limited set of input shapes, so a sequence it never tries (for example an unusual tap rhythm) cannot be found by planning, only by learning.
+- **The safety layer acts on predictions.** If the physics model or the hitboxes are wrong for a mode (see *Trajectory prediction limits*), it can override a correct policy decision, or fail to see a collision. Every override is recorded with its reason, so wrong ones can be found in the log. It only uses trusted, calibrated modes.
+- **The safety slack (3 steps) and re-check window (16 steps) are fixed values**, measured in the simulator only.
 - **Failure memory is per exact state.** It is keyed by the 3-unit x cell plus the physics state, so it reacts to repeated failures in a deterministic replay of the same situation. In a level where the same situation is reached in slightly different states every time (non-deterministic mods, moving objects), streaks build up slowly. The cross-level pattern evidence is recorded too, but it is only used through the values, not to switch decisions.
 - **Credit assignment without prediction** relies on the failure analysis' guess. It walks back one decision per two deaths when that guess is wrong, which is slower than the timing experiments, so both run together.
 - **Determinism**: GD 2.2's physics are deterministic for identical inputs, which the learning relies on. Mods that change input timing, such as *Click Between Frames*, or physics settings can make attempts less repeatable and learning slower.

@@ -5,7 +5,7 @@
 	},
 	"id": "aqvose.ai-geode",
 	"name": "AI Geode",
-	"version": "v0.2.0",
+	"version": "v0.2.1",
 	"developer": "aqvose",
 	"description": "An AI player that learns Geometry Dash levels from its own deaths.",
 	"repository": "https://github.com/aqvose-prog/AI-Geode",
@@ -110,7 +110,7 @@
 		"show-trajectory": {
 			"type": "bool",
 			"name": "Show Trajectory",
-			"description": "Draw the predicted path in the level: green = safe, yellow = uncertain, red = collision, with the landing point, nearby spike hitboxes and steps until a collision.",
+			"description": "Draw the predicted path of the action being executed: green = safe, yellow = uncertain, red = collision, grey = not current; purple = what keeping the previous input would do. The label shows the action, its safety and any SAFETY OVERRIDE.",
 			"default": true
 		},
 		"show-alternative": {
