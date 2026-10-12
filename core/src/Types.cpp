@@ -72,6 +72,22 @@ char const* agentPhaseName(AgentPhase phase) {
     }
 }
 
+char const* decisionSourceName(DecisionSource source) {
+    switch (source) {
+        case DecisionSource::Policy: return "learned";
+        case DecisionSource::Prior: return "similar situations";
+        case DecisionSource::Planner: return "planner";
+        case DecisionSource::Explore: return "exploring";
+        case DecisionSource::Experiment: return "experiment";
+        case DecisionSource::Reference: return "reference replay";
+        case DecisionSource::KnownGood: return "known good here";
+        case DecisionSource::AvoidRepeat: return "avoiding repeated failure";
+        case DecisionSource::Shield: return "collision avoided";
+        case DecisionSource::Debounce: return "debounce";
+        default: return "?";
+    }
+}
+
 // ---------------------------------------------------------------------------
 // State keys
 

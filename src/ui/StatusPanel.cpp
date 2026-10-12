@@ -70,6 +70,9 @@ void StatusPanel::refresh() {
         if (st.lastFailureProgress >= 0.f) text += "\nLast failure: " + st.lastFailure;
         if (!st.lastChange.empty()) text += "\nChange: " + st.lastChange;
         if (st.lastImproved >= 0) text += st.lastImproved ? "\nResult: went further than the previous attempt" : "\nResult: did not get further";
+        if (!st.lastCredit.empty()) text += "\nCause: " + st.lastCredit;
+        text += fmt::format("\nDecision: {}", aigd::decisionSourceName(st.source));
+        if (!st.reason.empty()) text += "\nLast notable: " + st.reason;
         if (!ai.notice().empty()) text += "\n" + ai.notice();
 
         if (set.prediction) {
@@ -101,8 +104,21 @@ void StatusPanel::refresh() {
                 o.x, o.y, o.vy, o.playerSpeed, feat("hazard", o.hazard), feat("solid", o.solid), feat("orb", o.orb)
             );
             text += fmt::format(
-                "\n[decide] Q(release)={:.2f} Q(hold)={:.2f} -> {}{}{}  eps={:.2f}",
-                st.q[0], st.q[1], st.action ? "HOLD" : "release", st.forced ? " (experiment)" : "", st.explored ? " (explore)" : "", st.epsilon
+                "\n[decide] Q(release)={:.2f} Q(hold)={:.2f} -> {} ({})  eps={:.2f}",
+                st.q[0], st.q[1], st.action ? "HOLD" : "release", aigd::decisionSourceName(st.source), st.epsilon
+            );
+            text += fmt::format(
+                "\n[evidence here] release: failed {} ({} in a row), passed {} | hold: failed {} ({} in a row), passed {}",
+                st.fails[0], st.streak[0], st.passes[0], st.fails[1], st.streak[1], st.passes[1]
+            );
+            auto const& m = st.metrics;
+            text += fmt::format(
+                "\n[learning] repeated failures {} (alternatives tried {}, helped {}, vetoed by prediction {}) | known mistakes repeated {}"
+                "\n[credit] causes found by prediction {}, by analysis {}, unknown {} | doomed decisions not blamed {} | model errors {}"
+                " | reference replays {} of {} decisions",
+                m.repeatedFailuresDetected, m.alternativesTried, m.alternativesThatHelped, m.alternativesVetoed, m.sameMistakeRepeated,
+                m.pivotsByPrediction, m.pivotsByAnalysis, m.pivotsUnknown, m.doomedSkipped, m.mispredictedDeaths, m.referenceSteps,
+                m.referenceSteps + m.independentSteps
             );
             text += fmt::format(
                 "\n[memory] {} level states, {} pattern states, {} hotspots, {} objects indexed",
@@ -112,8 +128,9 @@ void StatusPanel::refresh() {
                 auto const& pr = ai.predictor();
                 auto const& adv = pr.lastAdvice();
                 text += fmt::format(
-                    "\n[physics] {} | step error {:.2f}u (pred y {:.2f} / real {:.2f}) | 32-step error {:.2f}u",
-                    pr.model().describe(ai.lastObservation().mode), pr.lastStepError(), pr.lastPredictedY(), pr.lastActualY(), pr.model().lastResimError()
+                    "\n[physics] {} | step error {:.2f}u (pred y {:.2f} / real {:.2f}) | 32-step error {:.2f}u | estimates replaced {}",
+                    pr.model().describe(ai.lastObservation().mode), pr.lastStepError(), pr.lastPredictedY(), pr.lastActualY(), pr.model().lastResimError(),
+                    pr.model().regimeChanges()
                 );
                 text += fmt::format(
                     "\n[planner] {} sims in {:.0f}us | {} obstacles | best: {} | mispredictions {} (caution {:.2f}) | {}{}",

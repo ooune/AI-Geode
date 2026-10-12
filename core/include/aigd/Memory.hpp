@@ -19,9 +19,26 @@ inline constexpr int kActions = 2;
 struct QEntry {
     float q[kActions] = {0.f, 0.f};
     uint16_t n[kActions] = {0, 0};
+    // Outcome evidence per action in exactly this situation. A decision is
+    // only counted as a failure when it was identified as the cause of a death
+    // (not merely because it happened shortly before one), and as a pass when
+    // the attempt got safely past it. `streak` counts failures since the last
+    // pass, so newer evidence always overrides older evidence.
+    uint16_t fails[kActions] = {0, 0};
+    uint16_t passes[kActions] = {0, 0};
+    uint8_t streak[kActions] = {0, 0};
 
     bool visited(int a) const { return n[a] > 0; }
     float best() const { return q[0] > q[1] ? q[0] : q[1]; }
+    bool hasEvidence() const { return fails[0] | fails[1] | passes[0] | passes[1]; }
+    void notePass(int a) {
+        if (passes[a] < 0xFFFF) ++passes[a];
+        streak[a] = 0;
+    }
+    void noteFail(int a) {
+        if (fails[a] < 0xFFFF) ++fails[a];
+        if (streak[a] < 0xFF) ++streak[a];
+    }
 };
 
 class QTable {
@@ -40,6 +57,9 @@ public:
         return it->second;
     }
     size_t size() const { return m_map.size(); }
+    // Keeps memory bounded: drops the entries with the least experience until
+    // at most `keep` remain.
+    void prune(size_t keep);
     void clear() { m_map.clear(); }
     void reserve(size_t n) { m_map.reserve(n); }
 
@@ -114,7 +134,9 @@ inline uint32_t timingKey(GameMode mode, int speedClass, bool mini) {
 // Everything remembered about one level.
 struct LevelMemory {
     static constexpr size_t kMaxHistory = 300;
-    static constexpr int kFormatVersion = 1;
+    static constexpr size_t kMaxStates = 400000;
+    // 2: per-state outcome evidence (fails/passes/streak) in the q table.
+    static constexpr int kFormatVersion = 2;
 
     std::string key;   // stable identifier, e.g. "online-128" or "main-1"
     std::string name;
@@ -134,9 +156,11 @@ struct LevelMemory {
     // Inputs (x position, new button state) of the furthest attempt so far.
     // Kept for inspection/export only; the policy is always the Q-table.
     std::vector<std::pair<float, uint8_t>> bestRunInputs;
-    // Decisions (state key + action) of the furthest full attempt. Everything
-    // well behind the frontier is distilled back into the Q-table so later
-    // learning near the frontier can never silently break sections that work.
+    // Decisions (state key + action) of the furthest full attempt. Kept for
+    // inspection/export and to know how far the level has been solved; it is
+    // never replayed or written back into the policy. What the best run did
+    // well reaches later attempts only through the per-state evidence and
+    // values it produced.
     std::vector<PathStep> bestPath;
     float bestPathX = 0.f;
     // State/action history leading up to the most recent death.
@@ -152,7 +176,8 @@ struct LevelMemory {
 
 // Knowledge that transfers between levels.
 struct PatternMemory {
-    static constexpr int kFormatVersion = 1;
+    static constexpr size_t kMaxStates = 200000;
+    static constexpr int kFormatVersion = 2;
     QTable q;
     std::map<uint32_t, TimingStat> leads;
     PhysicsCalibration physics; // what the trajectory predictor learned about the game's physics

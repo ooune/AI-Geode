@@ -32,6 +32,14 @@ struct Experiment {
     int32_t toCell = -1;    // inclusive
     int32_t shift = 0;
     std::vector<uint8_t> actions; // per cell in [fromCell, toCell]
+    // The cells the experiment actually changes (its hypothesis). Only these
+    // are played as written. Elsewhere in [fromCell, toCell] the reference
+    // attempt's action is reproduced only while the player is in exactly the
+    // reference attempt's state there (same key), so a fair comparison is made
+    // without ever replaying actions in a situation they were not chosen for.
+    int32_t testFrom = 0;
+    int32_t testTo = -1;
+    std::vector<uint64_t> baseKeys; // per cell, the reference attempt's state key (0 = unknown)
     std::string description;
     // The search that produced this experiment (used to remember what worked).
     int32_t blockStart = 0;
@@ -40,6 +48,29 @@ struct Experiment {
 
     bool covers(int32_t cell) const { return active && cell >= fromCell && cell <= toCell; }
     uint8_t actionAt(int32_t cell) const { return actions[static_cast<size_t>(cell - fromCell)]; }
+    bool tests(int32_t cell) const { return covers(cell) && cell >= testFrom && cell <= testTo; }
+    uint64_t baseKeyAt(int32_t cell) const {
+        size_t i = static_cast<size_t>(cell - fromCell);
+        return covers(cell) && i < baseKeys.size() ? baseKeys[i] : 0;
+    }
+};
+
+// Counters that show whether learning is working (diagnostics + tests).
+struct LearningMetrics {
+    uint32_t repeatedFailuresDetected = 0; // a decision about to be repeated had failed repeatedly in that state
+    uint32_t alternativesTried = 0;        // ... and the alternative was played instead
+    uint32_t alternativesVetoed = 0;       // ... or not, because the alternative was predicted to collide
+    uint32_t alternativesThatHelped = 0;   // a tried alternative got safely past that point
+    uint32_t sameMistakeRepeated = 0;      // deaths blamed on a decision already known to fail there
+    uint32_t knownGoodKept = 0;            // the learned choice was overruled by a reliable record of the other action
+    uint32_t pivotsByPrediction = 0;       // deaths whose cause was located with the recorded predictions
+    uint32_t pivotsByAnalysis = 0;         // ... with the failure analysis
+    uint32_t pivotsUnknown = 0;            // ... not located (no decision blamed)
+    uint32_t doomedSkipped = 0;            // decisions not blamed because neither action could have survived
+    uint32_t mispredictedDeaths = 0;       // deaths on a path that was predicted to be safe (model error)
+    uint32_t newBests = 0;
+    uint32_t referenceSteps = 0;           // decisions reproduced from an experiment's reference attempt
+    uint32_t independentSteps = 0;         // all other decisions
 };
 
 struct AgentStatus {
@@ -79,6 +110,15 @@ struct AgentStatus {
     uint32_t plannedThisAttempt = 0;
     uint64_t shieldsTotal = 0;
     std::string predictionNote;    // predicted vs. actual at the last death
+
+    // decision diagnostics
+    DecisionSource source = DecisionSource::Policy;
+    std::string reason;            // why the last notable decision was taken
+    uint16_t fails[2] = {0, 0};    // evidence for the current state
+    uint16_t passes[2] = {0, 0};
+    uint8_t streak[2] = {0, 0};
+    std::string lastCredit;        // which decision was blamed for the last death, and why
+    LearningMetrics metrics;
 };
 
 class Agent {
@@ -127,6 +167,7 @@ private:
         int32_t startCell = 0;
         std::vector<uint8_t> actions;
         std::vector<uint8_t> ground;  // player on the ground at the cell centre
+        std::vector<uint64_t> keys;   // state key of the decision active at the cell centre
         float endX = 0.f;
         FailureReport report;
         uint8_t at(int32_t cell) const {
@@ -140,6 +181,11 @@ private:
             return i < ground.size() ? ground[i] != 0 : true;
         }
         int32_t endCell() const { return startCell + static_cast<int32_t>(actions.size()) - 1; }
+        uint64_t keyAt(int32_t cell) const {
+            if (!valid || cell < startCell) return 0;
+            size_t i = static_cast<size_t>(cell - startCell);
+            return i < keys.size() ? keys[i] : 0;
+        }
     };
 
     // Timing constraint learned from a successful experiment: the press that now
@@ -205,21 +251,27 @@ private:
     float m_focusFrom = 0.f;
     float m_focusTo = -1.f;
     float m_prevEndX = -1.f;
-    float m_protectLimitX = 1e30f;               // lowered if the best path stops working
-    std::map<int32_t, uint32_t> m_regressions;   // deaths inside the protected region per hotspot
+    float m_protectLimitX = 1e30f;               // no random exploration before this x (lowered by experiments)
     std::string m_nextChange;
+    // Credit assignment of the attempt being finished: the decision identified
+    // as the cause of the death, and whether that came from the predictions
+    // (then earlier decisions are judged by the best value at that point
+    // instead of by the death).
+    size_t m_pivot = static_cast<size_t>(-1);
+    bool m_cutAtPivot = false;
+    std::vector<uint64_t> m_avoidedThisAttempt;  // states where the alternative to a repeated failure was played
     FailureReport m_lastReport;
     AgentStatus m_status;
 
     QEntry* lookup(uint64_t key, uint64_t pkey, QEntry& scratch);
-    int greedyAction(QEntry const& e, uint64_t pkey) const;
     float progressReward(float dx) const;
     float epsilonAt(float x) const;
     uint32_t stuckLevel() const;
-    // Everything before this x is "known good": the best path is kept there.
+    // No random exploration before this x: the level is solved up to there.
     float protectedUpTo() const;
-    void commitBestPath();
 
+    void assignCredit(int32_t endTick, FailureReport const* report, bool completed);
+    void applyNewBestBonus(float endX);
     void backwardUpdate(float terminalBonus, bool terminal, float bootstrap, int32_t endTick);
     void commitExperiment();
     void finishAttempt(float endX, int32_t endTick, bool died, bool completed, FailureKind kind);

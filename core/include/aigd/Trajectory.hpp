@@ -25,6 +25,12 @@ struct Step {
     bool explored = false; // chosen by random exploration
     bool planned = false;  // chosen by the trajectory planner (no learned preference yet)
     bool shielded = false; // the predicted collision of the other action was avoided
+    bool replayed = false; // reproduced from an experiment's reference attempt (same state)
+    DecisionSource source = DecisionSource::Policy;
+    // Trusted prediction at this decision, per action (a Certainty value), or -1
+    // when there was none. Used afterwards to find the decision that really
+    // decided a death: the last one whose alternative still had a way through.
+    int8_t pred[2] = {-1, -1};
 };
 
 // A contiguous stretch of steps with the button held.

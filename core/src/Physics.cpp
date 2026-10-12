@@ -13,10 +13,41 @@ bool pooledGravity(GameMode m) {
     return m != GameMode::Ship && m != GameMode::Robot && m != GameMode::Wave;
 }
 
-bool acceptSample(RunningStat const& s, double v, double fallback, double relTol, double absTol) {
-    if (s.n < 20) return true;
+// Samples needed in a row, all disagreeing with the current estimate but
+// agreeing with each other, before the estimate is replaced. Odd single frames
+// (orbs, pads, portals) never come close; a real change produces this many
+// within a fraction of a second.
+constexpr uint32_t kRegimeRun = 40;
+
+// Adds v to s unless it is an outlier of an established estimate. Returns
+// whether it was added.
+bool offerAround(RunningStat& s, double v, double mean, bool warm, double tol) {
+    if (!warm || std::fabs(v - mean) < tol) {
+        s.add(v);
+        s.altSum = 0.0;
+        s.altN = 0;
+        return true;
+    }
+    if (s.altN && std::fabs(v - s.altSum / s.altN) >= tol) {
+        s.altSum = 0.0;
+        s.altN = 0;
+    }
+    s.altSum += v;
+    ++s.altN;
+    if (s.altN >= kRegimeRun) {
+        s.sum = s.altSum;
+        s.n = s.altN;
+        s.altSum = 0.0;
+        s.altN = 0;
+        ++s.regimeChanges;
+        return true;
+    }
+    return false;
+}
+
+bool offerSample(RunningStat& s, double v, double fallback, double relTol, double absTol) {
     double mean = s.mean(fallback);
-    return std::fabs(v - mean) < std::max(absTol, relTol * std::fabs(mean));
+    return offerAround(s, v, mean, s.n >= 20, std::max(absTol, relTol * std::fabs(mean)));
 }
 } // namespace
 
@@ -163,10 +194,7 @@ void PhysicsModel::observeStep(Observation const& prev, Observation const& cur, 
         if (p.press == PressAction::TeleportOnGround && std::fabs(cur.y - prev.y) > 20.f) {
             ++c.teleports;
         } else if (p.press == PressAction::FlipOnGround || p.press == PressAction::FlipOnEdge) {
-            if (acceptSample(c.flipVy, vc, p.flipVy, 0.25, 0.3)) {
-                c.flipVy.add(vc);
-                ++c.flips;
-            }
+            if (offerSample(c.flipVy, vc, p.flipVy, 0.25, 0.3)) ++c.flips;
         }
         refit(slot);
         return;
@@ -176,7 +204,7 @@ void PhysicsModel::observeStep(Observation const& prev, Observation const& cur, 
         // wave: straight diagonal lines; slope = |dy| / dx
         if (bothAir && dx > 0.5f && std::fabs(dyN) > 0.05f) {
             double slope = std::fabs(dyN) / dx;
-            if (acceptSample(c.waveVy, slope, p.waveVy, 0.05, 0.02)) c.waveVy.add(slope);
+            offerSample(c.waveVy, slope, p.waveVy, 0.05, 0.02);
         }
         refit(slot);
         return;
@@ -184,14 +212,14 @@ void PhysicsModel::observeStep(Observation const& prev, Observation const& cur, 
 
     // Press events
     if (p.press == PressAction::JumpOnGround && prev.onGround && !cur.onGround && held && vc > 1.f) {
-        if (c.impulse.n < 2 || acceptSample(c.impulse, vc, p.impulse, 0.15, 0.2)) c.impulse.add(vc);
+        offerSample(c.impulse, vc, p.impulse, 0.15, 0.2);
         m_robotSinceTakeoff = 0;
         refit(slot);
         return;
     }
     if (cur.mode == GameMode::Robot && bothAir) ++m_robotSinceTakeoff;
     if (p.press == PressAction::ImpulseOnEdge && edge && vc - vp > 1.f) {
-        if (c.impulse.n < 2 || acceptSample(c.impulse, vc, p.impulse, 0.15, 0.2)) c.impulse.add(vc);
+        offerSample(c.impulse, vc, p.impulse, 0.15, 0.2);
         refit(slot);
         return;
     }
@@ -211,19 +239,21 @@ void PhysicsModel::observeStep(Observation const& prev, Observation const& cur, 
             if (cur.mode == GameMode::Robot) {
                 // robot: holding only boosts briefly after take-off; keep the two apart
                 if (held && d > p.accRelease + 0.03f) {
-                    if (acceptSample(c.accHold, d, p.accHold, 0.2, 0.02)) c.accHold.add(d);
+                    offerSample(c.accHold, d, p.accHold, 0.2, 0.02);
                     if (m_robotSinceTakeoff < 1000) c.boostMax = std::max<uint32_t>(c.boostMax, static_cast<uint32_t>(m_robotSinceTakeoff));
                 } else if (!held) {
-                    if (acceptSample(c.accRelease, d, p.accRelease, 0.1, 0.02)) c.accRelease.add(d);
+                    offerSample(c.accRelease, d, p.accRelease, 0.1, 0.02);
                 }
             } else if (pooledGravity(cur.mode)) {
                 // the same gravity whatever the button does: pool both
                 RunningStat& s = c.accRelease;
                 double mean = (c.accHold.sum + c.accRelease.sum) / std::max<uint32_t>(1, c.accHold.n + c.accRelease.n);
-                if (c.accHold.n + c.accRelease.n < 20 || std::fabs(d - mean) < std::max(0.02, 0.1 * std::fabs(mean))) s.add(d);
+                uint32_t changes = s.regimeChanges;
+                offerAround(s, d, mean, c.accHold.n + c.accRelease.n >= 20, std::max(0.02, 0.1 * std::fabs(mean)));
+                if (s.regimeChanges != changes) c.accHold = {}; // the pooled estimate restarts as a whole
             } else {
                 RunningStat& s = held ? c.accHold : c.accRelease;
-                if (acceptSample(s, d, held ? p.accHold : p.accRelease, 0.1, 0.02)) s.add(d);
+                offerSample(s, d, held ? p.accHold : p.accRelease, 0.1, 0.02);
             }
         }
         if (std::fabs(vc) > 0.5f) {

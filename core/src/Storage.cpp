@@ -36,6 +36,21 @@ void writeQTable(std::string& out, QTable const& table) {
         appendNumber(out, e.n[0]);
         out += ',';
         appendNumber(out, e.n[1]);
+        if (e.hasEvidence() || e.streak[0] || e.streak[1]) {
+            // format 2: outcome evidence (omitted when empty to keep files small)
+            for (int a = 0; a < kActions; ++a) {
+                out += ',';
+                appendNumber(out, e.fails[a]);
+            }
+            for (int a = 0; a < kActions; ++a) {
+                out += ',';
+                appendNumber(out, e.passes[a]);
+            }
+            for (int a = 0; a < kActions; ++a) {
+                out += ',';
+                appendNumber(out, e.streak[a]);
+            }
+        }
         out += ']';
     }
     out += ']';
@@ -62,6 +77,13 @@ bool readQTable(json::Value const& arr, QTable& table, std::string* error) {
         e.q[1] = static_cast<float>(row.at(2).asNumber());
         e.n[0] = static_cast<uint16_t>(std::clamp<int64_t>(row.at(3).asInt(), 0, 0xFFFF));
         e.n[1] = static_cast<uint16_t>(std::clamp<int64_t>(row.at(4).asInt(), 0, 0xFFFF));
+        if (row.size() >= 11) {
+            for (int a = 0; a < kActions; ++a) {
+                e.fails[a] = static_cast<uint16_t>(std::clamp<int64_t>(row.at(5 + a).asInt(), 0, 0xFFFF));
+                e.passes[a] = static_cast<uint16_t>(std::clamp<int64_t>(row.at(7 + a).asInt(), 0, 0xFFFF));
+                e.streak[a] = static_cast<uint8_t>(std::clamp<int64_t>(row.at(9 + a).asInt(), 0, 0xFF));
+            }
+        }
     }
     return true;
 }
@@ -314,6 +336,10 @@ bool deserializePatterns(std::string_view text, PatternMemory& out, std::string*
     auto const& d = *doc;
     if (!d.isObject() || d.get("format").asString() != "ai-geode-patterns") {
         if (error) *error = "not an AI-Geode pattern file";
+        return false;
+    }
+    if (d.get("version").asInt() > PatternMemory::kFormatVersion) {
+        if (error) *error = "file was written by a newer version of the mod";
         return false;
     }
     PatternMemory P;

@@ -76,7 +76,17 @@ public:
     static constexpr float kJumpVy = 11.f;
     static constexpr float kGravity = 0.22f; // cube gravity, vy units per tick
 
+    // Test hook: scales every mode's vertical accelerations, to simulate the
+    // game's physics changing (or the model having learned the wrong values).
+    static inline float s_gravityScale = 1.f;
+
     static ModeSpec spec(GameMode m) {
+        ModeSpec s = baseSpec(m);
+        s.accHold *= s_gravityScale;
+        s.accRelease *= s_gravityScale;
+        return s;
+    }
+    static ModeSpec baseSpec(GameMode m) {
         switch (m) {
             case GameMode::Robot: return {15.f, 4.5f, -0.06f, -0.22f, 99.f, 15.f, 7.5f, 0.f, 0.f, 50};
             case GameMode::Ship: return {12.f, 4.5f, 0.16f, -0.20f, 7.5f, 7.5f, 0.f, 0.f, 0.f, 0};

@@ -84,9 +84,9 @@ Inputs go through `GJBaseGameLayer::handleButton` from a `processCommands` hook,
 
 ### Learning: Q-learning plus failure-driven timing experiments
 1. **State.** The per-level state is (x cell of 3 units, mode, grounded, gravity, mini, button held, y band, vy band, speed). The cross-level pattern state is the same physics but, instead of x, the relative position of the nearby hazard, solid and orb.
-2. **Policy.** Each state stores Q(release) and Q(hold), and the AI picks the better one. A new state is seeded from the pattern table, so for example "spike 2 blocks ahead at 1× while grounded" transfers to unseen places and other levels. Because pattern keys include speed and mode, timings are never transferred between different speeds or modes.
-3. **Reward.** +1 per block of progress, −10 for dying, +50 for completing. Progress is the main signal, so the AI cannot farm reward without moving forward.
-4. **Update.** At the end of each attempt the whole trajectory is replayed backwards with λ-returns (γ = 0.995 and λ = 0.99 per tick). Blame for a death therefore spreads over roughly the last 0.3 s of decisions in proportion to time, instead of always landing on the final input.
+2. **Policy.** Each state stores Q(release) and Q(hold), and the AI picks the better one. A state with no experience of its own uses the pattern table instead (read live, so knowledge gained later still reaches it). For example, "spike 2 blocks ahead at 1× while grounded" transfers to unseen places and other levels. The prior is never mixed with a state's own record: own experience always decides alone, so learning elsewhere cannot silently change a decision that works here. Because pattern keys include speed and mode, timings are never transferred between different speeds or modes.
+3. **Reward.** +1 per block of progress, −10 for dying, +50 for completing. Progress is the main signal, so the AI cannot farm reward without moving forward. Each reward is paid once per event, so repeating an attempt earns nothing extra. A "new personal best" bonus (paid once, on the decision that first passes the old record) exists as `LearnerConfig::newBestReward`, but it is **off by default**: measured on the benchmark it slowed learning (blocks: mean 14 → 40 attempts), because progress is already rewarded and the bonus inflated whatever was done on the way.
+4. **Update.** At the end of each attempt the whole trajectory is replayed backwards with λ-returns (γ = 0.995 and λ = 0.99 per tick), with terminal handling (no bootstrap after a death or completion). See *Credit assignment* below for what is blamed.
 5. **Failure analysis.** `FailureAnalyzer` looks at the last ~5 blocks of the trajectory and at what killed the player (killer object above, below or ahead, rising or falling, which presses actually did something). It classifies the death as one of:
    - *no jump*;
    - *jumped too early* (came down onto it);
@@ -99,9 +99,43 @@ Inputs go through `GJBaseGameLayer::handleButton` from a `processCommands` hook,
    - flipping from early to late halves the step;
    - a try that changes nothing, or makes things worse, counts as evidence too.
    - If every variation of the suspected input fails, it **escalates** to an earlier input, because the real cause may be a decision made before the obstacle.
-7. **Keeping what works.** A successful experiment is committed into the Q-table, so the greedy policy repeats it. Its timing window is also stored as a constraint, so fixing a later obstacle never silently undoes an earlier fix. Changes that make things worse are dropped: the next experiment starts again from the best-known attempt.
-8. **Stuck detection.** After 20 attempts without a new best, exploration widens around the trouble spot and the search reaches further back.
+   An experiment plays only the change it tests as written. Around that change, the reference attempt's actions are reproduced **only while the player is in exactly the reference attempt's state** (same state key), so the comparison is fair. Once the change has made the situation different, decisions are made normally. Nothing is replayed by position. These reproduced decisions are labelled *reference replay* in the diagnostics.
+7. **Keeping what works.** When an experiment succeeds, its tested change and the state-matched decisions leading into it are committed into the Q-table. Its timing window is also stored as a constraint, so fixing a later obstacle never silently undoes an earlier fix. Changes that make things worse are dropped: the next experiment starts again from the best-known attempt.
+8. **Stuck detection.** After 20 attempts without a new best, exploration widens around the trouble spot and the search reaches further back. Right after progress it narrows (half the exploration) to refine what just worked.
 9. **Timing statistics.** Every successful jump over a hazard records its lead distance per mode and speed. These statistics seed future "add a press" experiments on any level.
+
+### Contextual failure memory and credit assignment (2.0)
+
+An audit of the 1.x learner found why it repeated mistakes and copied successful runs:
+- timing experiments replayed the previous attempt's actions per x position over about 8 blocks, regardless of the player's actual state;
+- after every attempt the furthest run's actions were written back into the Q-table for the whole solved part, overriding newer evidence;
+- deaths there were "fixed" by replaying that path up to 3 times;
+- failures were remembered only per x position ("hotspots"), never per decision and situation;
+- blame was spread over the last ~0.3 s by time, not by cause;
+- the cross-level prior only seeded brand-new states.
+
+What replaced it:
+
+1. **Per-state outcome evidence.** Every state stores, per action, how often that decision was identified as *the cause* of a death (`fails`), how often the attempt got safely past it (`passes`), and the failures since its last pass (`streak`). A pass resets the streak, so newer evidence always overrides older evidence. The same evidence is kept per pattern key (across levels). It is saved in the memory files.
+2. **Credit assignment.** After a death, one decision is identified as the cause; the rest are not blamed:
+   - With trusted predictions, the cause is the **last decision whose alternative still had a way through** (recorded at decision time). Later decisions, where both actions were predicted to collide, are not blamed. Their value update also applies to the other action, so the agent does not switch around pointlessly in a doomed state. Earlier decisions are judged by the best value available at the cause, not by the death (a Watkins-style trace cut).
+   - A predicted way through that has itself failed repeatedly in reality does not count (prediction vs. reality).
+   - If the path that died had been predicted *safe*, it is a model error. The physics model learns from it, and the prediction is not used to blame a decision.
+   - Without predictions, the failure analysis' suspect is used: for example the press for "jumped too early", or the wait before it for "too late".
+   - If both actions have already failed in that state, neither can be the cause, so the search moves to the decision before.
+   - Decisions safely before the death (more than 0.5 s and before the cause) count as passes. Those in between get no claim either way.
+3. **Repeated-failure detection.** Before acting, the agent checks the evidence for exactly this state. If the chosen decision has failed twice in a row here, and the alternative less often:
+   - it reports *"Repeated failure detected: an immediate jump failed 2 times here. Testing a delayed jump."*;
+   - it evaluates the alternative with the trajectory prediction when available. If the alternative is predicted to collide while the current choice is not, the switch is rejected (*"…the cause is probably earlier"*), and credit assignment looks further back;
+   - otherwise it plays the alternative, and the outcome becomes new evidence.
+
+   This applies to experiments and reference replays too. Nothing repeats a known mistake in the same situation, and it is not a global blacklist: other places and other states are unaffected.
+4. **Known good.** If one action got safely through a state at least 3 times without failing since, and the learned choice has no such record, the reliable action is taken. This guards against values disturbed by deaths further on, without replaying any run. (In the simulator benchmarks this override never actually triggered.)
+5. **No copying.** The furthest run (`bestPath`) is kept for inspection, export and to know how far the level is solved. It is never replayed or written into the policy. What it did well reaches later attempts only through the values and evidence of the states it visited.
+6. **Physics vs. policy.** The physics calibrator now detects a lasting change: 40 consecutive samples that disagree with the estimate but agree with each other replace the estimate (shown as "estimates replaced"). Before, after 20 samples, anything 10% off the estimate was rejected forever. Policy blame never comes from a wrong prediction.
+7. **Bounded memory.** Above 400,000 states per level, or 200,000 pattern states, the least experienced states are dropped. Memory files are now format 2 (with evidence); format-1 files still load, and files from a newer version are refused.
+
+The status panel shows each decision's source (learned, similar situations, planner, exploring, experiment, reference replay, known good, avoiding repeated failure, collision avoided), the last notable reason, and which decision was blamed for the last death and why. With *Show Debug Data* on, it also shows the evidence for the current state and the learning counters.
 
 ### Trajectory prediction (all game modes)
 Learning only from deaths is slow: every bad timing has to be tried once. The
@@ -281,6 +315,18 @@ Add `--bench` to also run the multi-seed learning benchmark.
 - the Q-update penalising the action before a death, and **learning-off leaving memory untouched**;
 - storage round trips, atomic writes, `.bak` recovery from a corrupted file, and rejection of foreign files;
 - the agent **changing its behaviour after a failure**;
+- the 2.0 learning architecture:
+  - **repeated failure**: a decision that failed twice in the same state is detected and the alternative is played, even though the values still favour the old choice. One failure is not enough, and a pass since then clears it;
+  - **prediction veto**: a repeated failure whose alternative is predicted to collide is not switched;
+  - **context**: a failure in one state changes nothing in other places or in other states at the same place;
+  - **breaking a loop values cannot**: with no death penalty, plain Q-learning dies at the first spike on all 79 later attempts. With failure memory, the same agent gets past it and on through the level, with 0 deaths on an already known mistake;
+  - **credit assignment**: one death blames exactly one decision (the wait before the spike). Earlier decisions are passed, the ones in between get no claim, and a completed run passes every decision;
+  - **persistence**: the evidence survives save/reload exactly, format-1 files still load, future formats are refused, and the reloaded agent makes the same evidence-based decision;
+  - **bounded memory**;
+  - **generalisation**: the prior decides unseen states, also states created before it was learned, but never overrides a state's own experience;
+  - **physics correction**: with gravity changed by 30% after calibration, the estimate is replaced (to the new value exactly) and the 32-step prediction error returns to 0.04 units. The agent with prediction still completes a level, and changing gravity back is recovered too;
+  - **no copying**: an experiment reproduces reference actions only in identical states; values of states an attempt does not visit are left alone; a best-run decision that newer evidence says now fails is not repeated;
+  - **learning regression with metrics**: every level × 3 seeds × with/without prediction, with attempts, regressions, known mistakes repeated, repeated failures detected, alternatives tried and helped, and deaths with a located cause;
 - the agent **completing all four simulator levels**, with later attempts measurably further than early ones;
 - **learned policy surviving save + reload**: a fresh agent with learning disabled completes the level from the saved file, while an untrained one does not;
 - cross-level transfer through pattern memory;
@@ -303,7 +349,7 @@ Add `--bench` to also run the multi-seed learning benchmark.
 
 ### Results
 
-Unit tests: 36 tests, 539 checks, 0 failures.
+Unit tests: 48 tests, 1890 checks, 0 failures.
 
 Trajectory prediction against the simulator:
 - calibration recovers the simulator's physics exactly (g 0.2200, k 0.2326,
@@ -333,32 +379,46 @@ that the predictor assumes (which button does what), only with different
 numbers. These results show that the calibration and planning work. They do
 **not** prove the rules match Geometry Dash exactly; only in-game testing can.
 
-Attempts to first completion, same seed, with vs. without prediction:
+With prediction, every simulator level is completed on attempt 1 (basics,
+spikes, blocks) or attempt 9–17 (ship) over 3 seeds.
 
-| Level | With prediction | Without |
-|---|---|---|
-| basics | 3 | 9 |
-| spikes | 3 | 16 |
-| blocks | 4 | 15 |
-| ship | 10 | 35 |
+Per-tick cost: about 0.7 µs per decision in the simulator. The end-of-attempt update (values, credit assignment and evidence) over about 1,200 decisions takes about 0.4 ms. Saving is done on a background thread.
 
-The first one or two attempts are still learned the old way while the physics
-model calibrates.
+Benchmark (`--bench`): attempts to first completion over 5 seeds, median / mean (lower is better). 1.x is the previous version (commit 6a6520a), built and run side by side:
 
-Per-tick cost: about 0.5 µs per decision in the simulator. The end-of-attempt update over about 1,100 decisions takes about 0.25 ms. Saving is done on a background thread.
-
-Benchmark: attempts to first completion, median over 5 seeds (lower is better):
-
-| Level | Q-learning only | **Default (Q + failure analysis)** | speed 1.0 |
+| Level | Variant | 1.x | 2.0 |
 |---|---|---|---|
-| basics (single spikes) | 10 | **7** | 7 |
-| spikes (doubles/triples) | **9** | 31 | 29 |
-| blocks (stairs, platforms) | failed 3 of 5 | **17** | 16 |
-| ship (cube→ship→cube) | failed 4 of 5 | **119** | 106 |
+| basics | default | 7 / 8 | **6 / 7** |
+| | learning speed 0.1 / 1.0 | 9 / 11, 9 / 9 | **7 / 7, 6 / 7** |
+| | Q-learning only | 8 / 8 | **7 / 7** |
+| spikes | default | 16 / 16 | **14 / 16** |
+| | learning speed 0.1 / 1.0 | 19 / 19, 13 / 193 | **15 / 16, 10 / 21** |
+| | Q-learning only | 8 / 11 | 9 / 8 |
+| blocks | default | 15 / 16 | **13 / 14** |
+| | learning speed 0.1 / 1.0 | 18 / 840, 15 / 17 | 26 / 44, **13 / 13** |
+| | Q-learning only | 225 / 188 (1 of 5 failed) | **93 / 85** (1 of 5 failed) |
+| ship | default | 33 / 34 | **32 / 31** |
+| | learning speed 0.1 / 1.0 | 282 / 254, 21 / 21 | **139 / 140, 18 / 19** |
+| | Q-learning only | 303 / 264 (2 of 5 failed) | **165 / 166** |
+| all | with trajectory prediction | 3, 3, 3, 10 | 3, 3, 3, 10 |
 
-The failure analysis is what makes the harder levels solvable at all. Plain Q-learning is faster on the simplest spike patterns. A "Q-learning first, experiments after N deaths" hybrid was measured as well and rejected, because it broke the block level on every seed.
+2.0 is better or equal on every line except two:
+- blocks at learning speed 0.1 has a worse median (26 vs 18), but a far better mean (44 vs 840);
+- spikes with Q-learning only is roughly equal (median 9 vs 8, mean 8 vs 11).
 
-Cross-level transfer: after training on *spikes*, the *basics* level was completed in 1 attempt with shared pattern memory, versus 7 from scratch.
+The learning-metrics test (3 seeds, without prediction) also shows:
+- regressions into solved sections: 0–2 per run;
+- deaths on a decision already known to fail there: 0 in every run except one ship run with prediction (1 of 16 deaths);
+- a single cause located for nearly every death.
+
+The ablation also measured each mechanism on blocks (mean attempts):
+- without failure memory (measured while the new-best bonus was still on): default 40 → 110 with 1 of 5 seeds failing, and 4 of 5 failing at learning speed 0.1;
+- blind replay by position instead of state-matched replay: better on blocks, but worse on basics, spikes and ship (for example ship at speed 0.1: 139 → 307), so it was not kept;
+- new-best bonus: see *Reward* above.
+
+The failure analysis is what makes the harder levels solvable at all.
+
+Cross-level transfer: after training on *spikes*, the *basics* level was completed in 1 attempt with shared pattern memory, versus 6 from scratch.
 
 ### In-game test (Stereo Madness, normal mode, GD 2.2081 + Geode 5.11.1)
 
@@ -369,9 +429,11 @@ Cross-level transfer: after training on *spikes*, the *basics* level was complet
 
 Later in-game runs on Stereo Madness (before trajectory prediction) reached
 51.5% after 386 attempts. Several problems were found in game and fixed:
-- regressions into already-solved sections, fixed by best-path protection;
+- regressions into already-solved sections, at first fixed by best-path protection. 2.0 replaced that with per-state evidence (see *Contextual failure memory*), because it overrode newer evidence;
 - ship deaths misclassified by obstacle centre, fixed by using obstacle edges;
 - ship climbs needing a hold-range search instead of a single tap.
+
+**The 2.0 learning changes (failure memory, credit assignment, state-matched replay) have not been tested in game yet**, only in the simulator.
 
 **Trajectory prediction has not been verified in game yet.** Its accuracy on the
 real game is measured by the debug panel (step error, 32-step error, drift,
@@ -394,6 +456,8 @@ sizes and landing tolerance are still unconfirmed.
   - the wave hitbox (12 units, inner 6) and the ship hitbox (24 units) are guesses;
   - the game's own corridor bounds (`m_portalY` / `m_lastModeHeight`) are not used yet because their meaning is unconfirmed; bounds are learned by contact instead;
   - the planner tries a limited set of input shapes, so a sequence it never tries (for example an unusual tap rhythm) cannot be found by planning, only by learning.
+- **Failure memory is per exact state.** It is keyed by the 3-unit x cell plus the physics state, so it reacts to repeated failures in a deterministic replay of the same situation. In a level where the same situation is reached in slightly different states every time (non-deterministic mods, moving objects), streaks build up slowly. The cross-level pattern evidence is recorded too, but it is only used through the values, not to switch decisions.
+- **Credit assignment without prediction** relies on the failure analysis' guess. It walks back one decision per two deaths when that guess is wrong, which is slower than the timing experiments, so both run together.
 - **Determinism**: GD 2.2's physics are deterministic for identical inputs, which the learning relies on. Mods that change input timing, such as *Click Between Frames*, or physics settings can make attempts less repeatable and learning slower.
 - The memory of a local/editor level is keyed by its content, so editing the level starts a fresh memory.
 - **Training Speed** above 1× desyncs the music.

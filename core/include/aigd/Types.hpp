@@ -112,4 +112,22 @@ enum class AgentPhase : uint8_t { Idle = 0, Observing, Playing, Learning, Retryi
 
 char const* agentPhaseName(AgentPhase phase);
 
+// Where a decision came from. Shown in the diagnostics and recorded per step so
+// that learning can tell learned choices from tests and safety overrides.
+enum class DecisionSource : uint8_t {
+    Policy = 0,   // learned values of this exact state
+    Prior,        // no own experience yet: values of similar situations (other levels/places)
+    Planner,      // no learned preference: the trajectory planner's best plan
+    Explore,      // random exploration near the current trouble spot
+    Experiment,   // the one change a timing experiment is testing
+    Reference,    // reproducing the reference attempt (same state) so an experiment is a fair comparison
+    KnownGood,    // the other action reliably got through here and the learned choice has no such record
+    AvoidRepeat,  // the learned choice was the cause of repeated deaths here: testing the alternative
+    Shield,       // the chosen action was predicted to collide; the other was not
+    Debounce,     // kept the button state (minimum time between changes)
+    Count
+};
+
+char const* decisionSourceName(DecisionSource source);
+
 } // namespace aigd

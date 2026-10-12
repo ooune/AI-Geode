@@ -17,7 +17,7 @@ constexpr int32_t kMaxFlyingShiftCells = 60;
 constexpr size_t kTraceSamples = 240;
 
 std::string fmt(char const* f, ...) {
-    char buf[256];
+    char buf[512];
     va_list args;
     va_start(args, f);
     std::vsnprintf(buf, sizeof(buf), f, args);
@@ -58,6 +58,27 @@ int desire(ExperimentType type, FailureKind kind) {
         default: return 0;
     }
 }
+
+// What an action means in words, for the decision diagnostics.
+char const* failedPhrase(GameMode mode, bool onGround, bool holding, int a) {
+    if (needsGroundToAct(mode)) {
+        if (a == 1) return holding ? "holding on" : (onGround ? "an immediate jump" : "pressing in the air");
+        return onGround ? "waiting" : "staying released";
+    }
+    if (a == 1) return holding ? "holding on" : "pressing now";
+    return holding ? "releasing now" : "staying released";
+}
+
+char const* alternativePhrase(GameMode mode, bool onGround, bool holding, int b) {
+    if (needsGroundToAct(mode)) {
+        if (b == 1) return onGround ? "jumping here (earlier)" : "holding into the landing";
+        return holding ? "releasing here" : "a delayed jump";
+    }
+    if (b == 1) return holding ? "keeping it held" : "pressing here (earlier)";
+    return holding ? "releasing here (earlier)" : "a delayed press";
+}
+
+constexpr size_t kNone = static_cast<size_t>(-1);
 } // namespace
 
 Agent::Agent(LearnerConfig cfg) : m_cfg(cfg), m_rng(cfg.seed) {}
@@ -91,7 +112,9 @@ void Agent::resetTransient() {
     m_focusTo = -1.f;
     m_prevEndX = -1.f;
     m_protectLimitX = 1e30f;
-    m_regressions.clear();
+    m_pivot = kNone;
+    m_cutAtPivot = false;
+    m_avoidedThisAttempt.clear();
     m_nextChange.clear();
     m_lastReport = {};
     m_curAction = 0;
@@ -121,22 +144,13 @@ float Agent::protectedUpTo() const {
     return std::min(limit, m_protectLimitX);
 }
 
-void Agent::commitBestPath() {
-    if (!m_level || !m_cfg.learningEnabled) return;
-    float upTo = protectedUpTo();
-    for (auto const& p : m_level->bestPath) {
-        if (p.x >= upTo) break;
-        QEntry& e = m_level->q.getOrCreate(p.key);
-        int a = p.action;
-        if (e.q[a] <= e.q[1 - a] + kCommitMargin) e.q[a] = e.q[1 - a] + kCommitMargin;
-    }
-}
-
 float Agent::epsilonAt(float x) const {
     if (x < protectedUpTo()) return 0.f;
     if (x < m_focusFrom || x > m_focusTo) return 0.f;
+    // Broader when stuck, narrower right after progress (refine what works).
     float eps = m_cfg.focusEpsilon * (1.f + 2.f * static_cast<float>(stuckLevel()));
     if (!m_activeExp.active) eps *= 2.f; // no targeted idea: explore more broadly
+    if (m_status.lastImproved == 1) eps *= 0.5f;
     return std::min(eps, 0.5f);
 }
 
@@ -161,11 +175,6 @@ QEntry* Agent::lookup(uint64_t key, uint64_t pkey, QEntry& scratch) {
     return &scratch;
 }
 
-int Agent::greedyAction(QEntry const& e, uint64_t) const {
-    if (e.q[1] > e.q[0] + kTieEpsilon) return 1;
-    return 0;
-}
-
 void Agent::beginAttempt(Observation const& first, bool fromCheckpoint) {
     if (!m_level) return;
     if (m_active) abortAttempt(nullptr);
@@ -186,6 +195,9 @@ void Agent::beginAttempt(Observation const& first, bool fromCheckpoint) {
     m_lastObs = first;
 
     m_activeExp = {};
+    m_avoidedThisAttempt.clear();
+    m_pivot = kNone;
+    m_cutAtPivot = false;
     if (m_cfg.learningEnabled && m_pendingExp.active && m_pendingExp.toCell >= xCell(first.x, m_cfg.cellSize)) {
         m_activeExp = std::move(m_pendingExp);
     }
@@ -227,61 +239,157 @@ bool Agent::act(Observation const& obs) {
     uint64_t pkey = encodePatternKey(obs, holdingNow);
     QEntry scratch;
     QEntry* e = lookup(key, pkey, scratch);
-    int a = greedyAction(*e, pkey);
+    QEntry const* pe = m_patterns ? m_patterns->q.find(pkey) : nullptr;
+    auto& M = m_status.metrics;
+
+    // Values used for the decision: own experience in this exact state where
+    // there is any, otherwise what was learned in similar situations. The
+    // prior is read live, so later knowledge about a situation still reaches
+    // states that were created before it was learned. It is never mixed with
+    // own experience: a state with a record of its own decides by that alone,
+    // so learning elsewhere cannot silently change a decision that works here.
+    float v[kActions] = {e->q[0], e->q[1]};
+    bool fromPrior = false;
+    if (!e->visited(0) && !e->visited(1) && pe && (pe->visited(0) || pe->visited(1))) {
+        for (int k = 0; k < kActions; ++k) {
+            if (pe->visited(k)) v[k] = pe->q[k] * m_cfg.priorWeight;
+        }
+        fromPrior = true;
+    }
+    int a = v[1] > v[0] + kTieEpsilon ? 1 : 0;
+    DecisionSource src = fromPrior ? DecisionSource::Prior : DecisionSource::Policy;
     bool forced = false;
     bool explored = false;
+    bool replayed = false;
+    bool decided = false;
+    std::string reason; // only for notable decisions
+
+    // Trajectory prediction for both actions, used to vet alternatives and to
+    // find the deciding decision afterwards.
+    Predictor::Advice const* adv = nullptr;
+    if (m_predictor && m_cfg.usePrediction && !obs.obstacles.empty()) {
+        adv = &m_predictor->advise(obs, holdingNow);
+        m_status.predictionValid = adv->valid;
+        m_status.predictionTrusted = adv->trusted;
+        if (adv->valid) {
+            m_status.pressOutcome = adv->press;
+            m_status.releaseOutcome = adv->release;
+            m_status.pressTTC = adv->pressTTC;
+            m_status.releaseTTC = adv->releaseTTC;
+        }
+    }
+    bool const trusted = adv && adv->valid && adv->trusted;
+    auto predicted = [&](int k) { return k ? adv->press : adv->release; };
 
     int32_t cell = xCell(obs.x, m_cfg.cellSize);
-    if (m_activeExp.covers(cell)) {
+    if (m_activeExp.tests(cell)) {
+        // The one change the experiment is testing.
         a = m_activeExp.actionAt(cell);
         forced = true;
-    } else if (m_cfg.learningEnabled) {
+        decided = true;
+        src = DecisionSource::Experiment;
+    } else if (m_activeExp.covers(cell) && m_activeExp.baseKeyAt(cell) == key) {
+        // Same state as in the reference attempt: do the same, so the
+        // experiment's result is a fair comparison. In any other state the
+        // decision is made normally.
+        a = m_activeExp.actionAt(cell);
+        replayed = true;
+        decided = true;
+        src = DecisionSource::Reference;
+    }
+
+    {
+        // Contextual failure memory: has this decision, in exactly this state,
+        // been identified as the cause of deaths, again and again? This
+        // applies to every source, including experiments and reference
+        // replays: nothing repeats a known mistake in the same situation.
+        int const b = 1 - a;
+        int const thr = std::max(1, m_cfg.repeatFailureThreshold);
+        if (e->streak[a] >= thr && e->streak[b] < e->streak[a]) {
+            bool first = std::find(m_avoidedThisAttempt.begin(), m_avoidedThisAttempt.end(), key) == m_avoidedThisAttempt.end();
+            if (first) {
+                m_avoidedThisAttempt.push_back(key);
+                ++M.repeatedFailuresDetected;
+            }
+            char const* failed = failedPhrase(obs.mode, obs.onGround, holdingNow, a);
+            char const* alt = alternativePhrase(obs.mode, obs.onGround, holdingNow, b);
+            if (trusted && predicted(b) == Certainty::Collision && predicted(a) != Certainty::Collision) {
+                // The alternative is predicted to die as well: switching cannot
+                // help here, the cause must be earlier (credit assignment
+                // will look there).
+                if (first) ++M.alternativesVetoed;
+                reason = fmt("Repeated failure detected: %s failed %u times here, but %s is predicted to collide; the cause is probably earlier.",
+                             failed, static_cast<unsigned>(e->streak[a]), alt);
+            } else {
+                if (first) ++M.alternativesTried;
+                reason = fmt("Repeated failure detected: %s failed %u times here. Testing %s%s%s.", failed,
+                             static_cast<unsigned>(e->streak[a]), alt, trusted ? ", predicted " : "",
+                             trusted ? certaintyName(predicted(b)) : "");
+                a = b;
+                decided = true;
+                forced = false;
+                replayed = false;
+                src = DecisionSource::AvoidRepeat;
+            }
+        } else if (!decided && e->streak[b] == 0 && e->passes[b] >= static_cast<uint16_t>(std::max(1, m_cfg.knownGoodPasses)) &&
+                   (e->passes[a] == 0 || e->streak[a] > 0)) {
+            // The other action reliably got through from exactly this state and
+            // has not failed since; the learned choice has no such record.
+            // (Values here may have been disturbed by deaths further on.)
+            // Exploration may still try something else when stuck.
+            reason = fmt("Known good here: %s got through %u times; %s has no such record.",
+                         alternativePhrase(obs.mode, obs.onGround, holdingNow, b), static_cast<unsigned>(e->passes[b]),
+                         failedPhrase(obs.mode, obs.onGround, holdingNow, a));
+            a = b;
+            src = DecisionSource::KnownGood;
+            ++M.knownGoodKept;
+        }
+    }
+
+    if (!decided && m_cfg.learningEnabled) {
         float eps = epsilonAt(obs.x);
         if (eps > 0.f && std::uniform_real_distribution<float>(0.f, 1.f)(m_rng) < eps) {
             a = 1 - a;
             explored = true;
+            src = DecisionSource::Explore;
         }
     }
 
     // Trajectory prediction: simulate pressing vs. releasing before committing.
     bool planned = false;
     bool shielded = false;
-    bool advised = false;
-    if (m_predictor && m_cfg.usePrediction && !obs.obstacles.empty()) {
-        auto const& adv = m_predictor->advise(obs, holdingNow);
-        advised = true;
-        m_status.predictionValid = adv.valid;
-        m_status.predictionTrusted = adv.trusted;
-        if (adv.valid) {
-            m_status.pressOutcome = adv.press;
-            m_status.releaseOutcome = adv.release;
-            m_status.pressTTC = adv.pressTTC;
-            m_status.releaseTTC = adv.releaseTTC;
+    if (trusted) {
+        // No learned preference here yet: follow the planner's best plan.
+        bool opinion = (e->visited(0) || e->visited(1)) && std::fabs(e->q[0] - e->q[1]) > 1e-3f;
+        if (!decided && !explored && !opinion) {
+            a = adv->bestPresses ? 1 : 0;
+            planned = true;
+            src = DecisionSource::Planner;
         }
-        if (adv.valid && adv.trusted) {
-            // No learned preference here yet: follow the planner's best plan.
-            bool opinion = (e->visited(0) || e->visited(1)) && std::fabs(e->q[0] - e->q[1]) > 1e-3f;
-            if (!forced && !explored && !opinion) {
-                a = adv.bestPresses ? 1 : 0;
-                planned = true;
+        // Never execute an action whose every continuation is predicted to
+        // collide while the other action still has a way through. The
+        // rejected action is learned as an imagined death right away, so
+        // the timing does not have to be discovered by dying.
+        Certainty mine = predicted(a);
+        Certainty other = predicted(1 - a);
+        if (mine == Certainty::Collision && other != Certainty::Collision) {
+            int32_t ttc = std::max(0, a ? adv->pressTTC : adv->releaseTTC);
+            if (m_cfg.learningEnabled) {
+                float target = -m_cfg.deathPenalty * std::pow(m_cfg.gammaPerTick, static_cast<float>(ttc));
+                e->q[a] += m_cfg.alpha() * m_cfg.imaginedScale * (target - e->q[a]);
+                if (e->n[a] < 0xFFFF) ++e->n[a]; // it is evidence about this action
             }
-            // Never execute an action whose every continuation is predicted to
-            // collide while the other action still has a way through. The
-            // rejected action is learned as an imagined death right away, so
-            // the timing does not have to be discovered by dying.
-            Certainty mine = a ? adv.press : adv.release;
-            Certainty other = a ? adv.release : adv.press;
-            if (mine == Certainty::Collision && other != Certainty::Collision) {
-                if (m_cfg.learningEnabled) {
-                    int32_t ttc = std::max(0, a ? adv.pressTTC : adv.releaseTTC);
-                    float target = -m_cfg.deathPenalty * std::pow(m_cfg.gammaPerTick, static_cast<float>(ttc));
-                    e->q[a] += m_cfg.alpha() * m_cfg.imaginedScale * (target - e->q[a]);
-                }
-                a = 1 - a;
-                shielded = true;
-                forced = false;
-                explored = false;
+            if (src != DecisionSource::Planner) {
+                reason = fmt("Collision avoided: %s was predicted to collide in %d steps; %s was not.",
+                             failedPhrase(obs.mode, obs.onGround, holdingNow, a), ttc + 1,
+                             alternativePhrase(obs.mode, obs.onGround, holdingNow, 1 - a));
             }
+            a = 1 - a;
+            shielded = true;
+            forced = false;
+            explored = false;
+            replayed = false;
+            src = DecisionSource::Shield;
         }
     }
 
@@ -291,8 +399,10 @@ bool Agent::act(Observation const& obs) {
         forced = false;
         explored = false;
         shielded = false;
+        replayed = false;
+        src = DecisionSource::Debounce;
     }
-    if (advised) m_predictor->noteExecuted(a == 1);
+    if (adv) m_predictor->noteExecuted(a == 1);
     if (shielded) {
         ++m_status.shieldsThisAttempt;
         ++m_status.shieldsTotal;
@@ -321,7 +431,15 @@ bool Agent::act(Observation const& obs) {
     s.explored = explored;
     s.planned = planned;
     s.shielded = shielded;
+    s.replayed = replayed;
+    s.source = src;
+    if (trusted) {
+        s.pred[0] = static_cast<int8_t>(adv->release);
+        s.pred[1] = static_cast<int8_t>(adv->press);
+    }
     m_steps.push_back(s);
+    if (replayed) ++M.referenceSteps;
+    else ++M.independentSteps;
 
     m_curKey = key;
     m_curAction = static_cast<uint8_t>(a);
@@ -334,6 +452,13 @@ bool Agent::act(Observation const& obs) {
     m_status.explored = explored;
     m_status.planned = planned;
     m_status.shielded = shielded;
+    m_status.source = src;
+    if (!reason.empty()) m_status.reason = std::move(reason);
+    for (int k = 0; k < kActions; ++k) {
+        m_status.fails[k] = e->fails[k];
+        m_status.passes[k] = e->passes[k];
+        m_status.streak[k] = e->streak[k];
+    }
     m_status.epsilon = epsilonAt(obs.x);
     m_status.decisions = m_steps.size();
     return a == 1;
@@ -368,6 +493,15 @@ void Agent::backwardUpdate(float terminalBonus, bool terminal, float bootstrap, 
         QEntry& e = m_level->q.getOrCreate(s.key);
         e.q[s.action] += alpha * (target - e.q[s.action]);
         if (e.n[s.action] < 0xFFFF) ++e.n[s.action];
+        if (m_cutAtPivot && i > m_pivot && s.pred[0] == static_cast<int8_t>(Certainty::Collision) &&
+            s.pred[1] == static_cast<int8_t>(Certainty::Collision)) {
+            // Past the deciding decision both actions were predicted to die,
+            // so the death says as much about the other action: learn it too,
+            // instead of making the untried action look better than it is.
+            int o = 1 - s.action;
+            e.q[o] += alpha * m_cfg.imaginedScale * (target - e.q[o]);
+            if (e.n[o] < 0xFFFF) ++e.n[o];
+        }
 
         if (m_patterns) {
             QEntry& pe = m_patterns->q.getOrCreate(s.pkey);
@@ -378,14 +512,181 @@ void Agent::backwardUpdate(float terminalBonus, bool terminal, float bootstrap, 
         G = target;
         nextMax = e.best();
         nextTick = s.tick;
+        // The deciding decision had a way through (its alternative was
+        // predicted to survive): decisions before it are judged by the best
+        // value available at that point, not by the death that followed a
+        // later mistake (Watkins-style trace cut).
+        if (m_cutAtPivot && i == m_pivot) G = nextMax;
+    }
+}
+
+void Agent::applyNewBestBonus(float endX) {
+    if (!m_level || m_fromCheckpoint || m_steps.empty() || m_cfg.newBestReward <= 0.f) return;
+    if (m_level->totalAttempts == 0) return; // the first attempt has no record to beat
+    float prev = m_level->bestX;
+    if (endX < prev + kBlock) return;
+    // Rewarded once, on the decision that carried the player past the old
+    // record. The record then moves, so the same achievement is never paid twice.
+    for (size_t i = 0; i < m_steps.size(); ++i) {
+        if (m_steps[i].x > prev) {
+            m_steps[i ? i - 1 : 0].reward += m_cfg.newBestReward;
+            break;
+        }
+    }
+    ++m_status.metrics.newBests;
+}
+
+void Agent::assignCredit(int32_t endTick, FailureReport const* report, bool completed) {
+    m_pivot = kNone;
+    m_cutAtPivot = false;
+    if (m_steps.empty() || !m_level) return;
+    auto& M = m_status.metrics;
+    size_t const n = m_steps.size();
+    int const thr = std::max(1, m_cfg.repeatFailureThreshold);
+    auto const collision = static_cast<int8_t>(Certainty::Collision);
+    auto const safe = static_cast<int8_t>(Certainty::Safe);
+    auto recentlyFailed = [&](Step const& s, int a, int atLeast) {
+        auto const* e = m_level->q.find(s.key);
+        return e && e->streak[a] >= atLeast;
+    };
+
+    size_t pivot = kNone;
+    enum { None, Prediction, Analysis } how = None;
+    bool mispredicted = false;
+    bool walkedPredictions = false;
+    if (!completed && report) {
+        // 1. Did the model see this death coming? A decision right before the
+        // death whose own path was predicted safe means the physics model was
+        // wrong: that is corrected by physics learning, and the predictions
+        // are not used to blame a decision.
+        for (size_t i = n; i-- > 0;) {
+            Step const& s = m_steps[i];
+            if (endTick - s.tick > 12) break;
+            if (s.pred[0] < 0) continue;
+            mispredicted = s.pred[s.action] == safe;
+            break;
+        }
+        if (mispredicted) ++M.mispredictedDeaths;
+
+        // 2. With trusted predictions: the deciding decision is the last one
+        // whose alternative still had a way through. Later decisions could not
+        // have saved the attempt (both actions predicted to collide), so they
+        // are not blamed. A predicted way through that already failed
+        // repeatedly in reality does not count (prediction vs. reality).
+        if (!mispredicted) {
+            for (size_t i = n; i-- > 0;) {
+                Step const& s = m_steps[i];
+                if (endTick - s.tick > m_cfg.blameTicks) break;
+                if (s.pred[0] < 0) break; // no prediction: no evidence from here on back
+                walkedPredictions = true;
+                int alt = 1 - s.action;
+                if (s.pred[alt] != collision && !recentlyFailed(s, alt, thr)) {
+                    pivot = i;
+                    how = Prediction;
+                    break;
+                }
+                ++M.doomedSkipped;
+            }
+        }
+
+        // 3. Otherwise: the failure analysis' suspect (from what really happened).
+        if (pivot == kNone && !walkedPredictions) {
+            FailureReport const& R = *report;
+            if (R.responsibleBlock >= 0 && R.responsibleBlock < static_cast<int>(R.blocks.size())) {
+                auto const& b = R.blocks[static_cast<size_t>(R.responsibleBlock)];
+                switch (R.kind) {
+                    case FailureKind::TooLate: pivot = b.firstStep > 0 ? b.firstStep - 1 : kNone; break;
+                    case FailureKind::HeldTooLong: pivot = b.lastStep; break;
+                    case FailureKind::ReleasedTooLong: pivot = b.lastStep + 1 < n ? b.lastStep + 1 : kNone; break;
+                    default: pivot = b.firstStep; break;
+                }
+            } else {
+                // No press to blame: the last chance to press before the death.
+                for (size_t i = n; i-- > 0;) {
+                    Step const& s = m_steps[i];
+                    if (endTick - s.tick > m_cfg.blameTicks) break;
+                    if (s.action == 0 && (!needsGroundToAct(s.mode) || s.onGround)) {
+                        pivot = i;
+                        break;
+                    }
+                }
+            }
+            // Where both actions have already failed in this state, neither is
+            // the cause: the trouble starts earlier.
+            while (pivot != kNone && pivot < n && recentlyFailed(m_steps[pivot], 0, 1) && recentlyFailed(m_steps[pivot], 1, 1)) {
+                ++M.doomedSkipped;
+                size_t j = pivot;
+                pivot = kNone;
+                while (j-- > 0) {
+                    Step const& s = m_steps[j];
+                    if (endTick - s.tick > m_cfg.blameTicks) break;
+                    if (s.key != m_steps[j + 1].key && (!needsGroundToAct(s.mode) || s.onGround || s.action == 1)) {
+                        pivot = j;
+                        break;
+                    }
+                }
+            }
+            if (pivot >= n) pivot = kNone;
+            if (pivot != kNone) how = Analysis;
+        }
+    }
+
+    float const len = m_level->levelLength > 1.f ? m_level->levelLength : 1.f;
+    if (pivot != kNone) {
+        Step const& s = m_steps[pivot];
+        QEntry const* known = m_level->q.find(s.key);
+        uint8_t streak = known ? known->streak[s.action] : 0;
+        if (streak >= thr) ++M.sameMistakeRepeated;
+        if (m_cfg.learningEnabled) {
+            QEntry& e = m_level->q.getOrCreate(s.key);
+            e.noteFail(s.action);
+            streak = e.streak[s.action];
+            if (m_patterns) m_patterns->q.getOrCreate(s.pkey).noteFail(s.action);
+        }
+        bool holdingBefore = pivot > 0 && m_steps[pivot - 1].action == 1;
+        m_pivot = pivot;
+        m_cutAtPivot = how == Prediction;
+        if (how == Prediction) ++M.pivotsByPrediction;
+        else ++M.pivotsByAnalysis;
+        m_status.lastCredit = fmt("Blamed %s at %.1f%% (%s; failed %u times here)",
+                                  failedPhrase(s.mode, s.onGround, holdingBefore, s.action), s.x / len * 100.f,
+                                  how == Prediction ? "prediction: the other action still had a way through"
+                                                    : "failure analysis",
+                                  static_cast<unsigned>(streak));
+    } else if (!completed && report) {
+        ++M.pivotsUnknown;
+        m_status.lastCredit = walkedPredictions
+                                  ? "No decision blamed: every decision in reach was already doomed (cause is further back)"
+                                  : "No decision blamed: no evidence which decision caused it";
+    }
+    if (mispredicted) m_status.lastCredit += "; the path had been predicted safe, so the physics model was corrected and the prediction not used for blame";
+
+    // Passes: decisions the attempt got safely past (well before the death,
+    // and before the deciding decision).
+    if (m_cfg.learningEnabled) {
+        uint64_t lastKey = ~uint64_t(0);
+        uint8_t lastA = 0xFF;
+        for (size_t i = 0; i < n; ++i) {
+            Step const& s = m_steps[i];
+            if (!completed && endTick - s.tick <= m_cfg.passTicks) break;
+            if (m_pivot != kNone && i >= m_pivot) break;
+            if (s.key == lastKey && s.action == lastA) continue;
+            lastKey = s.key;
+            lastA = s.action;
+            m_level->q.getOrCreate(s.key).notePass(s.action);
+            if (m_patterns) m_patterns->q.getOrCreate(s.pkey).notePass(s.action);
+            if (s.source == DecisionSource::AvoidRepeat) ++M.alternativesThatHelped;
+        }
     }
 }
 
 void Agent::commitExperiment() {
     // The experiment worked: make sure the greedy policy now prefers what the
-    // experiment did, so the improvement is kept on the next attempts.
+    // experiment did, so the improvement is kept on the next attempts. That is
+    // the tested change plus the decisions leading into it that were taken in
+    // exactly the reference attempt's states (never anything outside them).
     for (auto const& s : m_steps) {
-        if (!s.forced) continue;
+        if (!s.forced && !s.replayed) continue;
         if (auto* e = m_level->q.find(s.key)) {
             int a = s.action;
             if (e->q[a] <= e->q[1 - a] + kCommitMargin) e->q[a] = e->q[1 - a] + kCommitMargin;
@@ -402,6 +703,7 @@ Agent::ActionTrace Agent::buildTrace(float endX) const {
     int32_t endCell = std::max(t.startCell, xCell(endX, cs));
     t.actions.assign(static_cast<size_t>(endCell - t.startCell + 1), 0);
     t.ground.assign(t.actions.size(), 1);
+    t.keys.assign(t.actions.size(), 0);
     t.endX = endX;
     // The action recorded for a cell is the one active at the cell's centre.
     size_t j = 0;
@@ -412,6 +714,7 @@ Agent::ActionTrace Agent::buildTrace(float endX) const {
         auto i = static_cast<size_t>(c - t.startCell);
         t.actions[i] = covered ? m_steps[j].action : 0;
         t.ground[i] = covered ? (m_steps[j].onGround ? 1 : 0) : 1;
+        t.keys[i] = covered ? m_steps[j].key : 0;
     }
     return t;
 }
@@ -489,9 +792,7 @@ void Agent::finishAttempt(float endX, int32_t endTick, bool died, bool completed
         L.bestPath.reserve(m_steps.size());
         for (auto const& s : m_steps) L.bestPath.push_back({s.x, s.key, s.action});
         m_protectLimitX = 1e30f;
-        m_regressions.clear();
     }
-    commitBestPath();
 
     if (progress > L.bestProgress + 1e-6f) {
         L.bestProgress = progress;
@@ -513,6 +814,9 @@ void Agent::finishAttempt(float endX, int32_t endTick, bool died, bool completed
 
     L.pushHistory(std::move(rec));
     m_activeExp = {};
+    // Bounded memory: forget the least experienced states first.
+    if (L.q.size() > LevelMemory::kMaxStates) L.q.prune(LevelMemory::kMaxStates * 9 / 10);
+    if (m_patterns && m_patterns->q.size() > PatternMemory::kMaxStates) m_patterns->q.prune(PatternMemory::kMaxStates * 9 / 10);
     refreshStatus();
 }
 
@@ -536,29 +840,22 @@ void Agent::onDeath(Observation const& last, DeathInfo const& death) {
     h.lastKind = rep.kind;
     m_lastReport = rep;
 
-    if (m_cfg.learningEnabled) backwardUpdate(-m_cfg.deathPenalty, true, 0.f, last.tick);
+    assignCredit(last.tick, &rep, false);
+    if (m_cfg.learningEnabled) {
+        applyNewBestBonus(endX);
+        backwardUpdate(-m_cfg.deathPenalty, true, 0.f, last.tick);
+    }
     finishAttempt(endX, last.tick, true, false, rep.kind);
 
     m_focusFrom = rep.windowStartX;
     m_focusTo = rep.deathX + kBlock;
-    // An experiment that made things worse is judged by planNext, not here.
-    bool regression = !m_fromCheckpoint && endX < protectedUpTo() && m_lastSearchHotspot == INT32_MIN;
-    if (regression && m_cfg.learningEnabled) {
-        // Died in a section the best run already got through. The best path
-        // has just been re-committed, so replay it; if that keeps failing here
-        // (the game is not perfectly repeatable), hand the spot back to learning.
-        if (++m_regressions[bucket] >= 3) {
-            m_protectLimitX = std::min(m_protectLimitX, static_cast<float>(bucket - 1) * kBlock);
-            m_regressions.erase(bucket);
-            regression = false;
-        } else {
-            m_pendingExp = {};
-            m_nextChange = fmt("Fell behind the best run at %.1f%%: restoring the known-good path", rep.deathProgress * 100.f);
-        }
+    if (m_pivot != kNone) {
+        // Explore from the deciding decision on, even when it lies before the
+        // analysis window (the trouble started earlier than the death).
+        // (Still never before the solved part: see protectedUpTo.)
+        m_focusFrom = std::min(m_focusFrom, m_steps[m_pivot].x - kBlock);
     }
-    if (regression) {
-        // handled above
-    } else if (m_cfg.learningEnabled) {
+    if (m_cfg.learningEnabled) {
         planNext(rep);
     } else {
         m_pendingExp = {};
@@ -577,7 +874,11 @@ void Agent::onComplete(Observation const& last) {
     m_lastObs = last;
     float endX = std::max(last.x, m_maxX);
     if (!m_steps.empty()) m_steps.back().reward += progressReward(endX - m_steps.back().x);
-    if (m_cfg.learningEnabled) backwardUpdate(m_cfg.completionReward, true, 0.f, last.tick);
+    assignCredit(last.tick, nullptr, true);
+    if (m_cfg.learningEnabled) {
+        applyNewBestBonus(endX);
+        backwardUpdate(m_cfg.completionReward, true, 0.f, last.tick);
+    }
     finishAttempt(endX, last.tick, false, true, FailureKind::None);
     m_pendingExp = {};
     m_incumbent = buildTrace(endX);
@@ -593,6 +894,9 @@ void Agent::abortAttempt(Observation const*) {
     // A running experiment is retried on the next attempt instead of being judged.
     if (m_activeExp.active) m_pendingExp = std::move(m_activeExp);
     m_activeExp = {};
+    m_avoidedThisAttempt.clear();
+    m_pivot = kNone;
+    m_cutAtPivot = false;
     m_steps.clear();
     m_inputs.clear();
     m_leads.clear();
@@ -904,7 +1208,36 @@ void Agent::buildExperiment(Search const& s, ActionTrace const& base, FailureRep
     ex.fromCell = std::max(ex.fromCell, base.startCell);
     ex.toCell = std::max(deathCell + 3, s.blockEnd + std::max(0, s.shift) + 1);
     ex.actions.resize(static_cast<size_t>(ex.toCell - ex.fromCell + 1));
-    for (int32_t c = ex.fromCell; c <= ex.toCell; ++c) ex.actions[static_cast<size_t>(c - ex.fromCell)] = base.at(c);
+    ex.baseKeys.resize(ex.actions.size());
+    for (int32_t c = ex.fromCell; c <= ex.toCell; ++c) {
+        ex.actions[static_cast<size_t>(c - ex.fromCell)] = base.at(c);
+        ex.baseKeys[static_cast<size_t>(c - ex.fromCell)] = base.keyAt(c);
+    }
+    // The cells that make up the change being tested.
+    switch (s.type) {
+        case ExperimentType::ShiftBlock:
+            ex.testFrom = std::min(s.blockStart, s.blockStart + s.shift);
+            ex.testTo = std::max(s.blockEnd, s.blockEnd + s.shift);
+            break;
+        case ExperimentType::ShiftStart:
+            ex.testFrom = std::min(s.blockStart, s.blockStart + s.shift);
+            ex.testTo = s.blockEnd;
+            break;
+        case ExperimentType::ShiftEnd:
+            ex.testFrom = s.blockStart;
+            ex.testTo = std::max(s.blockEnd, s.blockEnd + s.shift);
+            break;
+        case ExperimentType::HoldRange:
+        case ExperimentType::ReleaseRange:
+            ex.testFrom = s.blockStart + s.shift;
+            ex.testTo = s.blockEnd;
+            break;
+        case ExperimentType::InsertPress:
+            ex.testFrom = s.blockStart + s.shift;
+            ex.testTo = s.blockStart + s.shift + s.insertLen - 1;
+            break;
+        default: break;
+    }
 
     auto set = [&](int32_t from, int32_t to, uint8_t v) { // inclusive range
         for (int32_t c = std::max(from, ex.fromCell); c <= std::min(to, ex.toCell); ++c)
@@ -966,6 +1299,19 @@ void Agent::refreshStatus() {
 }
 
 // ---------------------------------------------------------------------------
+
+void QTable::prune(size_t keep) {
+    if (m_map.size() <= keep) return;
+    std::vector<std::pair<uint32_t, uint64_t>> score;
+    score.reserve(m_map.size());
+    for (auto const& [k, e] : m_map) {
+        uint32_t sc = static_cast<uint32_t>(e.n[0]) + e.n[1] + e.passes[0] + e.passes[1] + 2u * (e.fails[0] + e.fails[1]);
+        score.emplace_back(sc, k);
+    }
+    size_t drop = m_map.size() - keep;
+    std::nth_element(score.begin(), score.begin() + static_cast<std::ptrdiff_t>(drop), score.end());
+    for (size_t i = 0; i < drop; ++i) m_map.erase(score[i].second);
+}
 
 float LevelMemory::recentCompletionRate(size_t window) const {
     if (history.empty()) return 0.f;

@@ -19,7 +19,19 @@ struct LearnerConfig {
     float progressRewardPerBlock = 1.f;
     float deathPenalty = 10.f;
     float completionReward = 50.f;
-    float priorWeight = 0.5f;         // how much cross-level pattern knowledge seeds new states
+    float priorWeight = 0.5f;         // how much cross-level pattern knowledge counts in states without own experience
+    // Extra reward, once per attempt, on the decision that first goes past the
+    // previous best. Off by default: measured on the benchmark it slowed
+    // learning (blocks: mean 14 -> 40 attempts), because the progress reward
+    // already pays for new ground and the bonus inflated the values of
+    // whatever happened to be done on the way there.
+    float newBestReward = 0.f;
+
+    // --- Credit assignment / failure memory ---
+    int passTicks = 120;              // a decision followed by this long without dying counts as a pass
+    int blameTicks = 360;             // how far before a death its cause is searched for
+    int repeatFailureThreshold = 2;   // failures in a row of one decision in one state before trying the alternative
+    int knownGoodPasses = 3;          // passes (and no failure since) for an action to count as known good
 
     // --- Exploration ---
     float focusEpsilon = 0.03f;       // random exploration inside the failure window

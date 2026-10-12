@@ -1437,6 +1437,537 @@ TEST(all_modes_overlay_and_agent_hook_work) {
 }
 
 // ---------------------------------------------------------------------------
+// Learning architecture (2.0): contextual failure memory, credit assignment,
+// no copying of successful runs, generalisation, physics correction
+
+namespace {
+// Agent with only the mechanism under test: no timing experiments, no random
+// exploration.
+LearnerConfig isolatedConfig() {
+    LearnerConfig cfg;
+    cfg.useExperiments = false;
+    cfg.focusEpsilon = 0.f;
+    return cfg;
+}
+
+struct GravityScale {
+    explicit GravityScale(float s) { sim::World::s_gravityScale = s; }
+    ~GravityScale() { sim::World::s_gravityScale = 1.f; }
+};
+
+size_t countIf(QTable const& t, std::function<bool(QEntry const&)> const& f) {
+    size_t n = 0;
+    for (auto const& [k, e] : t) n += f(e) ? 1 : 0;
+    return n;
+}
+} // namespace
+
+TEST(repeated_failure_is_detected_and_the_alternative_tested) {
+    sim::Level level = sim::levelBasics();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    LearnerConfig cfg = isolatedConfig();
+    Agent agent(cfg);
+    agent.attach(&mem, &pat);
+    sim::World w(level);
+    Observation o = w.observe();
+    QEntry& e = mem.q.getOrCreate(encodeLevelKey(o, false, cfg.cellSize));
+    // The values still favour waiting here, but waiting was identified as the
+    // cause of the last two deaths in exactly this state.
+    e.q[0] = 1.f;
+    e.q[1] = 0.f;
+    e.n[0] = 5;
+    e.n[1] = 1;
+    e.fails[0] = 2;
+    e.streak[0] = 2;
+
+    agent.beginAttempt(o, false);
+    bool hold = agent.act(o);
+    auto const& st = agent.status();
+    std::printf("    decision: %s | %s\n", decisionSourceName(st.source), st.reason.c_str());
+    CHECK(hold);
+    CHECK(st.source == DecisionSource::AvoidRepeat);
+    CHECK(st.reason.find("Repeated failure detected") != std::string::npos);
+    CHECK(st.metrics.repeatedFailuresDetected == 1);
+    CHECK(st.metrics.alternativesTried == 1);
+    agent.abortAttempt(nullptr);
+
+    // One failure is not yet a pattern: the values decide.
+    e.streak[0] = 1;
+    agent.beginAttempt(o, false);
+    CHECK(!agent.act(o));
+    CHECK(agent.status().source == DecisionSource::Policy);
+    agent.abortAttempt(nullptr);
+
+    // A pass since then (newer evidence) clears the streak.
+    e.streak[0] = 2;
+    e.notePass(0);
+    agent.beginAttempt(o, false);
+    CHECK(!agent.act(o));
+    agent.abortAttempt(nullptr);
+}
+
+TEST(repeated_failure_alternative_is_vetted_by_prediction) {
+    // Spike 4 blocks ahead: jumping now lands on it, waiting (and jumping
+    // later) clears it. Waiting "failed twice" here, but the only alternative
+    // is predicted to collide, so switching is rejected.
+    PredictionRig rig;
+    warmUp(rig);
+    sim::Level level;
+    level.name = "veto";
+    level.spike(4.4f);
+    level.finish(20);
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    LearnerConfig cfg = isolatedConfig();
+    Agent agent(cfg);
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    sim::World w(level);
+    Observation o = rig.observe(w);
+    rig.predictor.observe(o, false);
+    auto const& adv = rig.predictor.advise(o, false, false);
+    std::printf("    press now: %s, wait: %s\n", certaintyName(adv.press), certaintyName(adv.release));
+    CHECK(adv.valid && adv.trusted);
+    CHECK(adv.press == Certainty::Collision);
+    CHECK(adv.release != Certainty::Collision);
+
+    QEntry& e = mem.q.getOrCreate(encodeLevelKey(o, false, cfg.cellSize));
+    e.q[0] = 1.f;
+    e.n[0] = 5;
+    e.fails[0] = 2;
+    e.streak[0] = 2;
+    agent.beginAttempt(o, false);
+    bool hold = agent.act(o);
+    std::printf("    decision: %s | %s\n", decisionSourceName(agent.status().source), agent.status().reason.c_str());
+    CHECK(!hold);
+    CHECK(agent.status().metrics.alternativesVetoed == 1);
+    CHECK(agent.status().reason.find("predicted to collide") != std::string::npos);
+    agent.abortAttempt(nullptr);
+}
+
+TEST(failure_memory_is_contextual) {
+    sim::Level level = sim::levelBasics();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    LearnerConfig cfg = isolatedConfig();
+    Agent agent(cfg);
+    agent.attach(&mem, &pat);
+    sim::World w(level);
+    Observation a = w.observe();
+    for (int t = 0; t < 40; ++t) w.step(false);
+    Observation b = w.observe(); // further along, otherwise the same situation
+    Observation c = a;           // same place, different state (airborne, rising)
+    c.y += 40.f;
+    c.vy = 6.f;
+    c.onGround = false;
+    uint64_t ka = encodeLevelKey(a, false, cfg.cellSize);
+    uint64_t kb = encodeLevelKey(b, false, cfg.cellSize);
+    uint64_t kc = encodeLevelKey(c, false, cfg.cellSize);
+    CHECK(ka != kb && ka != kc && kb != kc);
+    for (uint64_t k : {ka, kb, kc}) {
+        QEntry& e = mem.q.getOrCreate(k);
+        e.q[1] = 1.f; // pressing preferred everywhere
+        e.n[1] = 3;
+    }
+    QEntry& bad = mem.q.getOrCreate(ka);
+    bad.fails[1] = 3;
+    bad.streak[1] = 3; // ...but pressing failed repeatedly in state a only
+
+    auto decide = [&](Observation const& o) {
+        agent.beginAttempt(o, false);
+        bool h = agent.act(o);
+        DecisionSource s = agent.status().source;
+        agent.abortAttempt(nullptr);
+        return std::make_pair(h, s);
+    };
+    auto da = decide(a), db = decide(b), dc = decide(c);
+    CHECK(!da.first && da.second == DecisionSource::AvoidRepeat);
+    // Not a global "do not press" rule: other places and other states are unaffected.
+    CHECK(db.first && db.second == DecisionSource::Policy);
+    CHECK(dc.first && dc.second == DecisionSource::Policy);
+}
+
+TEST(failure_memory_breaks_a_mistake_values_alone_repeat) {
+    // Without a death penalty a death costs the values nothing, so plain
+    // Q-learning keeps repeating the fatal decision before the first spike.
+    // The contextual failure memory has to recognise and break the loop.
+    struct Outcome {
+        float bestX;
+        LearningMetrics m;
+        int sameEnd;
+    };
+    auto run = [](int threshold) {
+        sim::Level level = sim::levelBasics();
+        LevelMemory mem = freshLevel(level);
+        PatternMemory pat;
+        LearnerConfig cfg = isolatedConfig();
+        cfg.deathPenalty = 0.f;
+        cfg.repeatFailureThreshold = threshold;
+        Agent agent(cfg);
+        agent.attach(&mem, &pat);
+        int sameEnd = 0;
+        float lastEnd = -1.f;
+        for (int i = 0; i < 80; ++i) {
+            auto r = runAttempt(agent, level);
+            if (std::fabs(r.endX - lastEnd) < 0.01f) ++sameEnd;
+            lastEnd = r.endX;
+            if (r.completed) break;
+        }
+        return Outcome{mem.bestX, agent.status().metrics, sameEnd};
+    };
+    Outcome with = run(2), without = run(100000);
+    float spike1 = 12.f * kBlock;
+    std::printf("    without failure memory: best x %.0f, %d of 79 attempts died at exactly the same spot\n", without.bestX, without.sameEnd);
+    std::printf("    with failure memory:    best x %.0f; %u repeated failures detected, %u alternatives tried, %u helped, "
+                "%u deaths on an already known mistake\n",
+                with.bestX, with.m.repeatedFailuresDetected, with.m.alternativesTried, with.m.alternativesThatHelped,
+                with.m.sameMistakeRepeated);
+    CHECK(without.bestX < spike1 + kBlock);       // values alone: stuck at the first spike
+    CHECK(with.bestX > spike1 + 2.f * kBlock);    // failure memory: gets past it
+    CHECK(with.m.repeatedFailuresDetected > 0);
+    CHECK(with.m.alternativesThatHelped > 0);
+    CHECK(with.m.sameMistakeRepeated == 0);
+    CHECK(without.sameEnd >= 75);
+}
+
+TEST(credit_assignment_blames_one_decision_and_keeps_uncertainty) {
+    sim::Level level = sim::levelBasics();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    LearnerConfig cfg = isolatedConfig();
+    Agent agent(cfg);
+    agent.attach(&mem, &pat);
+    auto r = runAttempt(agent, level); // never jumps: dies at the first spike
+    CHECK(!r.completed);
+    size_t blamed = countIf(mem.q, [](QEntry const& e) { return e.fails[0] + e.fails[1] > 0; });
+    size_t passed = countIf(mem.q, [](QEntry const& e) { return e.passes[0] + e.passes[1] > 0; });
+    size_t neither = countIf(mem.q, [](QEntry const& e) { return !e.hasEvidence(); });
+    std::printf("    %zu states: %zu blamed, %zu passed, %zu without evidence | %s\n", mem.q.size(), blamed, passed, neither,
+                agent.status().lastCredit.c_str());
+    CHECK(blamed == 1); // one decision, not every decision before the death
+    CHECK(passed > 0);
+    CHECK(neither > 0); // the decisions right before the death: no claim either way
+    // The blamed decision is "waiting", shortly before the spike.
+    float maxPassedX = 0.f;
+    for (auto const& s : agent.steps()) {
+        auto const* e = mem.q.find(s.key);
+        if (e && e->fails[0] > 0) {
+            CHECK(s.action == 0);
+            CHECK(s.x > r.endX - 3.f * kBlock);
+            CHECK(e->q[0] < 0.f); // and its value dropped
+        }
+        if (e && e->passes[s.action] > 0) maxPassedX = std::max(maxPassedX, s.x);
+    }
+    CHECK(maxPassedX < r.endX - kBlock); // passes only well before the death
+    CHECK(agent.status().metrics.pivotsByAnalysis == 1);
+
+    // A completed attempt passes every decision and blames none.
+    LevelMemory mem2 = freshLevel(level);
+    PatternMemory pat2;
+    Agent trained;
+    trained.attach(&mem2, &pat2);
+    auto t = train(trained, level, 400);
+    CHECK(t.attemptsToComplete > 0);
+    for (auto const& s : trained.steps()) CHECK(mem2.q.find(s.key)->passes[s.action] > 0);
+}
+
+TEST(failure_memory_survives_save_and_reload) {
+    sim::Level level = sim::levelBasics();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    {
+        Agent agent;
+        agent.attach(&mem, &pat);
+        train(agent, level, 400);
+    }
+    size_t withEvidence = countIf(mem.q, [](QEntry const& e) { return e.hasEvidence(); });
+    CHECK(withEvidence > 0);
+
+    std::string err;
+    LevelMemory loaded;
+    PatternMemory loadedPat;
+    CHECK(storage::deserializeLevel(storage::serializeLevel(mem), loaded, &err));
+    CHECK(storage::deserializePatterns(storage::serializePatterns(pat), loadedPat, &err));
+    bool same = loaded.q.size() == mem.q.size();
+    for (auto const& [k, e] : mem.q) {
+        auto const* l = loaded.q.find(k);
+        same = same && l && l->fails[0] == e.fails[0] && l->fails[1] == e.fails[1] && l->passes[0] == e.passes[0] &&
+               l->passes[1] == e.passes[1] && l->streak[0] == e.streak[0] && l->streak[1] == e.streak[1];
+    }
+    CHECK(same);
+    CHECK(countIf(loadedPat.q, [](QEntry const& e) { return e.hasEvidence(); }) > 0);
+
+    // Files from version 1 (no evidence) still load; files from the future do not.
+    LevelMemory old = freshLevel(level);
+    QEntry& oe = old.q.getOrCreate(42);
+    oe.q[1] = 2.f;
+    oe.n[1] = 1;
+    std::string v1 = storage::serializeLevel(old);
+    auto pos = v1.find("\"version\":2");
+    CHECK(pos != std::string::npos);
+    std::string v3 = v1;
+    v1.replace(pos, 11, "\"version\":1");
+    v3.replace(pos, 11, "\"version\":3");
+    LevelMemory fromV1, fromV3;
+    CHECK(storage::deserializeLevel(v1, fromV1, &err));
+    CHECK(fromV1.q.find(42) && fromV1.q.find(42)->q[1] == 2.f && !fromV1.q.find(42)->hasEvidence());
+    CHECK(!storage::deserializeLevel(v3, fromV3, &err));
+
+    // The reloaded memory produces the same decision from the same evidence.
+    sim::World w(level);
+    Observation o = w.observe();
+    LearnerConfig cfg = isolatedConfig();
+    QEntry& e = mem.q.getOrCreate(encodeLevelKey(o, false, cfg.cellSize));
+    e.streak[e.q[1] > e.q[0] ? 1 : 0] = 5;
+    LevelMemory again;
+    CHECK(storage::deserializeLevel(storage::serializeLevel(mem), again, &err));
+    PatternMemory noPat;
+    Agent fresh(cfg);
+    fresh.attach(&again, &noPat);
+    fresh.beginAttempt(o, false);
+    fresh.act(o);
+    CHECK(fresh.status().source == DecisionSource::AvoidRepeat);
+    fresh.abortAttempt(nullptr);
+}
+
+TEST(memory_is_bounded) {
+    QTable t;
+    for (uint64_t k = 0; k < 1000; ++k) {
+        QEntry& e = t.getOrCreate(k);
+        e.n[0] = static_cast<uint16_t>(k % 7 == 0 ? 50 : 0);
+    }
+    t.prune(200);
+    CHECK(t.size() == 200);
+    size_t kept = countIf(t, [](QEntry const& e) { return e.n[0] == 50; });
+    CHECK(kept == 143); // every experienced state (1000/7 rounded up) survives
+}
+
+TEST(prior_reaches_unseen_states_but_never_overrides_own_experience) {
+    sim::Level level = sim::levelBasics();
+    sim::World w(level);
+    Observation o = w.observe();
+    LearnerConfig cfg = isolatedConfig();
+    PatternMemory pat;
+    QEntry& pe = pat.q.getOrCreate(encodePatternKey(o, false));
+    pe.q[1] = 4.f; // in similar situations elsewhere, pressing worked
+    pe.n[1] = 10;
+    pe.q[0] = -2.f;
+    pe.n[0] = 10;
+
+    auto decide = [&](LevelMemory& mem) {
+        Agent agent(cfg);
+        agent.attach(&mem, &pat);
+        agent.beginAttempt(o, false);
+        bool h = agent.act(o);
+        DecisionSource s = agent.status().source;
+        agent.abortAttempt(nullptr);
+        return std::make_pair(h, s);
+    };
+    // Unseen state: the prior decides.
+    LevelMemory fresh = freshLevel(level);
+    auto d1 = decide(fresh);
+    CHECK(d1.first && d1.second == DecisionSource::Prior);
+    // A state created before the prior was learned still gets it (live prior).
+    LevelMemory created = freshLevel(level);
+    created.q.getOrCreate(encodeLevelKey(o, false, cfg.cellSize));
+    auto d2 = decide(created);
+    CHECK(d2.first && d2.second == DecisionSource::Prior);
+    // Own experience in this exact state wins over the prior.
+    LevelMemory own = freshLevel(level);
+    QEntry& e = own.q.getOrCreate(encodeLevelKey(o, false, cfg.cellSize));
+    e.q[0] = 1.f;
+    e.n[0] = 2;
+    auto d3 = decide(own);
+    CHECK(!d3.first && d3.second == DecisionSource::Policy);
+}
+
+TEST(physics_change_is_detected_and_corrected) {
+    PredictionRig rig;
+    warmUpMode(rig, GameMode::Cube);
+    float g1 = rig.model.params(GameMode::Cube, false).accRelease;
+    {
+        GravityScale heavier(1.3f);
+        float truth = sim::World::spec(GameMode::Cube).accRelease;
+        warmUpMode(rig, GameMode::Cube, 3000, 11);
+        float g2 = rig.model.params(GameMode::Cube, false).accRelease;
+        Accuracy a = measureAccuracy(rig, GameMode::Cube);
+        std::printf("    gravity before %.4f, after the change %.4f (truth %.4f); %u estimate(s) replaced; 32-step error %.2f\n",
+                    g1, g2, truth, rig.model.regimeChanges(), a.meanErr);
+        CHECK(rig.model.regimeChanges() > 0);
+        CHECK(std::fabs(g2 - truth) < 0.01f);
+        CHECK(a.samples > 10 && a.meanErr < 1.0);
+
+        // The learning agent with prediction still completes a level under
+        // the changed physics (single spikes: with 30% more gravity a jump
+        // no longer clears three in a row). A death on a path that was
+        // predicted safe is counted as a model error, not blamed via prediction.
+        sim::Level level = sim::levelBasics();
+        LevelMemory mem = freshLevel(level);
+        PatternMemory pat;
+        Agent agent;
+        agent.attach(&mem, &pat);
+        agent.setPredictor(&rig.predictor);
+        auto r = train(agent, level, 300, &rig);
+        std::printf("    basics under changed physics: completed after %d attempts (%u mispredicted deaths)\n", r.attemptsToComplete,
+                    agent.status().metrics.mispredictedDeaths);
+        CHECK(r.attemptsToComplete > 0);
+    }
+    // and back: the original physics are recovered too
+    warmUpMode(rig, GameMode::Cube, 3000, 13);
+    CHECK(std::fabs(rig.model.params(GameMode::Cube, false).accRelease - g1) < 0.01f);
+}
+
+TEST(experiments_replay_only_in_the_same_state) {
+    // An experiment changes one thing. Around it, the reference attempt's
+    // actions are reproduced only while the player is in exactly the same
+    // state as then; once the change has made the situation different, the
+    // decisions are made normally instead of being replayed by position.
+    sim::Level level = sim::levelBasics();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent;
+    agent.attach(&mem, &pat);
+    runAttempt(agent, level);
+    Experiment ex = agent.pendingExperiment();
+    CHECK(ex.active);
+    CHECK(ex.testFrom >= ex.fromCell && ex.testTo <= ex.toCell && ex.testFrom <= ex.testTo);
+    runAttempt(agent, level);
+    int reference = 0, tested = 0, independentInSpan = 0, violations = 0;
+    for (auto const& s : agent.steps()) {
+        int32_t cell = xCell(s.x, agent.config().cellSize);
+        if (!ex.covers(cell)) continue;
+        if (s.source == DecisionSource::Reference) {
+            ++reference;
+            if (s.key != ex.baseKeyAt(cell) || ex.tests(cell)) ++violations;
+        } else if (s.source == DecisionSource::Experiment) {
+            ++tested;
+            if (!ex.tests(cell)) ++violations;
+        } else if (!ex.tests(cell)) {
+            ++independentInSpan;
+        }
+    }
+    std::printf("    experiment span: %d reference decisions (same state), %d tested, %d decided normally\n", reference, tested,
+                independentInSpan);
+    CHECK(violations == 0);
+    CHECK(tested > 0);
+    CHECK(independentInSpan > 0); // after the change the states differ: no blind replay
+}
+
+TEST(newer_evidence_overrides_the_best_run) {
+    // The best run is kept for inspection only. It is never written back into
+    // the policy, so when later evidence says one of its decisions now fails,
+    // that evidence wins.
+    sim::Level level = sim::levelSpikes();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent;
+    agent.attach(&mem, &pat);
+    auto r = train(agent, level, 800);
+    CHECK(r.attemptsToComplete > 0);
+    CHECK(!mem.bestPath.empty());
+
+    // (1) Values of states an attempt does not visit are left alone: an
+    // early state of the best run is changed, then an attempt is played from
+    // a checkpoint after it.
+    PathStep target{};
+    for (auto const& p : mem.bestPath) {
+        if (p.x > 5.f * kBlock && p.action == 0) {
+            target = p;
+            break;
+        }
+    }
+    QEntry& e = mem.q.getOrCreate(target.key);
+    e.q[1] = e.q[0] + 7.f; // new preference, against the best run
+    float before = e.q[1];
+    {
+        sim::World w(level);
+        w.reset(20.f * kBlock);
+        agent.beginAttempt(w.observe(), true);
+        for (int t = 0; t < 100000 && !w.dead() && !w.complete(); ++t) w.step(agent.act(w.observe()));
+        if (w.dead()) agent.onDeath(w.observe(), w.death());
+        else if (w.complete()) agent.onComplete(w.observe());
+    }
+    CHECK(mem.q.find(target.key)->q[1] == before);
+    mem.q.find(target.key)->q[1] = mem.q.find(target.key)->q[0] - 7.f; // undo, so the next check follows the best run
+
+    // (2) A best-run decision that newer evidence says now fails is not repeated.
+    PathStep press{};
+    for (auto const& p : mem.bestPath) {
+        if (p.action == 1 && p.x > 10.f * kBlock) {
+            press = p;
+            break;
+        }
+    }
+    QEntry& pe = mem.q.getOrCreate(press.key);
+    std::printf("    best-run press at x=%.0f: q %.2f/%.2f, passes %u/%u, fails %u/%u, streak %u/%u\n", press.x, pe.q[0], pe.q[1],
+                pe.passes[0], pe.passes[1], pe.fails[0], pe.fails[1], pe.streak[0], pe.streak[1]);
+    pe.streak[1] = static_cast<uint8_t>(std::max(2, pe.streak[0] + 1));
+    pe.fails[1] += pe.streak[1];
+    LearnerConfig replayCfg;
+    replayCfg.learningEnabled = false;
+    Agent check(replayCfg);
+    check.attach(&mem, &pat);
+    runAttempt(check, level);
+    bool pressedThere = false, avoided = false;
+    for (auto const& s : check.steps()) {
+        if (s.key != press.key) continue;
+        pressedThere = pressedThere || s.action == 1;
+        avoided = avoided || s.source == DecisionSource::AvoidRepeat;
+    }
+    std::printf("    with new evidence against it: %s\n", pressedThere ? "pressed anyway" : "not pressed (alternative tested)");
+    CHECK(!pressedThere);
+    CHECK(avoided);
+}
+
+TEST(learning_metrics_regression) {
+    // Attempts to first completion plus the learning-quality counters, for
+    // every simulator level and three seeds, without and with prediction.
+    std::printf("    %-7s %-5s %8s %6s %7s %9s %8s %7s %6s %6s %7s\n", "level", "pred", "attempts", "regr", "repeat", "detected",
+                "tried", "helped", "vetoed", "known", "blamed");
+    int failures = 0;
+    for (auto const& level : sim::allLevels()) {
+        for (int pred = 0; pred < 2; ++pred) {
+            for (uint32_t seed = 1; seed <= 3; ++seed) {
+                LevelMemory mem = freshLevel(level);
+                PatternMemory pat;
+                LearnerConfig cfg;
+                cfg.seed = seed * 7919u;
+                Agent agent(cfg);
+                agent.attach(&mem, &pat);
+                PredictionRig rig;
+                if (pred) {
+                    warmUp(rig);
+                    agent.setPredictor(&rig.predictor);
+                }
+                auto r = train(agent, level, 1500, pred ? &rig : nullptr);
+                int regressions = 0;
+                float best = 0.f;
+                for (auto const& a : r.attempts) {
+                    if (a.endX < best - 3.f * kBlock) ++regressions;
+                    best = std::max(best, a.endX);
+                }
+                auto const& m = agent.status().metrics;
+                int deaths = static_cast<int>(r.attempts.size()) - (r.attemptsToComplete > 0 ? 1 : 0);
+                std::printf("    %-7s %-5s %8d %6d %7u %9u %8u %7u %6u %6u %4u/%-3d\n", level.name.c_str(), pred ? "yes" : "no",
+                            r.attemptsToComplete, regressions, m.sameMistakeRepeated, m.repeatedFailuresDetected,
+                            m.alternativesTried, m.alternativesThatHelped, m.alternativesVetoed, m.knownGoodKept > 0 ? 1u : 0u,
+                            m.pivotsByPrediction + m.pivotsByAnalysis, deaths);
+                if (r.attemptsToComplete <= 0) ++failures;
+                CHECK_MSG(r.attemptsToComplete > 0, "%s seed %u pred %d not completed", level.name.c_str(), seed, pred);
+                CHECK_MSG(regressions * 4 <= static_cast<int>(r.attempts.size()), "%s seed %u: %d regressions in %zu",
+                          level.name.c_str(), seed, regressions, r.attempts.size());
+                // Deaths on a decision already known to fail there stay rare.
+                CHECK_MSG(m.sameMistakeRepeated * 5 <= static_cast<uint32_t>(std::max(deaths, 5)), "%s seed %u: %u of %d deaths repeated a known mistake",
+                          level.name.c_str(), seed, m.sameMistakeRepeated, deaths);
+            }
+        }
+    }
+    std::printf("    (repeat = deaths on a decision already known to fail there; known = known-good overrides used)\n");
+    CHECK(failures == 0);
+}
+
+// ---------------------------------------------------------------------------
 // Benchmark (not run by default)
 
 static void runBench() {
@@ -1546,9 +2077,11 @@ static void diag(sim::Level const& level, int attempts) {
             auto const& st = agent.steps();
             for (size_t k = 1; k < st.size(); ++k)
                 if (st[k].action != st[k - 1].action && st[k].x > r.endX - 200.f)
-                    std::printf(" %s@%.0f%s%s", st[k].action ? "P" : "R", st[k].x, st[k].onGround ? "g" : "a", st[k].forced ? "*" : "");
+                    std::printf(" %s@%.0f%s%s", st[k].action ? "P" : "R", st[k].x, st[k].onGround ? "g" : "a",
+                                st[k].source == DecisionSource::Policy ? "" : (std::string("[") + decisionSourceName(st[k].source) + "]").c_str());
             auto const& d = agent.lastReport();
-            std::printf(" | kind=%s\n", failureKindName(d.kind));
+            std::printf(" | kind=%s\n      credit: %s | reason: %s\n", failureKindName(d.kind), agent.status().lastCredit.c_str(),
+                        agent.status().reason.c_str());
         }
     }
 }

@@ -39,6 +39,12 @@ struct ModePhysics {
 struct RunningStat {
     double sum = 0.0;
     uint32_t n = 0;
+    // Transient (not saved): an unbroken run of rejected samples that agree
+    // with each other. If it grows long enough the physics really changed (or
+    // the first estimate was wrong) and the statistic restarts from that run.
+    double altSum = 0.0;
+    uint32_t altN = 0;
+    uint32_t regimeChanges = 0;
     void add(double v) {
         sum += v;
         ++n;
@@ -94,6 +100,15 @@ public:
     float driftPerTick() const { return driftPerTick(GameMode::Cube); }
     float lastResimError() const { return m_lastResimError; }
     uint32_t accuracySamples() const { return m_accuracyN; }
+    // How often an estimate was replaced because the game consistently did
+    // something else (physics changed, or the first estimate was wrong).
+    uint32_t regimeChanges() const {
+        uint32_t n = 0;
+        for (auto const& c : m_cal.modes) {
+            for (auto const* st : {&c.accHold, &c.accRelease, &c.impulse, &c.flipVy, &c.waveVy}) n += st->regimeChanges;
+        }
+        return n;
+    }
 
     PhysicsCalibration const& calibration() const { return m_cal; }
     void loadCalibration(PhysicsCalibration const& cal);
