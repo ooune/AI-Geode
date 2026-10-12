@@ -1,0 +1,13 @@
+# Build output
+build/
+build-*/
+out/
+*.geode
+.cache/
+compile_commands.json
+
+# IDE
+.vscode/
+.vs/
+.idea/
+*.user
