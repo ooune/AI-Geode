@@ -83,6 +83,8 @@ void Agent::resetTransient() {
     m_focusFrom = 0.f;
     m_focusTo = -1.f;
     m_prevEndX = -1.f;
+    m_protectLimitX = 1e30f;
+    m_regressions.clear();
     m_nextChange.clear();
     m_lastReport = {};
     m_curAction = 0;
@@ -98,7 +100,33 @@ uint32_t Agent::stuckLevel() const {
     return std::min<uint32_t>(3, m_level->attemptsSinceBest / static_cast<uint32_t>(m_cfg.stuckAttempts));
 }
 
+float Agent::protectedUpTo() const {
+    if (!m_level || m_level->bestPath.empty()) return -1e30f;
+    float limit;
+    if (m_level->completions > 0 && m_level->levelLength > 1.f && m_level->bestPathX >= m_level->levelLength - kBlock) {
+        limit = 1e30f; // the whole level is solved
+    } else {
+        // Leave the last stretch before the frontier free for learning: that is
+        // where the death that is being worked on is usually caused.
+        float scale = unitsPerSecond(m_lastObs.speedClass()) / unitsPerSecond(1);
+        limit = m_level->bestPathX - 8.f * kBlock * std::max(1.f, scale);
+    }
+    return std::min(limit, m_protectLimitX);
+}
+
+void Agent::commitBestPath() {
+    if (!m_level || !m_cfg.learningEnabled) return;
+    float upTo = protectedUpTo();
+    for (auto const& p : m_level->bestPath) {
+        if (p.x >= upTo) break;
+        QEntry& e = m_level->q.getOrCreate(p.key);
+        int a = p.action;
+        if (e.q[a] <= e.q[1 - a] + kCommitMargin) e.q[a] = e.q[1 - a] + kCommitMargin;
+    }
+}
+
 float Agent::epsilonAt(float x) const {
+    if (x < protectedUpTo()) return 0.f;
     if (x < m_focusFrom || x > m_focusTo) return 0.f;
     float eps = m_cfg.focusEpsilon * (1.f + 2.f * static_cast<float>(stuckLevel()));
     if (!m_activeExp.active) eps *= 2.f; // no targeted idea: explore more broadly
@@ -393,6 +421,16 @@ void Agent::finishAttempt(float endX, int32_t endTick, bool died, bool completed
         if (bx >= m_startX && bx + kBlock * 1.5f < endX) ++h.passes;
     }
 
+    if (!m_fromCheckpoint && (endX > L.bestPathX + 1e-3f || (completed && L.bestPathX < L.levelLength))) {
+        L.bestPathX = completed ? std::max(endX, L.levelLength) : endX;
+        L.bestPath.clear();
+        L.bestPath.reserve(m_steps.size());
+        for (auto const& s : m_steps) L.bestPath.push_back({s.x, s.key, s.action});
+        m_protectLimitX = 1e30f;
+        m_regressions.clear();
+    }
+    commitBestPath();
+
     if (progress > L.bestProgress + 1e-6f) {
         L.bestProgress = progress;
         L.bestX = endX;
@@ -437,7 +475,24 @@ void Agent::onDeath(Observation const& last, DeathInfo const& death) {
 
     m_focusFrom = rep.windowStartX;
     m_focusTo = rep.deathX + kBlock;
-    if (m_cfg.learningEnabled) {
+    // An experiment that made things worse is judged by planNext, not here.
+    bool regression = !m_fromCheckpoint && endX < protectedUpTo() && m_lastSearchHotspot == INT32_MIN;
+    if (regression && m_cfg.learningEnabled) {
+        // Died in a section the best run already got through. The best path
+        // has just been re-committed, so replay it; if that keeps failing here
+        // (the game is not perfectly repeatable), hand the spot back to learning.
+        if (++m_regressions[bucket] >= 3) {
+            m_protectLimitX = std::min(m_protectLimitX, static_cast<float>(bucket - 1) * kBlock);
+            m_regressions.erase(bucket);
+            regression = false;
+        } else {
+            m_pendingExp = {};
+            m_nextChange = fmt("Fell behind the best run at %.1f%%: restoring the known-good path", rep.deathProgress * 100.f);
+        }
+    }
+    if (regression) {
+        // handled above
+    } else if (m_cfg.learningEnabled) {
         planNext(rep);
     } else {
         m_pendingExp = {};
@@ -561,9 +616,10 @@ void Agent::planNext(FailureReport const& rep) {
             }
             s.exhausted = true; // nothing to vary at this level of suspicion: escalate
         }
-        search = &(m_searches[report.hotspot] = s);
+        s.base = base;
+        search = &(m_searches[report.hotspot] = std::move(s));
     }
-    buildExperiment(*search, base, report);
+    buildExperiment(*search, search->base, search->base.report);
 }
 
 bool Agent::initSearch(Search& s, FailureReport const& report, ActionTrace const& base, Observation const* last) {
@@ -793,6 +849,9 @@ void Agent::buildExperiment(Search const& s, ActionTrace const& base, FailureRep
         }
         default: break;
     }
+    // The stretch under investigation is deliberately opened up for change
+    // (until the next new best), even if it lies behind the frontier.
+    m_protectLimitX = std::min(m_protectLimitX, static_cast<float>(ex.fromCell) * cs);
     m_nextChange = ex.description;
     m_pendingExp = std::move(ex);
 }

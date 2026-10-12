@@ -142,6 +142,9 @@ private:
         float lastEndX = -1.f;     // where the previous try of this search died
         float lastEndY = 0.f;
         uint32_t noEffect = 0;     // tries that changed nothing at all
+        // The attempt this search varies. Every try is built from it, so a
+        // try never inherits the previous try's modification.
+        ActionTrace base;
     };
 
     struct LeadCandidate {
@@ -179,6 +182,8 @@ private:
     float m_focusFrom = 0.f;
     float m_focusTo = -1.f;
     float m_prevEndX = -1.f;
+    float m_protectLimitX = 1e30f;               // lowered if the best path stops working
+    std::map<int32_t, uint32_t> m_regressions;   // deaths inside the protected region per hotspot
     std::string m_nextChange;
     FailureReport m_lastReport;
     AgentStatus m_status;
@@ -188,6 +193,9 @@ private:
     float progressReward(float dx) const;
     float epsilonAt(float x) const;
     uint32_t stuckLevel() const;
+    // Everything before this x is "known good": the best path is kept there.
+    float protectedUpTo() const;
+    void commitBestPath();
 
     void backwardUpdate(float terminalBonus, bool terminal, float bootstrap, int32_t endTick);
     void commitExperiment();

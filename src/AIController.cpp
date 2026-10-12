@@ -297,8 +297,10 @@ void AIController::onPlayerDestroyed(PlayLayer* layer, PlayerObject* player, Gam
     m_agent.onDeath(obs, death);
     m_deathPending = true;
     m_deathTimer = 0.f;
-    log::info("Attempt {}: {}. Next: {}", m_agent.status().attempt, m_agent.status().lastFailure,
-              m_level->history.empty() ? std::string("-") : m_agent.status().lastChange);
+    // lastChange is still the change that was tested in this attempt; the plan
+    // for the next attempt becomes visible when the next attempt starts.
+    auto const& rec = m_level->history.back();
+    log::info("Attempt {}: {} | tested: {}", rec.number, m_agent.status().lastFailure, rec.change.empty() ? "-" : rec.change);
 
     if (layer->m_isPracticeMode && !m_checkpointXs.empty()) {
         if (death.x > m_bestSinceCheckpoint + aigd::kBlock) {

@@ -136,6 +136,20 @@ std::string serializeLevel(LevelMemory const& L) {
     }
     out += "],";
 
+    key(out, "bestPathX"); appendNumber(out, L.bestPathX); out += ',';
+    key(out, "bestPath");
+    out += '[';
+    for (size_t i = 0; i < L.bestPath.size(); ++i) {
+        auto const& p = L.bestPath[i];
+        if (i) out += ',';
+        out += '[';
+        appendNumber(out, p.x); out += ',';
+        appendNumber(out, static_cast<double>(p.key & kKeyMask)); out += ',';
+        appendNumber(out, p.action);
+        out += ']';
+    }
+    out += "],";
+
     key(out, "lastFailure");
     out += '[';
     for (size_t i = 0; i < L.lastFailureTrace.size(); ++i) {
@@ -215,6 +229,15 @@ bool deserializeLevel(std::string_view text, LevelMemory& out, std::string* erro
     for (auto const& row : d.get("bestRun").items()) {
         if (row.size() < 2) continue;
         L.bestRunInputs.emplace_back(static_cast<float>(row.at(0).asNumber()), static_cast<uint8_t>(row.at(1).asInt()));
+    }
+    L.bestPathX = static_cast<float>(d.get("bestPathX").asNumber());
+    for (auto const& row : d.get("bestPath").items()) {
+        if (row.size() < 3) continue;
+        PathStep p;
+        p.x = static_cast<float>(row.at(0).asNumber());
+        p.key = static_cast<uint64_t>(row.at(1).asNumber());
+        p.action = static_cast<uint8_t>(row.at(2).asInt());
+        L.bestPath.push_back(p);
     }
     for (auto const& row : d.get("lastFailure").items()) {
         if (row.size() < 6) continue;

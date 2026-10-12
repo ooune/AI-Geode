@@ -527,6 +527,35 @@ TEST(agent_learns_spikes) { expectLearns(sim::levelSpikes(), 800); }
 TEST(agent_learns_blocks) { expectLearns(sim::levelBlocks(), 1200); }
 TEST(agent_learns_ship) { expectLearns(sim::levelShip(), 1500); }
 
+// Once something works it must keep working: after the first completion, keep
+// training (learning on, exploration on) and require the AI to stay consistent,
+// and never to fall far behind its best in the meantime.
+TEST(agent_does_not_regress) {
+    for (auto const& level : sim::allLevels()) {
+        LevelMemory mem = freshLevel(level);
+        PatternMemory pat;
+        Agent agent;
+        agent.attach(&mem, &pat);
+        auto r = train(agent, level, 1500);
+        CHECK(r.attemptsToComplete > 0);
+        // Regressions while learning: attempts ending more than 3 blocks
+        // before the best already reached at that time.
+        int regressions = 0;
+        float best = 0.f;
+        for (auto const& a : r.attempts) {
+            if (a.endX < best - 3.f * kBlock) ++regressions;
+            best = std::max(best, a.endX);
+        }
+        int completed = 0;
+        for (int i = 0; i < 20; ++i) completed += runAttempt(agent, level).completed ? 1 : 0;
+        std::printf("    %-8s %d regressions in %zu attempts; %d/20 completions after first success\n", level.name.c_str(),
+                    regressions, r.attempts.size(), completed);
+        CHECK_MSG(completed >= 18, "%s only completed %d/20 after learning it", level.name.c_str(), completed);
+        CHECK_MSG(regressions * 4 <= static_cast<int>(r.attempts.size()), "%s regressed in %d of %zu attempts", level.name.c_str(),
+                  regressions, r.attempts.size());
+    }
+}
+
 TEST(learned_policy_survives_save_and_reload) {
     sim::Level level = sim::levelSpikes();
     LevelMemory mem = freshLevel(level);

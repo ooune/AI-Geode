@@ -72,6 +72,12 @@ struct Hotspot {
     uint32_t escalation = 0;    // how far back the search window has widened
 };
 
+struct PathStep {
+    float x = 0.f;
+    uint64_t key = 0;
+    uint8_t action = 0;
+};
+
 struct TraceSample {
     float x = 0.f, y = 0.f, vy = 0.f;
     uint8_t mode = 0;
@@ -127,6 +133,11 @@ struct LevelMemory {
     // Inputs (x position, new button state) of the furthest attempt so far.
     // Kept for inspection/export only; the policy is always the Q-table.
     std::vector<std::pair<float, uint8_t>> bestRunInputs;
+    // Decisions (state key + action) of the furthest full attempt. Everything
+    // well behind the frontier is distilled back into the Q-table so later
+    // learning near the frontier can never silently break sections that work.
+    std::vector<PathStep> bestPath;
+    float bestPathX = 0.f;
     // State/action history leading up to the most recent death.
     std::vector<TraceSample> lastFailureTrace;
 
