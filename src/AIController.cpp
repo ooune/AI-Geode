@@ -111,10 +111,6 @@ void AIController::ensurePatternsLoaded() {
     }
 }
 
-int32_t AIController::currentTick(PlayLayer* layer) const {
-    return static_cast<int32_t>(layer->m_gameState.m_levelTime * aigd::kTicksPerSecond) + 1;
-}
-
 // ---------------------------------------------------------------------------
 // Level lifecycle
 
@@ -124,6 +120,7 @@ void AIController::onLevelInit(PlayLayer* layer) {
 
     m_layer = layer;
     m_lastTick = -1;
+    m_clock.reset();
     m_holding = false;
     m_deathPending = false;
     m_observer.reset();
@@ -206,6 +203,7 @@ void AIController::afterReset(PlayLayer* layer) {
     m_deathPending = false;
     ++m_resetToken;
     m_lastTick = -1;
+    m_clock.reset();
     m_holding = false;
     if (!layer->m_isPracticeMode) m_checkpointXs.clear();
     if (layer->m_checkpointArray) {
@@ -238,16 +236,20 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
         return;
     }
 
-    int32_t tick = currentTick(layer);
-    if (tick == m_lastTick) return; // several sub-steps can share one physics tick
-    m_lastTick = tick;
-
     auto* player = layer->m_player1;
     if (!player || player->m_isDead || layer->m_levelEndAnimationStarted || !layer->m_started) return;
 
     applyTimeScale(true);
     m_observer.ensureIndex(layer);
-    auto obs = m_observer.observe(layer, tick);
+    auto obs = m_observer.observe(layer, 0);
+    // Count the real physics steps since the last call from the horizontal
+    // movement: in game this hook does not run on every physics step (1-3
+    // steps per call were measured), and the level-time tick did not show
+    // that. 0 steps: still the same step, nothing new to decide.
+    if (m_clock.advance(obs.x, obs.speedClass()) == 0) return;
+    int32_t const tick = m_clock.tick();
+    obs.tick = tick;
+    m_lastTick = tick;
     // Hitboxes around the player for the trajectory predictor: a little behind
     // (for re-simulating the last steps) up to the end of the prediction horizon.
     float reach = m_settings.predictionHorizon * aigd::unitsPerSecond(obs.speedClass()) * 1.1f;
@@ -312,7 +314,9 @@ void AIController::manageCheckpoints(PlayLayer* layer, aigd::Observation const& 
 
 void AIController::onPlayerDestroyed(PlayLayer* layer, PlayerObject* player, GameObject* killer) {
     if (layer != m_layer || !m_agent.attemptActive()) return;
-    auto obs = m_observer.observe(layer, currentTick(layer));
+    auto obs = m_observer.observe(layer, 0);
+    m_clock.advance(obs.x, obs.speedClass()); // real physics steps (see onPhysicsStep)
+    obs.tick = m_clock.tick();
     obs.dead = true;
     auto death = m_observer.deathInfo(layer, player, killer);
     if (m_holding) press(layer, false);
@@ -374,7 +378,9 @@ void AIController::logAttemptQuality(aigd::GameMode mode, bool mini) const {
 
 void AIController::onLevelComplete(PlayLayer* layer) {
     if (layer != m_layer || !m_agent.attemptActive()) return;
-    auto obs = m_observer.observe(layer, currentTick(layer));
+    auto obs = m_observer.observe(layer, 0);
+    m_clock.advance(obs.x, obs.speedClass()); // real physics steps (see onPhysicsStep)
+    obs.tick = m_clock.tick();
     obs.x = std::max(obs.x, layer->m_levelLength);
     if (m_holding) press(layer, false);
     logAttemptQuality(obs.mode, obs.mini);

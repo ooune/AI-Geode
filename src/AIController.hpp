@@ -8,6 +8,7 @@
 #include <aigd/Overlay.hpp>
 #include <aigd/Physics.hpp>
 #include <aigd/Predictor.hpp>
+#include <aigd/StepClock.hpp>
 
 #include <filesystem>
 #include <memory>
@@ -103,7 +104,6 @@ private:
     void logAttemptQuality(aigd::GameMode mode, bool mini) const;
     void endAttemptWithoutOutcome(PlayLayer* layer);
     void manageCheckpoints(PlayLayer* layer, aigd::Observation const& obs);
-    int32_t currentTick(PlayLayer* layer) const;
 
     Settings m_settings;
     aigd::Agent m_agent;
@@ -126,6 +126,7 @@ private:
     bool m_holding = false;
     bool m_injecting = false;
     int32_t m_lastTick = -1;
+    aigd::StepClock m_clock; // real physics steps (the game does not call us on every step)
     aigd::Observation m_lastObs;
 
     bool m_deathPending = false;

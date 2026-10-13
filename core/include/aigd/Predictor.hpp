@@ -161,7 +161,12 @@ public:
     // Calibration + accuracy + floor/ceiling tracking: call once per physics
     // step with the new state and whether the button was held during the step
     // that led to it.
+    // `obs.tick` must count real physics steps (see StepClock): consecutive
+    // observations may be several steps apart, with the button held as given
+    // for all of them.
     void observe(Observation const& obs, bool heldDuringStep);
+    // Average number of physics steps between observations (1 = every step).
+    float decisionInterval() const { return m_interval; }
     void onDeath(int32_t tick, float x, float y);
 
     Bounds const& bounds() const { return m_bounds; }
@@ -270,6 +275,11 @@ private:
     size_t m_histCount = 0;
     size_t m_histHead = 0;
     int m_sinceResim = 0;
+    float m_interval = 1.f;
+    // Button state that acted during the physics step ending at `step` (as
+    // sent, before any latency), from the history; `current` covers steps
+    // after the newest record (the step being observed now).
+    bool sentAt(int32_t step, int currentFrom = INT32_MAX, bool current = false) const;
     std::vector<uint8_t> m_holdBuf;
     PredictedPath m_resim;
     float m_predY = 0.f, m_actY = 0.f, m_stepErr = 0.f;

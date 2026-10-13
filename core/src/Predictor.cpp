@@ -58,15 +58,27 @@ SimStart Predictor::startFrom(Observation const& obs, bool holding) const {
     // With input latency L, the next L steps still run with buttons that were
     // sent before: the last L recorded states (oldest first), and the state in
     // effect before them is the one L+1 records back.
-    if (m_latency > 0 && m_histCount > static_cast<size_t>(m_latency)) {
-        auto at = [&](int back) -> Rec const& { return m_hist[(m_histHead + kHistory - 1 - static_cast<size_t>(back)) % kHistory]; };
+    // (in physics steps: the steps T+1 .. T+L act with what was sent for
+    // steps T+1-L .. T, all already known)
+    if (m_latency > 0 && m_histCount > 0) {
         s.lag = m_latency;
-        for (int j = 0; j < m_latency; ++j) s.pending[j] = at(m_latency - 1 - j).held ? 1 : 0;
-        s.holding = at(m_latency).held;
-        // the newest state counts as "current" for the caller's decision
+        for (int j = 0; j < m_latency; ++j) s.pending[j] = sentAt(obs.tick + 1 + j - m_latency) ? 1 : 0;
+        s.holding = sentAt(obs.tick - m_latency);
         (void)holding;
     }
     return s;
+}
+
+bool Predictor::sentAt(int32_t step, int currentFrom, bool current) const {
+    if (step >= currentFrom) return current;
+    // records are newest first; record j covers the steps (tick_{j+1}, tick_j]
+    for (size_t j = 0; j < m_histCount; ++j) {
+        Rec const& r = m_hist[(m_histHead + kHistory - 1 - j) % kHistory];
+        if (step > r.tick) return r.held; // after the newest covered record (only for j == 0)
+        Rec const* older = j + 1 < m_histCount ? &m_hist[(m_histHead + kHistory - 2 - j) % kHistory] : nullptr;
+        if (!older || step > older->tick) return r.held;
+    }
+    return false;
 }
 
 std::string Predictor::trustReason(GameMode mode, bool mini) const {
@@ -807,14 +819,19 @@ void Predictor::updateBounds(Observation const& obs, bool held) {
 }
 
 void Predictor::observe(Observation const& obs, bool heldDuringStep) {
+    Rec const* last = m_histCount ? &m_hist[(m_histHead + kHistory - 1) % kHistory] : nullptr;
+    // Steps since the previous observation (real physics steps), or 0 when
+    // the two are not connected (first observation, respawn, teleport).
+    int32_t const gap = last && obs.tick > last->tick && obs.tick - last->tick <= 8 ? obs.tick - last->tick : 0;
+    if (gap > 0) m_interval = m_interval * 0.95f + static_cast<float>(gap) * 0.05f;
+
     // robot boost bookkeeping (needed to simulate from the middle of a jump)
     if (obs.mode == GameMode::Robot) {
-        Rec const* last = m_histCount ? &m_hist[(m_histHead + kHistory - 1) % kHistory] : nullptr;
-        if (last && last->tick + 1 == obs.tick && last->onGround && !obs.onGround && heldDuringStep) {
-            m_robotSince = 0;
+        if (last && gap > 0 && last->onGround && !obs.onGround && heldDuringStep) {
+            m_robotSince = gap - 1;
             m_robotAlive = true;
         } else if (!obs.onGround) {
-            ++m_robotSince;
+            m_robotSince += std::max(1, gap);
             if (!heldDuringStep) m_robotAlive = false;
         } else {
             m_robotAlive = false;
@@ -828,17 +845,14 @@ void Predictor::observe(Observation const& obs, bool heldDuringStep) {
           obs.playerSpeed, boostLeft};
     if (!obs.dead) updateBounds(obs, heldDuringStep);
 
-    if (m_histCount > 0) {
-        Rec const& p = m_hist[(m_histHead + kHistory - 1) % kHistory];
-        // With input latency L the button acting during this step was sent L
-        // decisions earlier (k records back from the previous one).
-        auto sentBack = [&](int k) -> bool {
-            if (static_cast<size_t>(k) >= m_histCount) return false;
-            return m_hist[(m_histHead + kHistory - 1 - static_cast<size_t>(k)) % kHistory].held;
-        };
-        bool const effHeld = m_latency == 0 ? heldDuringStep : sentBack(m_latency - 1);
-        bool const effBefore = sentBack(m_latency);
-        if (p.tick + 1 == r.tick) {
+    if (last) {
+        Rec const& p = *last;
+        if (gap == 1) {
+            // A single physics step: calibrate the model on it. (Pairs several
+            // steps apart are not used: the model learns per step.)
+            int32_t const from = p.tick + 1; // steps from here on: heldDuringStep
+            bool const effHeld = sentAt(obs.tick - m_latency, from, heldDuringStep);
+            bool const effBefore = sentAt(obs.tick - 1 - m_latency, from, heldDuringStep);
             Observation prev;
             prev.x = p.x;
             prev.y = p.y;
@@ -865,68 +879,80 @@ void Predictor::observe(Observation const& obs, bool heldDuringStep) {
                     m_stepErr = std::fabs(m_predY - m_actY);
                 }
             }
-        } else {
-            m_histCount = 0; // gap (reset, respawn): start a new history
+        } else if (gap == 0) {
+            m_histCount = 0; // not connected (reset, respawn, teleport): start a new history
         }
     }
     m_hist[m_histHead] = r;
     m_histHead = (m_histHead + 1) % kHistory;
     m_histCount = std::min(m_histCount + 1, kHistory);
 
-    // Every 16 steps, re-simulate the last 32 real steps with the inputs that
-    // were actually used and compare the end point with reality. This measures
-    // movement only (measureOnly): hazards and error margins play no part, so
-    // a near miss that the model's hitboxes call a hit cannot count as a
-    // 20-unit error (before, that inflated the drift, the inflated drift
-    // widened the margins, and predictions ended up untrusted). It is done for
-    // each assumed input latency (0, 1, 2 steps); the one that matches the
-    // real game best is used for planning.
-    if (++m_sinceResim >= 16 && m_histCount > static_cast<size_t>(kResimSteps + kLags)) {
-        m_sinceResim = 0;
+    // About every 16 steps, re-simulate the last ~32 real physics steps with
+    // the button states that were actually in effect (step by step, also
+    // across observations several steps apart) and compare the end point
+    // with reality. This measures movement only (measureOnly): hazards and
+    // error margins play no part, so a near miss that the model's hitboxes
+    // call a hit cannot count as an error. It is done for each assumed input
+    // latency (0, 1, 2 steps); the one that matches the real game best is
+    // used for planning.
+    m_sinceResim += std::max(1, gap);
+    if (m_sinceResim >= 16 && m_histCount > 2) {
         auto at = [&](size_t back) -> Rec const& { return m_hist[(m_histHead + kHistory - 1 - back) % kHistory]; };
-        Rec const& s0 = at(kResimSteps);
-        bool ok = supports(s0.mode);
-        for (int i = 0; i <= kResimSteps && ok; ++i) {
-            Rec const& q = at(static_cast<size_t>(i));
-            ok = q.mode == s0.mode && q.mini == s0.mini && !q.dead && q.speedClass == s0.speedClass;
-        }
-        if (ok) {
-            std::array<float, kLags> errs{};
-            bool valid = true;
-            bool differs = false;
-            std::vector<uint8_t> base;
-            for (int L = 0; L < kLags && valid; ++L) {
-                m_holdBuf.clear();
-                for (int i = kResimSteps - 1; i >= 0; --i) m_holdBuf.push_back(at(static_cast<size_t>(i + L)).held ? 1 : 0);
-                if (L == 0) base = m_holdBuf;
-                else if (m_holdBuf != base) differs = true;
-                SimStart s{s0.x, s0.y, s0.vy, s0.mode, s0.onGround, s0.upsideDown, s0.mini, at(static_cast<size_t>(kResimSteps + L)).held,
-                           s0.speedClass, s0.tick, m_bounds, s0.robotBoostLeft};
-                s.measureOnly = true;
-                simulate(s, obs.obstacles, Plan{}, m_resim, m_holdBuf);
-                if (m_resim.uncertainFrom >= 0 || m_resim.points.empty()) {
-                    valid = false; // unmodelled object involved: not the model's fault
-                    break;
-                }
-                Rec const& end = at(0);
-                auto const& e = m_resim.points.back();
-                errs[static_cast<size_t>(L)] = std::hypot(e.x - end.x, e.y - end.y);
+        // the newest record at least kResimSteps steps back, with kLags more steps of history before it
+        size_t B = 0;
+        for (size_t b = 1; b + 1 < m_histCount; ++b) {
+            if (at(0).tick - at(b).tick >= kResimSteps) {
+                if (at(b).tick - at(m_histCount - 1).tick >= kLags) B = b;
+                break;
             }
-            if (valid) {
-                m_model.recordAccuracy(s0.mode, errs[static_cast<size_t>(m_latency)], kResimSteps);
-                if (differs) {
-                    // Only windows with an input change say anything about latency.
-                    for (int L = 0; L < kLags; ++L) {
-                        float& a = m_lagErr[static_cast<size_t>(L)];
-                        a = m_lagSamples == 0 ? errs[static_cast<size_t>(L)] : a * 0.9f + errs[static_cast<size_t>(L)] * 0.1f;
+        }
+        if (B > 0) {
+            m_sinceResim = 0;
+            Rec const& s0 = at(B);
+            Rec const& end = at(0);
+            int32_t const steps = end.tick - s0.tick;
+            bool ok = supports(s0.mode) && steps <= 64;
+            for (size_t i = 0; i <= B && ok; ++i) {
+                Rec const& q = at(i);
+                ok = q.mode == s0.mode && q.mini == s0.mini && !q.dead && q.speedClass == s0.speedClass;
+            }
+            if (ok) {
+                std::array<float, kLags> errs{};
+                bool valid = true;
+                bool differs = false;
+                std::vector<uint8_t> base;
+                for (int L = 0; L < kLags && valid; ++L) {
+                    m_holdBuf.clear();
+                    for (int32_t t = s0.tick + 1; t <= end.tick; ++t) m_holdBuf.push_back(sentAt(t - L) ? 1 : 0);
+                    if (L == 0) base = m_holdBuf;
+                    else if (m_holdBuf != base) differs = true;
+                    SimStart s{s0.x, s0.y, s0.vy, s0.mode, s0.onGround, s0.upsideDown, s0.mini, sentAt(s0.tick - L), s0.speedClass, s0.tick,
+                               m_bounds, s0.robotBoostLeft};
+                    s.measureOnly = true;
+                    simulate(s, obs.obstacles, Plan{}, m_resim, m_holdBuf);
+                    if (m_resim.uncertainFrom >= 0 || m_resim.points.empty()) {
+                        valid = false; // unmodelled object involved: not the model's fault
+                        break;
                     }
-                    ++m_lagSamples;
-                    if (m_lagSamples >= 12) {
-                        int best = m_latency;
-                        for (int L = 0; L < kLags; ++L)
-                            if (m_lagErr[static_cast<size_t>(L)] < m_lagErr[static_cast<size_t>(best)]) best = L;
-                        float cur = m_lagErr[static_cast<size_t>(m_latency)];
-                        if (best != m_latency && cur > 0.5f && m_lagErr[static_cast<size_t>(best)] < 0.5f * cur) m_latency = best;
+                    auto const& e = m_resim.points.back();
+                    errs[static_cast<size_t>(L)] = std::hypot(e.x - end.x, e.y - end.y);
+                }
+                if (valid) {
+                    m_model.recordAccuracy(s0.mode, errs[static_cast<size_t>(m_latency)], steps);
+                    if (differs) {
+                        // Only windows with an input change say anything about latency.
+                        for (int L = 0; L < kLags; ++L) {
+                            float& a = m_lagErr[static_cast<size_t>(L)];
+                            a = m_lagSamples == 0 ? errs[static_cast<size_t>(L)] : a * 0.9f + errs[static_cast<size_t>(L)] * 0.1f;
+                        }
+                        ++m_lagSamples;
+                        if (m_lagSamples >= 12) {
+                            int best = m_latency;
+                            for (int L = 0; L < kLags; ++L)
+                                if (m_lagErr[static_cast<size_t>(L)] < m_lagErr[static_cast<size_t>(best)]) best = L;
+                            float cur = m_lagErr[static_cast<size_t>(m_latency)];
+                            if (best != m_latency && cur > 0.5f && m_lagErr[static_cast<size_t>(best)] < 0.5f * cur) m_latency = best;
+                        }
                     }
                 }
             }

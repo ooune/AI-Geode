@@ -14,6 +14,7 @@
 #include <aigd/Predictor.hpp>
 #include <aigd/Json.hpp>
 #include <aigd/StateKey.hpp>
+#include <aigd/StepClock.hpp>
 #include <aigd/Storage.hpp>
 
 #include <algorithm>
@@ -2588,6 +2589,139 @@ TEST(decision_G_input_latency_is_measured_and_corrected) {
     agent0.setPredictor(&rig0.predictor);
     train(agent0, level, 20, &rig0);
     CHECK(rig0.predictor.inputLatency() == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Game-like observation timing: in Geometry Dash the AI is called once per
+// 1-3 physics steps (measured from real traces), not on every step.
+
+namespace {
+struct GapPattern {
+    uint32_t state;
+    int next() {
+        state = state * 1664525u + 1013904223u;
+        uint32_t r = (state >> 16) % 10;
+        return r < 5 ? 1 : (r < 9 ? 2 : 3); // about the in-game mix: mostly 1-2, sometimes 3
+    }
+};
+
+// Observes like the mod: ticks from a StepClock (true physics steps), or -
+// as before the fix - one tick per call.
+struct GameLikeObserver {
+    PredictionRig& rig;
+    bool naiveTicks = false;
+    StepClock clock;
+    int32_t naive = 0;
+    Observation observe(sim::World const& w) {
+        Observation o = rig.observe(w);
+        clock.advance(o.x, o.speedClass());
+        o.tick = naiveTicks ? ++naive : clock.tick();
+        return o;
+    }
+};
+
+void warmUpGaps(PredictionRig& rig, bool naiveTicks, uint32_t seed = 3) {
+    sim::Level flat;
+    flat.name = "flat";
+    flat.finish(400);
+    sim::World w(flat);
+    GameLikeObserver ob{rig, naiveTicks};
+    GapPattern gaps{seed};
+    rig.held = false;
+    for (int i = 0; i < 1600 && !w.complete(); ++i) {
+        Observation o = ob.observe(w);
+        rig.predictor.observe(o, rig.held);
+        bool hold = (i % 90) == 0; // a tap every ~90 calls
+        rig.held = hold;
+        for (int k = gaps.next(); k > 0; --k) w.step(hold);
+    }
+}
+
+AttemptResult runAttemptGaps(Agent& agent, sim::Level const& level, PredictionRig& rig, bool naiveTicks, uint32_t seed) {
+    sim::World w(level);
+    GameLikeObserver ob{rig, naiveTicks};
+    GapPattern gaps{seed};
+    rig.held = false;
+    agent.beginAttempt(ob.observe(w), false);
+    for (int i = 0; i < 60000; ++i) {
+        Observation o = ob.observe(w);
+        rig.predictor.observe(o, rig.held);
+        bool hold = agent.act(o);
+        rig.held = hold;
+        for (int k = gaps.next(); k > 0 && !w.dead() && !w.complete(); --k) w.step(hold);
+        if (w.dead()) {
+            Observation last = ob.observe(w);
+            agent.onDeath(last, w.death());
+            return {last.progress(), w.x(), false};
+        }
+        if (w.complete()) {
+            agent.onComplete(ob.observe(w));
+            return {1.f, w.x(), true};
+        }
+    }
+    agent.abortAttempt(nullptr);
+    return {w.observe().progress(), w.x(), false};
+}
+} // namespace
+
+TEST(step_clock_counts_physics_steps) {
+    StepClock c;
+    float const vx = unitsPerSecond(1) / 240.f;
+    CHECK(c.advance(100.f, 1) == StepClock::kDiscontinuity);
+    int32_t t0 = c.tick();
+    CHECK(c.advance(100.f + vx, 1) == 1);
+    CHECK(c.advance(100.f + 3.f * vx, 1) == 2);
+    CHECK(c.advance(100.f + 3.f * vx, 1) == 0);  // same step again: nothing to do
+    CHECK(c.advance(100.f + 6.f * vx, 1) == 3);
+    CHECK(c.tick() == t0 + 6);
+    CHECK(c.advance(50.f, 1) == StepClock::kDiscontinuity); // respawn behind
+    CHECK(c.tick() > t0 + 6 + 8);
+}
+
+TEST(game_like_frame_gaps_keep_predictions_trusted) {
+    // Before the fix (one tick per call), the model learned a horizontal
+    // speed that is too high and the accuracy check compared 32 "steps" with
+    // more real steps: drift above the limit, predictions never trusted -
+    // what the in-game log showed (drift 0.25, 0 trusted decisions).
+    PredictionRig naive;
+    warmUpGaps(naive, true);
+    float const nominal = unitsPerSecond(1) / 240.f;
+    std::printf("    one tick per call (old): x speed %.4f (true %.4f), drift %.3f/step, trusted %s\n", naive.model.vxPerTick(1), nominal,
+                naive.model.driftPerTick(GameMode::Cube), naive.predictor.trusted(GameMode::Cube, false) ? "yes" : "no");
+    CHECK(naive.model.vxPerTick(1) > nominal * 1.1f);
+    CHECK(!naive.predictor.trusted(GameMode::Cube, false));
+
+    // With real physics steps counted, the same play calibrates correctly and
+    // the predictions are trusted.
+    PredictionRig rig;
+    warmUpGaps(rig, false);
+    std::printf("    real steps (StepClock):  x speed %.4f (true %.4f), drift %.3f/step, trusted %s, %.2f steps per call\n",
+                rig.model.vxPerTick(1), nominal, rig.model.driftPerTick(GameMode::Cube),
+                rig.predictor.trusted(GameMode::Cube, false) ? "yes" : "no", rig.predictor.decisionInterval());
+    CHECK(std::fabs(rig.model.vxPerTick(1) - nominal) < nominal * 0.01f);
+    CHECK(rig.model.driftPerTick(GameMode::Cube) < 0.05f);
+    CHECK(rig.predictor.trusted(GameMode::Cube, false));
+    CHECK(rig.predictor.decisionInterval() > 1.3f);
+
+    // And the AI with prediction plays levels at that observation rate.
+    for (auto const& level : {sim::levelBasics(), sim::levelSpikes(), sim::levelBlocks()}) {
+        LevelMemory mem = freshLevel(level);
+        PatternMemory pat;
+        Agent agent;
+        agent.attach(&mem, &pat);
+        agent.setPredictor(&rig.predictor);
+        int done = -1;
+        uint32_t trusted = 0, untrusted = 0;
+        for (int i = 0; i < 60 && done < 0; ++i) {
+            if (runAttemptGaps(agent, level, rig, false, 11 + static_cast<uint32_t>(i)).completed) done = i + 1;
+            trusted += agent.status().decisionsTrusted;
+            untrusted += agent.status().decisionsUntrusted;
+        }
+        std::printf("    %-7s at 1-3 steps per call: completed after %d attempts (%u decisions with trusted prediction, %u untrusted)\n",
+                    level.name.c_str(), done, trusted, untrusted);
+        CHECK(done > 0);
+        CHECK(trusted > untrusted);
+    }
 }
 
 // ---------------------------------------------------------------------------

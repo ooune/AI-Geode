@@ -6,6 +6,7 @@ add_library(aigd_core STATIC
     src/Overlay.cpp
     src/Physics.cpp
     src/Predictor.cpp
+    src/StepClock.cpp
     src/Storage.cpp
     src/Types.cpp
 )
