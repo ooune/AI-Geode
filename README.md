@@ -260,6 +260,44 @@ The status panel shows the current record. On every death, the last 8 records ar
 
 **What it cannot do.** It cannot save the player once no action can avoid the collision any more, for example a cube already in the air over a spike. It acts as early as the prediction allows, so its reach is limited by the prediction horizon and the model's accuracy.
 
+### Decision pipeline: prediction quality, no unnecessary jumps (v0.2.2)
+
+**What the in-game log of v0.2.1 showed.** 36 attempts on main level 4 (Dry Out):
+- every death had a *Prediction check* line saying the executed path was predicted to collide only 3–5 steps ahead;
+- there was **not a single safety record**. That is only possible if prediction was not trusted for those decisions: the planner, collision checks and safety layer never acted, while the overlay still drew paths;
+- the last 22 deaths were all at 21.4% ("held too long (obstacle above)" / "jumped too late"). Every experiment there added or moved a jump, never removed one.
+
+**Root causes, traced in the code:**
+1. **Trust collapsed through the accuracy measurement itself.** Drift is measured by re-simulating the last 32 real steps. If that re-simulation "died", it counted as a 20-unit error, using the planner's error margins and the model's hitboxes. With hitbox sizes that do not exactly match the game, every graze that the player survived counted as a large model error. The higher drift widened the margins, which caused more false "deaths". One or two of these push drift over the 0.15 limit, and then the prediction is ignored.
+2. **The planner preferred jumping.** A plan's score added the clearance to the nearest hazard *or block* (capped at 30 units), and nothing cost an input. Standing on a block counted as only 10.5 units of clearance (the inner hitbox to the block below), while a jump in the air scored up to 30. So whenever there were blocks or hazards nearby, a jump beat walking on.
+3. **The learned policy's jumps went unchecked.** If both actions were "safe enough", the policy won, even when waiting was fully safe and the jump was not needed. A jump with a possible hit more than 12 steps ahead counted as just as safe as waiting. Where nothing was ahead at all, no prediction was made and any jump went through. In unseen states, the cross-level prior chose "press" on any tiny value difference.
+4. **Learning could not remove a jump.** The failure analysis' experiments could add a press or move one, never remove one.
+5. **Input timing was assumed, never measured.** The model assumed the button acts on the next physics step. If the game (or a mod such as Click Between Frames) applies it later, every planned jump is mistimed.
+
+**Changes:**
+- **Prediction accuracy is measured on movement only.** The re-simulation ignores hazards and margins and compares where the player really went. In a test where the model sees spikes 2 units bigger than they are, drift stays at 0.000 and the prediction stays trusted.
+- **The input latency is measured.** Every accuracy check re-simulates the recent steps assuming 0, 1 and 2 steps of input delay. Once the evidence is clear (windows with an input change, at least twice as accurate), planning uses the best fit: the first steps of every candidate run with the buttons already sent. A simulated 1-step delay is detected exactly (error 1.53 / 0.00 / 1.57 units for 0 / 1 / 2 steps). Without a delay the estimate stays at 0.
+- **Every candidate includes "never press".** Besides pressing now, waiting with every delayed-press timing, and keeping the current input, the predictor simulates releasing and not pressing at all within the horizon. Each candidate gets its outcome, first collision, time to collision, how long its input can stay, and the number of presses it costs.
+- **The planner's objective prefers fewer inputs.** Safety first. Then clearance, capped at 10 units and counting only hazards and the *sides* of blocks (standing on a block is not a near miss). Then a cost per press. Among equally safe plans, not pressing wins; a jump is chosen because it is needed or clearly safer.
+- **Candidate ranking:** collision < possible hit anywhere in the horizon < must change within the slack < unmodelled object ahead < safe. The executed action is replaced whenever it is not fully safe and the other ranks higher.
+- **No press that is not needed now.** With a trusted prediction, a proposed press (a jump, or holding into a landing re-jump) is dropped when releasing is fully safe and the planner's best-timed plan does not press now. That applies whoever proposed it: policy, prior or exploration. If a jump is needed later, the planner times it. Where nothing is ahead within the horizon, a jump is never needed. Exceptions:
+  - steered modes (ship, wave);
+  - an experiment's deliberate test;
+  - a state where not pressing has already failed (reality beats the prediction).
+- **The prior needs a real margin to press:** at least 0.5 value units (about half a block of progress).
+- **Learning can remove a jump.** After two timing variations of the same jump have failed, the jump is tested *removed*: no press from there until past the place of death. Only when the geometry allows it (what killed the player was above the head of a player staying at take-off height), and once per trouble spot. The timing search is paused meanwhile and resumes if not jumping fails too. When the death analysis says the jump carried the player into something above, removal is tried first.
+- **Diagnostics generated from the evaluations.** The status panel shows, for example:
+
+  `hazard 2.1 blocks ahead (+0 high) | Jump: collision in 5 steps | No jump: predicted clear | Selected: No jump | Executed: No jump`
+
+  Then come who proposed it (and whether that was learned from earlier attempts), whether the prediction is trusted (with drift and latency) or **PREDICTION NOT USED**, and the verdict. Next is the reason, e.g. *"No jump needed: not pressing is predicted clear for 180 steps (pressing now: ...); learned proposed it"* or *"Prediction not used: not trusted: the model drifts 0.211 units/step from the real game (limit 0.15)"*. Last are the counts this attempt: presses, unnecessary presses skipped, safety overrides, no safe option.
+- **Per-attempt log line (`Decisions: ...`)** with:
+  - decisions with a trusted vs. untrusted prediction, and the reason;
+  - presses made and skipped, overrides;
+  - drift, the estimated input latency with its re-simulation errors, caution, and the one-step error.
+
+  This is the in-game evidence for whether predictions drive the AI.
+
 **Checking the model against reality.**
 - Every 16 steps the last 32 real steps are re-simulated with the inputs that
   were actually used, and the end positions are compared. This gives drift per
@@ -380,6 +418,13 @@ Add `--bench` to also run the multi-seed learning benchmark.
   - **H**: learning with prediction still completes ship and blocks, records per-state evidence and keeps it through save/reload;
   - the cost of a whole decision per step;
   - on the code before the fix, B, C and D failed (both ships crashed) and E reported nothing;
+- **decision pipeline (v0.2.2):**
+  - the planner makes **no jump** over a level of flat blocks with hazards far above (0 presses);
+  - a learned policy that wants to jump at every chance makes **0 presses** on that level, and **exactly the 9 needed jumps** on the spikes level (415 proposed presses dropped). The planner alone also makes exactly 9;
+  - a policy with an old habit of jumping before low hanging spikes learns to stop: "remove the press" is tested after two failed timings, and the level is completed on attempt 4. Before, 12 attempts and only by luck. The learned behaviour holds with learning off and after a save/reload;
+  - a game the model cannot predict (random jitter) is detected (drift 0.211 > 0.15). The prediction is then not used, and the panel and overlay say so; no override ever came from an untrusted prediction;
+  - hazards observed 2 units bigger than they kill do not destroy trust (drift 0.000 while grazing them);
+  - a 1-step input delay is measured and corrected (spikes completed on attempt 1), and no delay is measured as 0;
 - trajectory prediction against the simulator:
   - physics calibration learning the simulator's (deliberately different) constants;
   - standing still before a spike;
@@ -398,7 +443,7 @@ Add `--bench` to also run the multi-seed learning benchmark.
 
 ### Results
 
-Unit tests: 58 tests, 1935 checks, 0 failures.
+Unit tests: 65 tests, 1997 checks, 0 failures.
 
 Trajectory prediction against the simulator:
 - calibration recovers the simulator's physics exactly (g 0.2200, k 0.2326,
@@ -455,6 +500,15 @@ Benchmark (`--bench`): attempts to first completion over 5 seeds, median / mean 
 | | learning speed 0.1 / 1.0 | 282 / 254, 21 / 21 | **139 / 140, 18 / 19** |
 | | Q-learning only | 303 / 264 (2 of 5 failed) | **165 / 166** |
 | all | with trajectory prediction | 3, 3, 3, 10 | 3, 3, 3, 10 |
+
+v0.2.2 compared with v0.2.1 (same benchmark, median / mean), default settings:
+- basics 6/7 → 3/3; learning speed 0.1: 7/7 → 2/2; speed 1.0: 6/7 → 4/4;
+- spikes 14/16 → 14/14; speed 0.1: 15/16 → 14/14; speed 1.0: 10/21 → 10/10;
+- blocks unchanged (13/14); speed 0.1: 26/44 → 26/30;
+- ship unchanged (32/31); speed 1.0: 18/19 → 17/17; **speed 0.1 worse: 139/140 → 147/164**;
+- with trajectory prediction: unchanged (3, 3, 3, 5).
+
+The *Q-learning only* ablation (no failure analysis; not something the mod can be set to) got much worse: blocks fails on 3 of 5 seeds, ship 165 → 397. This comes from the prior's press margin: pure Q-learning leaned on the prior pressing at the slightest preference. A smaller margin (0.1, 0.2) did not fix the ablation but cost the default setup, so 0.5 was kept.
 
 2.0 is better or equal on every line except two:
 - blocks at learning speed 0.1 has a worse median (26 vs 18), but a far better mean (44 vs 840);
@@ -514,6 +568,13 @@ Report:
 - any death where the log's last record says *safe* or *kept* with a current prediction: that is a model error;
 - any input mismatch error in the log: that would be a controller bug.
 
+**For v0.2.2, check first** (from the Geode log, one `Decisions:` line per attempt):
+1. Most decisions near obstacles should be *with a trusted prediction*. If not, the line says why (drift, caution or calibration). That is the first thing to fix before judging behaviour.
+2. *input latency*: 0 means the game applies the button on the next step, as the model assumes. 1 or 2 means it is later, and the predictor now compensates. Its three re-simulation errors show how clear the evidence is.
+3. *presses skipped as unnecessary*: on a section that can be passed without jumping, the panel should show `No jump: predicted clear | Selected: No jump`, with no jump.
+4. Where a jump is needed, the panel should show `No jump: collision in N steps | Selected: Jump`.
+5. Repeated deaths at one spot after jumping should lead to a *"Removed the press at X%: testing not jumping there"* attempt in the log (when not jumping can work there).
+
 **Trajectory prediction has not been verified in game yet.** Its accuracy on the
 real game is measured by the debug panel (step error, 32-step error, drift,
 mispredictions) and in the log at every death (`Prediction check: ...`). The
@@ -535,6 +596,9 @@ sizes and landing tolerance are still unconfirmed.
   - the wave hitbox (12 units, inner 6) and the ship hitbox (24 units) are guesses;
   - the game's own corridor bounds (`m_portalY` / `m_lastModeHeight`) are not used yet because their meaning is unconfirmed; bounds are learned by contact instead;
   - the planner tries a limited set of input shapes, so a sequence it never tries (for example an unusual tap rhythm) cannot be found by planning, only by learning.
+- **v0.2.2 has not been tested in game.** The in-game log of v0.2.1 shows that prediction was not trusted there. v0.2.2 removes the cause found in the code (false collisions inside the accuracy measurement), but whether trust now holds in game, and what input latency the game really has, can only be read from the new `Decisions:` log lines of a real session.
+- **The "no unnecessary jump" rule depends on a trusted prediction.** While the prediction is not trusted, the learned policy decides alone, and only the prior's press margin and the "remove the press" experiment work against unnecessary jumps.
+- **"Remove the press" uses the killer's geometry** to decide whether walking under it was possible. Where the observer reports no killer extent, it is tried once per trouble spot anyway.
 - **The safety layer acts on predictions.** If the physics model or the hitboxes are wrong for a mode (see *Trajectory prediction limits*), it can override a correct policy decision, or fail to see a collision. Every override is recorded with its reason, so wrong ones can be found in the log. It only uses trusted, calibrated modes.
 - **The safety slack (3 steps) and re-check window (16 steps) are fixed values**, measured in the simulator only.
 - **Failure memory is per exact state.** It is keyed by the 3-unit x cell plus the physics state, so it reacts to repeated failures in a deterministic replay of the same situation. In a level where the same situation is reached in slightly different states every time (non-deterministic mods, moving objects), streaks build up slowly. The cross-level pattern evidence is recorded too, but it is only used through the values, not to switch decisions.
