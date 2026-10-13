@@ -125,6 +125,7 @@ enum class DecisionSource : uint8_t {
     AvoidRepeat,  // the learned choice was the cause of repeated deaths here: testing the alternative
     Shield,       // the chosen action was predicted to collide; the other was not
     Debounce,     // kept the button state (minimum time between changes)
+    Economy,      // a press was proposed, but not pressing is predicted clear: no input
     Count
 };
 

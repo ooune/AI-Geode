@@ -1990,6 +1990,8 @@ struct StubbornRun {
     int overlayMismatches = 0;   // overlay main path is not the executed action's branch
     int recordMismatches = 0;    // safety record disagrees with the applied input / its own verdict
     int overrideRecords = 0;
+    int presses = 0;             // presses actually applied to the game
+    int pressesSkipped = 0;      // decisions where a proposed press was dropped as unnecessary
     std::vector<uint8_t> applied; // button state actually applied to the game, per tick
     std::vector<uint8_t> wanted;
 };
@@ -2003,17 +2005,21 @@ StubbornRun runStubborn(Agent& agent, LevelMemory& mem, sim::Level const& level,
     for (int t = 0; t < maxTicks; ++t) {
         Observation o = rig.observe(w);
         rig.predictor.observe(o, rig.held);
-        int a = want(o, agent.holding());
-        QEntry& e = mem.q.getOrCreate(encodeLevelKey(o, agent.holding(), agent.config().cellSize));
-        e.q[a] = 5.f;
-        e.q[1 - a] = 0.f;
-        e.n[0] = e.n[1] = 50;
+        int a = want(o, agent.holding()); // -1: no opinion, the AI decides
+        if (a >= 0) {
+            QEntry& e = mem.q.getOrCreate(encodeLevelKey(o, agent.holding(), agent.config().cellSize));
+            e.q[a] = 5.f;
+            e.q[1 - a] = 0.f;
+            e.n[0] = e.n[1] = 50;
+        }
         bool hold = agent.act(o);
         auto const& rec = agent.status().safety;
         if (rec.tick == o.tick) {
             if ((rec.executed != 0) != hold) ++r.recordMismatches;
             if (rec.verdict == SafetyVerdict::Overridden && rec.executed == rec.proposed) ++r.recordMismatches;
             if ((rec.verdict == SafetyVerdict::Clear || rec.verdict == SafetyVerdict::Kept) && rec.executed != rec.proposed) ++r.recordMismatches;
+            if (rec.verdict == SafetyVerdict::NoInputNeeded && (rec.executed != 0 || rec.proposed != 1)) ++r.recordMismatches;
+            if (rec.verdict == SafetyVerdict::NoInputNeeded) ++r.pressesSkipped;
             if (rec.verdict == SafetyVerdict::Overridden) ++r.overrideRecords;
             OverlayGeometry g;
             if (buildDecisionOverlay(rig.predictor, rec, o.tick, false, o.obstacles, g)) {
@@ -2024,9 +2030,10 @@ StubbornRun runStubborn(Agent& agent, LevelMemory& mem, sim::Level const& level,
                 if (saysOverride != (rec.verdict == SafetyVerdict::Overridden)) ++r.overlayMismatches;
             }
         }
-        r.wanted.push_back(static_cast<uint8_t>(a));
+        r.wanted.push_back(static_cast<uint8_t>(a < 0 ? (hold ? 1 : 0) : a));
+        if (hold && (r.applied.empty() || r.applied.back() == 0)) ++r.presses;
         r.applied.push_back(hold ? 1 : 0);
-        if ((hold ? 1 : 0) != a) {
+        if (a >= 0 && (hold ? 1 : 0) != a) {
             ++r.overridden;
             if (r.firstOverrideTick < 0) r.firstOverrideTick = t;
             if (o.x > calmAfterX) ++r.overriddenAfterCalm;
@@ -2318,6 +2325,269 @@ TEST(control_H_learning_still_works_with_the_safety_layer) {
         CHECK(storage::deserializeLevel(storage::serializeLevel(mem), loaded, &err));
         CHECK(countIf(loaded.q, [](QEntry const& e) { return e.hasEvidence(); }) == evidence);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Decision pipeline (v0.2.2): no unnecessary jumps, prediction quality checked
+// against reality before it is trusted, learning can remove a jump
+
+namespace {
+struct SimHooks {
+    SimHooks(int delay, float noise, float inflate) {
+        sim::World::s_inputDelay = delay;
+        sim::World::s_noise = noise;
+        sim::World::s_hazardInflate = inflate;
+    }
+    ~SimHooks() {
+        sim::World::s_inputDelay = 0;
+        sim::World::s_noise = 0.f;
+        sim::World::s_hazardInflate = 0.f;
+    }
+};
+
+// Ground made of blocks flush with the floor, with hazards far above the path:
+// nothing on it requires a jump.
+sim::Level flatBlocks() {
+    sim::Level l;
+    l.name = "flat-blocks";
+    for (float b = 4.f; b < 60.f; b += 1.f) l.block(b, -1.f, 1.f, 1.f);
+    for (float b = 20.f; b < 50.f; b += 6.f) l.spike(b, 4.f);
+    l.finish(64.f);
+    return l;
+}
+
+// Spikes hanging just above the cube's head: walking under them is safe, a
+// jump hits them.
+sim::Level hangingSpikes() {
+    sim::Level l;
+    l.name = "hanging";
+    for (float b = 14.f; b < 20.f; b += 1.f) l.spike(b, 1.1f);
+    l.finish(30.f);
+    return l;
+}
+} // namespace
+
+TEST(decision_A_no_unnecessary_jump_by_the_planner) {
+    // Nothing needs a jump. With no learned opinion the trajectory planner
+    // decides: it must not jump just because a jump is possible (before, the
+    // planner scored a jump's extra distance from blocks and hazards higher).
+    PredictionRig rig;
+    warmUp(rig);
+    sim::Level level = flatBlocks();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = runStubborn(agent, mem, level, rig, [](Observation const&, bool) { return -1; });
+    std::printf("    planner over flat blocks: %s, %d presses\n", r.completed ? "completed" : "DIED", r.presses);
+    CHECK(r.completed);
+    CHECK(r.presses == 0);
+    checkConsistent(r);
+}
+
+TEST(decision_B_policy_jump_dropped_when_not_needed) {
+    // The learned policy wants to jump at every chance. Not jumping is
+    // predicted clear the whole way, so no jump is executed, and each dropped
+    // press is recorded with the reason from the candidate evaluation.
+    PredictionRig rig;
+    warmUp(rig);
+    sim::Level level = flatBlocks();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = runStubborn(agent, mem, level, rig, [](Observation const& o, bool) { return o.onGround ? 1 : 0; });
+    std::printf("    policy 'always jump' over flat blocks: %s, %d presses executed, %d proposed presses dropped | %s\n",
+                r.completed ? "completed" : "DIED", r.presses, r.pressesSkipped, agent.status().safety.reason.c_str());
+    CHECK(r.completed);
+    CHECK(r.presses == 0);
+    CHECK(r.pressesSkipped > 0);
+    checkConsistent(r);
+    // the explanation is generated from the evaluation, not a fixed text
+    bool found = false;
+    for (auto const& s : agent.steps()) found = found || s.source == DecisionSource::Economy;
+    CHECK(found);
+}
+
+TEST(decision_C_jumps_when_needed_and_only_then) {
+    // Same 'always jump' policy on a level with spikes on the ground: the
+    // needed jumps happen (the level is completed), the others are dropped.
+    PredictionRig rig;
+    warmUp(rig);
+    sim::Level level = sim::levelSpikes();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = runStubborn(agent, mem, level, rig, [](Observation const& o, bool) { return o.onGround ? 1 : 0; });
+    // jumps needed: one per spike group
+    std::printf("    policy 'always jump' on spikes: %s, %d presses executed (9 spike groups), %d proposed presses dropped\n",
+                r.completed ? "completed" : "DIED", r.presses, r.pressesSkipped);
+    CHECK(r.completed);
+    CHECK(r.presses >= 9 && r.presses <= 12);
+    CHECK(r.pressesSkipped > 0);
+    checkConsistent(r);
+
+    // And the planner alone on the same level: also only the needed jumps.
+    PredictionRig rig2;
+    warmUp(rig2);
+    LevelMemory mem2 = freshLevel(level);
+    Agent planner(isolatedConfig());
+    planner.attach(&mem2, &pat);
+    planner.setPredictor(&rig2.predictor);
+    auto p = runStubborn(planner, mem2, level, rig2, [](Observation const&, bool) { return -1; });
+    std::printf("    planner on spikes: %s, %d presses\n", p.completed ? "completed" : "DIED", p.presses);
+    CHECK(p.completed);
+    CHECK(p.presses >= 9 && p.presses <= 12);
+}
+
+TEST(decision_D_learning_removes_a_harmful_jump) {
+    // Without prediction: the policy has learned to jump before low hanging
+    // spikes (e.g. from an earlier version of the level). Walking under them
+    // is safe; the jump kills. Learning must find out that the jump itself is
+    // the mistake and stop making it.
+    sim::Level level = hangingSpikes();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    LearnerConfig cfg;
+    Agent agent(cfg);
+    agent.attach(&mem, &pat);
+    {
+        // The old habit: prefer pressing in every state of the walk before the spikes.
+        sim::World w(level);
+        while (!w.dead() && !w.complete() && w.x() < 13.5f * kBlock) {
+            Observation o = w.observe();
+            if (o.x > 11.f * kBlock) {
+                QEntry& e = mem.q.getOrCreate(encodeLevelKey(o, false, cfg.cellSize));
+                e.q[1] = 2.f;
+                e.q[0] = 0.f;
+                e.n[0] = e.n[1] = 3;
+            }
+            w.step(false);
+        }
+    }
+    auto r = train(agent, level, 60);
+    bool removedTried = false;
+    for (auto const& h : mem.history) {
+        removedTried = removedTried || h.change.find("Removed the press") != std::string::npos;
+        if (std::getenv("AIGD_DIAG_D"))
+            std::printf("      #%u end %.0f %s | %s\n", h.number, h.endX, failureKindName(h.kind), h.change.c_str());
+    }
+    std::printf("    hanging spikes: completed after %d attempts; 'remove the press' experiment %s\n", r.attemptsToComplete,
+                removedTried ? "used" : "not used");
+    CHECK(r.attemptsToComplete > 0);
+    CHECK(r.attemptsToComplete <= 10);
+    // the learned policy no longer jumps there: replay with learning off
+    LearnerConfig replay;
+    replay.learningEnabled = false;
+    Agent check(replay);
+    check.attach(&mem, &pat);
+    CHECK(runAttempt(check, level).completed);
+    // ...and that survives a save/reload
+    LevelMemory loaded;
+    std::string err;
+    CHECK(storage::deserializeLevel(storage::serializeLevel(mem), loaded, &err));
+    Agent fresh(replay);
+    fresh.attach(&loaded, &pat);
+    CHECK(runAttempt(fresh, level).completed);
+}
+
+TEST(decision_E_unreliable_model_is_detected_and_not_obeyed) {
+    // The game moves in a way the model cannot predict (random jitter in the
+    // air). The measured drift must exceed the limit, the prediction must not
+    // be trusted, and the AI must say so instead of acting on it.
+    SimHooks hooks(0, 4.f, 0.f);
+    PredictionRig rig;
+    warmUp(rig);
+    sim::Level level = sim::levelBasics();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = runStubborn(agent, mem, level, rig, [](Observation const&, bool) { return 0; }, 1e9f, 900);
+    auto const& st = agent.status();
+    std::printf("    jittery game: drift %.3f/step, trusted %s; %u decisions trusted, %u untrusted | %s\n", rig.model.driftPerTick(GameMode::Cube),
+                rig.predictor.trusted(GameMode::Cube, false) ? "yes" : "no", st.decisionsTrusted, st.decisionsUntrusted,
+                st.safety.reason.c_str());
+    CHECK(!rig.predictor.trusted(GameMode::Cube, false));
+    CHECK(st.decisionsUntrusted > 0);
+    // Overrides only ever came from trusted predictions (early in the run,
+    // before the drift measurement had caught up), never from untrusted ones.
+    int untrustedOverrides = 0;
+    for (auto const& rec : agent.safetyLog())
+        if (rec.verdict == SafetyVerdict::Overridden && !rec.trusted) ++untrustedOverrides;
+    CHECK(untrustedOverrides == 0);
+    CHECK(st.safety.verdict == SafetyVerdict::NoPrediction);
+    (void)r;
+    CHECK(rig.predictor.trustReason(GameMode::Cube, false).find("not trusted") != std::string::npos);
+    OverlayGeometry g;
+    buildDecisionOverlay(rig.predictor, st.safety, st.safety.tick, false, {}, g);
+    std::printf("    overlay: %s\n", g.label.c_str());
+}
+
+TEST(decision_F_hitbox_mismatch_does_not_destroy_trust) {
+    // The observed hazards are 2 units bigger than what really kills (as
+    // suspected in game). Walking under spikes with 1 unit of real headroom
+    // survives; the model sees an overlap. The accuracy measurement compares
+    // movement only, so that does not count as a prediction error (before, it
+    // counted as a 20-unit error each time and destroyed trust).
+    SimHooks hooks(0, 0.f, 2.f);
+    PredictionRig rig;
+    warmUp(rig);
+    float const before = rig.model.driftPerTick(GameMode::Cube);
+    sim::Level level;
+    level.name = "graze";
+    for (float b = 6.f; b < 60.f; b += 1.f) level.spike(b, 31.f / kBlock - 0.1f); // hitbox bottom at 31: 1 unit above the head
+    level.finish(64.f);
+    sim::World w(level);
+    rig.held = false;
+    for (int t = 0; t < 1500 && !w.dead() && !w.complete(); ++t) {
+        Observation o = rig.observe(w);
+        rig.predictor.observe(o, false);
+        w.step(false);
+    }
+    std::printf("    walking 1 unit under spikes the model sees 2 units bigger: %s, drift %.3f -> %.3f/step, trusted %s\n",
+                w.dead() ? "DIED" : "alive", before, rig.model.driftPerTick(GameMode::Cube),
+                rig.predictor.trusted(GameMode::Cube, false) ? "yes" : "no");
+    CHECK(!w.dead());
+    CHECK(rig.model.driftPerTick(GameMode::Cube) < 0.05f);
+    CHECK(rig.predictor.trusted(GameMode::Cube, false));
+}
+
+TEST(decision_G_input_latency_is_measured_and_corrected) {
+    // The game applies the button one step later than the model assumes. The
+    // predictor must find that out from real play and plan with it.
+    SimHooks hooks(1, 0.f, 0.f);
+    PredictionRig rig;
+    warmUp(rig);
+    sim::Level level = sim::levelSpikes();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent;
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = train(agent, level, 100, &rig);
+    std::printf("    1-step input delay: estimated latency %d (re-simulation error %.2f / %.2f / %.2f for 0/1/2, %u windows); "
+                "spikes completed after %d attempts\n",
+                rig.predictor.inputLatency(), rig.predictor.latencyError(0), rig.predictor.latencyError(1), rig.predictor.latencyError(2),
+                rig.predictor.latencySamples(), r.attemptsToComplete);
+    CHECK(rig.predictor.inputLatency() == 1);
+    CHECK(r.attemptsToComplete > 0);
+
+    // Without a delay the estimate stays at 0.
+    SimHooks none(0, 0.f, 0.f);
+    PredictionRig rig0;
+    warmUp(rig0);
+    LevelMemory mem0 = freshLevel(level);
+    Agent agent0;
+    agent0.attach(&mem0, &pat);
+    agent0.setPredictor(&rig0.predictor);
+    train(agent0, level, 20, &rig0);
+    CHECK(rig0.predictor.inputLatency() == 0);
 }
 
 // ---------------------------------------------------------------------------

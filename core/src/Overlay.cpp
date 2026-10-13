@@ -114,7 +114,7 @@ bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decisi
     char buf[192];
     int n = std::snprintf(buf, sizeof(buf), "%s - %s", button, safety);
     if (out.hasCollision) n += std::snprintf(buf + n, sizeof(buf) - n, ", hit in %d", out.stepsToCollision);
-    if (!adv.trusted) n += std::snprintf(buf + n, sizeof(buf) - n, " - calibrating, not used");
+    if (!adv.trusted) n += std::snprintf(buf + n, sizeof(buf) - n, " - prediction not trusted, not used");
     if (decision.verdict == SafetyVerdict::Overridden) n += std::snprintf(buf + n, sizeof(buf) - n, " - SAFETY OVERRIDE");
     if (decision.verdict == SafetyVerdict::NoSafeOption) n += std::snprintf(buf + n, sizeof(buf) - n, " - NO SAFE OPTION");
     if (out.stale) std::snprintf(buf + n, sizeof(buf) - n, " - prediction %d step(s) old", out.predictionAge);

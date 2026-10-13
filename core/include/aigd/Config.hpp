@@ -26,6 +26,10 @@ struct LearnerConfig {
     // already pays for new ground and the bonus inflated the values of
     // whatever happened to be done on the way there.
     float newBestReward = 0.f;
+    // In a state without own experience, the cross-level prior only chooses
+    // to press when pressing is clearly better there (in value units, ~blocks
+    // of progress); a near tie means "no input".
+    float priorPressMargin = 0.5f;
 
     // --- Credit assignment / failure memory ---
     int passTicks = 120;              // a decision followed by this long without dying counts as a pass
@@ -46,7 +50,6 @@ struct LearnerConfig {
     // Safety layer (all in physics steps, i.e. time, so they hold at any speed):
     int safetySlackSteps = 3;         // change the input while at least this many steps remain to do so
     int dangerWindowSteps = 16;       // re-check every step while a change may be needed within this many steps
-    int imminentRiskSteps = 12;       // a possible (uncertain) hit this soon counts as unsafe if the other action is safe
 
     // --- Input hygiene ---
     int minToggleTicks = 2;           // never change the button state faster than this

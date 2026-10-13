@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <deque>
 #include <vector>
 
 namespace sim {
@@ -79,6 +80,10 @@ public:
     // Test hook: scales every mode's vertical accelerations, to simulate the
     // game's physics changing (or the model having learned the wrong values).
     static inline float s_gravityScale = 1.f;
+    // Test hooks for model/game mismatches:
+    static inline int s_inputDelay = 0;        // steps between the button being sent and acting
+    static inline float s_noise = 0.f;         // random vertical jitter per airborne step (unpredictable)
+    static inline float s_hazardInflate = 0.f; // hazards are reported this much bigger than they kill
 
     static ModeSpec spec(GameMode m) {
         ModeSpec s = baseSpec(m);
@@ -114,6 +119,7 @@ public:
         m_dead = false;
         m_complete = false;
         m_tick = 0;
+        m_pending.clear();
         m_death = DeathInfo{};
         m_portalsPassed = 0;
         for (auto const& o : m_level.objs) {
@@ -149,7 +155,8 @@ public:
             aigd::Obstacle ob;
             if (o.kind == ObjKind::Spike) {
                 Rect r = spikeHitbox(o);
-                ob = {r.l, r.b, r.r, r.t, aigd::Obstacle::Kind::Hazard};
+                float const g = s_hazardInflate;
+                ob = {r.l - g, r.b - g, r.r + g, r.t + g, aigd::Obstacle::Kind::Hazard};
             } else if (o.kind == ObjKind::Block) {
                 ob = {o.x, o.y, o.x + o.w, o.y + o.h, aigd::Obstacle::Kind::Solid};
             } else {
@@ -192,6 +199,14 @@ public:
     void step(bool hold) {
         if (m_dead || m_complete) return;
         ++m_tick;
+        if (s_inputDelay > 0) {
+            m_pending.push_back(hold);
+            hold = false;
+            if (static_cast<int>(m_pending.size()) > s_inputDelay) {
+                hold = m_pending.front();
+                m_pending.pop_front();
+            }
+        }
         ModeSpec const S = spec(m_mode);
         float const vx = aigd::unitsPerSecond(m_speedClass) / aigd::kTicksPerSecond;
         float const half = S.half;
@@ -287,6 +302,10 @@ public:
         m_vy = vyN * sg;
         m_x += vx;
         if (!teleported) m_y += m_vy / kVyScale;
+        if (s_noise > 0.f && !m_onGround) {
+            m_noise = m_noise * 1664525u + 1013904223u;
+            m_y += s_noise * (static_cast<float>(m_noise >> 8) / 8388608.f - 1.f);
+        }
 
         // the level floor (stood on only when gravity is normal)
         bool grounded = teleported;
@@ -372,6 +391,8 @@ private:
     bool m_onGround = true;
     bool m_upsideDown = false;
     bool m_prevHold = false;
+    std::deque<bool> m_pending;
+    uint32_t m_noise = 12345u;
     int m_boostLeft = 0;
     int m_portalsPassed = 0;
     bool m_dead = false;

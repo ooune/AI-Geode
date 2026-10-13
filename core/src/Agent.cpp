@@ -81,6 +81,16 @@ char const* alternativePhrase(GameMode mode, bool onGround, bool holding, int b)
 constexpr size_t kNone = static_cast<size_t>(-1);
 constexpr size_t kSafetyLogSize = 256;
 
+// Could the player have passed under what killed it by not pressing at all,
+// i.e. staying at the height where the press started? Unknown geometry: yes
+// (worth one test).
+bool walkingUnderClears(FailureReport const& r, PressBlock const& b, bool mini) {
+    if (!r.hasKillerExtent) return true;
+    float const half = mini ? 9.f : 15.f;
+    float const startY = r.upsideDown ? -b.startY : b.startY;
+    return r.killerBottom > startY + half + 0.5f;
+}
+
 char const* buttonName(GameMode mode, int a) {
     if (needsGroundToAct(mode)) return a ? "jump/hold" : "release";
     return a ? "hold" : "release";
@@ -94,6 +104,7 @@ char const* safetyVerdictName(SafetyVerdict v) {
         case SafetyVerdict::Kept: return "kept (danger near)";
         case SafetyVerdict::Overridden: return "SAFETY OVERRIDE";
         case SafetyVerdict::NoSafeOption: return "NO SAFE OPTION";
+        case SafetyVerdict::NoInputNeeded: return "no jump needed";
         default: return "?";
     }
 }
@@ -123,6 +134,7 @@ void Agent::resetTransient() {
     m_pendingExp = {};
     m_incumbent = {};
     m_searches.clear();
+    m_parked.clear();
     m_constraints.clear();
     m_lastSearchHotspot = INT32_MIN;
     m_focusFrom = 0.f;
@@ -132,6 +144,7 @@ void Agent::resetTransient() {
     m_pivot = kNone;
     m_cutAtPivot = false;
     m_avoidedThisAttempt.clear();
+    m_removeTried.clear();
     m_nextChange.clear();
     m_lastReport = {};
     m_curAction = 0;
@@ -219,6 +232,10 @@ void Agent::beginAttempt(Observation const& first, bool fromCheckpoint) {
     m_safetyLog.clear();
     m_status.overridesThisAttempt = 0;
     m_status.noSafeOptionThisAttempt = 0;
+    m_status.pressesAvoidedThisAttempt = 0;
+    m_status.pressesThisAttempt = 0;
+    m_status.decisionsTrusted = 0;
+    m_status.decisionsUntrusted = 0;
     m_status.safety = SafetyRecord{};
     if (m_cfg.learningEnabled && m_pendingExp.active && m_pendingExp.toCell >= xCell(first.x, m_cfg.cellSize)) {
         m_activeExp = std::move(m_pendingExp);
@@ -283,7 +300,7 @@ bool Agent::act(Observation const& obs) {
         }
         fromPrior = true;
     }
-    int a = v[1] > v[0] + kTieEpsilon ? 1 : 0;
+    int a = v[1] > v[0] + (fromPrior ? m_cfg.priorPressMargin : kTieEpsilon) ? 1 : 0;
     DecisionSource src = fromPrior ? DecisionSource::Prior : DecisionSource::Policy;
     bool forced = false;
     bool explored = false;
@@ -424,6 +441,17 @@ bool Agent::act(Observation const& obs) {
     rec.holdingBefore = holdingNow;
     rec.proposed = static_cast<uint8_t>(a);
     rec.proposedSource = src;
+    rec.hazardAhead = obs.hazard.present;
+    rec.hazardDx = obs.hazard.dx;
+    rec.hazardDy = obs.hazard.dy;
+    rec.predictionValid = adv && adv->valid;
+    rec.trusted = trusted;
+    if (rec.predictionValid) {
+        rec.never = adv->never;
+        rec.neverTTC = adv->neverTTC;
+        if (trusted) ++m_status.decisionsTrusted;
+        else ++m_status.decisionsUntrusted;
+    }
     bool overridden = false;
     if (trusted) {
         rec.predictionCurrent = adv->computedTick == obs.tick && !adv->reused;
@@ -437,9 +465,10 @@ bool Agent::act(Observation const& obs) {
         rec.keepTTC = adv->keepTTC;
         // Rank both candidates by safety:
         //   0 predicted collision
-        //   1 no safe continuation, a near miss coming up soon (imminentRiskSteps)
-        //   2 safe, but the input would have to change within the slack
-        //   3 safe with time to spare
+        //   1 possible hit (a near miss within the error margin) in the horizon
+        //   2 no hit predicted, but the input would have to change within the slack
+        //   3 no hit predicted, but an unmodelled object / unconfirmed surface is ahead
+        //   4 safe with time to spare
         // "Must change within the slack" only applies to keeping the current
         // input, or to any input in continuously steered modes (ship, wave),
         // where whatever is chosen now is held until the next change. It does
@@ -457,16 +486,17 @@ bool Agent::act(Observation const& obs) {
         auto rank = [&](int k) {
             Certainty o = adv->outcome(k);
             if (o == Certainty::Collision) return 0;
-            if (o == Certainty::Uncertain && adv->risk(k) >= 0 && adv->risk(k) < m_cfg.imminentRiskSteps) return 1;
+            if (o == Certainty::Uncertain && adv->risk(k) >= 0) return 1;
             bool continuing = (k == 1) == holdingNow;
             if ((continuing || steered) && margin(k) < slack && !(planCommitted && k == proposedAction)) return 2;
-            return 3;
+            return o == Certainty::Safe ? 4 : 3;
         };
         auto describe = [&](int k) {
             switch (rank(k)) {
                 case 0: return fmt("%s collides in %d steps", buttonName(obs.mode, k), adv->ttc(k) + 1);
                 case 1: return fmt("%s risks a hit in %d steps", buttonName(obs.mode, k), adv->risk(k) + 1);
                 case 2: return fmt("keeping %s leaves %d step(s) to change course", buttonName(obs.mode, k), std::max(0, margin(k)));
+                case 3: return fmt("%s has no predicted hit, but passes something the model does not simulate", buttonName(obs.mode, k));
                 default:
                     if (adv->outcome(k) == Certainty::Safe) return fmt("%s is safe (input can stay for %d steps)", buttonName(obs.mode, k), margin(k));
                     return fmt("%s has no definite hit, but is uncertain further ahead", buttonName(obs.mode, k));
@@ -477,7 +507,7 @@ bool Agent::act(Observation const& obs) {
         int const rb = rank(b);
         rec.alternativeAvailable = rb > 0;
         char const* fresh = rec.predictionCurrent ? "current prediction" : "prediction from an earlier step";
-        if (ra == 3) {
+        if (ra == 4) {
             rec.verdict = margin(a) < m_cfg.dangerWindowSteps || adv->outcome(a) != Certainty::Safe ? SafetyVerdict::Kept : SafetyVerdict::Clear;
             if (rec.verdict == SafetyVerdict::Kept) rec.reason = fmt("%s kept: %s (%s)", buttonName(obs.mode, a), describe(a).c_str(), fresh);
         } else if (rb > ra) {
@@ -519,13 +549,70 @@ bool Agent::act(Observation const& obs) {
             reason = rec.reason;
         }
         m_danger = rec.verdict != SafetyVerdict::Clear;
+
+        // ---- No input where none is needed ----
+        // A press (a jump, or holding into a landing re-jump) is only made
+        // when it is needed now: when not pressing is fully safe for now
+        // (rank 4) and the planner's best-timed plan does not press now
+        // either, the press is dropped, whoever proposed it. If a jump is
+        // needed later, the planner times it (best clearance, fewest inputs).
+        // Not for steered modes (ship, wave: the button sets the altitude),
+        // not for an experiment's deliberate test, and not where not pressing
+        // already failed in exactly this state (the prediction would be wrong
+        // here: reality wins).
+        bool const pressInput = a == 1 && (!holdingNow || needsGroundToAct(obs.mode));
+        bool const canChange = m_curAction == 0 || obs.tick - m_lastToggleTick >= m_cfg.minToggleTicks;
+        if (!steered && pressInput && canChange && src != DecisionSource::Experiment && !adv->bestPresses && rank(0) == 4 &&
+            e->streak[0] == 0) {
+            rec.verdict = SafetyVerdict::NoInputNeeded;
+            if (adv->never == Certainty::Safe)
+                rec.reason = fmt("No jump needed: not pressing is predicted clear for %d steps (pressing now: %s); %s proposed it",
+                                 m_predictor->neverPath().steps, describe(1).c_str(), decisionSourceName(rec.proposedSource));
+            else
+                rec.reason = fmt("No jump yet: waiting is safe, the best plan presses in %d steps (pressing now: %s); %s proposed it",
+                                 adv->bestPressAt, describe(1).c_str(), decisionSourceName(rec.proposedSource));
+            a = 0;
+            src = DecisionSource::Economy;
+            shielded = false;
+            forced = false;
+            explored = false;
+            replayed = false;
+            planned = false;
+            reason = rec.reason;
+            ++m_status.pressesAvoidedThisAttempt;
+            m_danger = margin(0) < m_cfg.dangerWindowSteps;
+        }
+        m_status.trust.clear();
+    } else if (m_predictor && m_cfg.usePrediction && (!adv || !adv->valid) && m_predictor->trusted(obs.mode, obs.mini) && a == 1 &&
+               !holdingNow && obs.onGround &&
+               needsGroundToAct(obs.mode) && src != DecisionSource::Experiment && e->streak[0] == 0 &&
+               (m_curAction == 0 || obs.tick - m_lastToggleTick >= m_cfg.minToggleTicks)) {
+        // Nothing to jump over within the whole prediction horizon.
+        m_danger = false;
+        rec.verdict = SafetyVerdict::NoInputNeeded;
+        rec.trusted = true;
+        rec.reason = fmt("No jump needed: nothing ahead within the prediction horizon; %s proposed a jump",
+                         decisionSourceName(rec.proposedSource));
+        a = 0;
+        src = DecisionSource::Economy;
+        forced = explored = replayed = planned = shielded = false;
+        reason = rec.reason;
+        ++m_status.pressesAvoidedThisAttempt;
+        m_status.trust.clear();
     } else {
         m_danger = false;
+        if (rec.predictionValid) {
+            // Simulated, but not trusted: the decision is the policy's alone,
+            // and the record says so (and why).
+            m_status.trust = m_predictor->trustReason(obs.mode, obs.mini);
+            rec.reason = "Prediction not used: " + m_status.trust;
+        }
     }
     rec.executed = static_cast<uint8_t>(a);
+    if (a == 1 && m_curAction == 0) ++m_status.pressesThisAttempt;
     if (rec.verdict == SafetyVerdict::Overridden) ++m_status.overridesThisAttempt;
     if (rec.verdict == SafetyVerdict::NoSafeOption) ++m_status.noSafeOptionThisAttempt;
-    if (rec.verdict != SafetyVerdict::Clear && rec.verdict != SafetyVerdict::NoPrediction) {
+    if (rec.verdict != SafetyVerdict::Clear && rec.verdict != SafetyVerdict::NoPrediction && rec.verdict != SafetyVerdict::NoInputNeeded) {
         if (m_safetyLog.size() >= kSafetyLogSize) m_safetyLog.erase(m_safetyLog.begin(), m_safetyLog.begin() + kSafetyLogSize / 2);
         m_safetyLog.push_back(rec);
     }
@@ -884,6 +971,9 @@ void Agent::finishAttempt(float endX, int32_t endTick, bool died, bool completed
             for (auto s = m_searches.begin(); s != m_searches.end();) {
                 s = std::abs(s->first - m_activeExp.hotspot) <= 1 ? m_searches.erase(s) : std::next(s);
             }
+            for (auto s = m_parked.begin(); s != m_parked.end();) {
+                s = std::abs(s->first - m_activeExp.hotspot) <= 1 ? m_parked.erase(s) : std::next(s);
+            }
             if (m_activeExp.type == ExperimentType::ShiftBlock || m_activeExp.type == ExperimentType::InsertPress) {
                 // Remember the timing window that made this work, so that fixing a
                 // later obstacle never silently undoes it.
@@ -1081,6 +1171,36 @@ void Agent::planNext(FailureReport const& rep) {
     if (it != m_searches.end()) {
         search = &it->second;
         if (experimentWasHere) feedback(*search, rep.kind, !useLatest, rep.deathX, rep.deathY);
+        int32_t const key = it->first;
+        bool const removeTried = std::find(m_removeTried.begin(), m_removeTried.end(), key) != m_removeTried.end();
+        // the press being varied: the latest one starting at the search's cell
+        PressBlock const* varied = nullptr;
+        for (auto const& b : search->base.report.blocks)
+            if (xCell(b.startX, m_cfg.cellSize) == search->blockStart) varied = &b;
+        if (search->type == ExperimentType::ShiftBlock && needsGroundToAct(report.mode) && search->tries >= 2 && !search->exhausted &&
+            !removeTried && varied && walkingUnderClears(rep, *varied, m_lastObs.mini)) {
+            // Two timing variations of this jump failed: before trying more
+            // timings, test not jumping there at all (the jump itself may be
+            // the mistake). The timing search is paused, not lost.
+            m_removeTried.push_back(key);
+            Search r;
+            r.type = ExperimentType::RemovePress;
+            r.blockStart = search->blockStart;
+            r.blockEnd = search->blockEnd;
+            r.base = search->base;
+            r.lastEndX = search->lastEndX;
+            r.lastEndY = search->lastEndY;
+            m_parked[key] = std::move(*search);
+            *search = std::move(r);
+        } else if (search->type == ExperimentType::RemovePress && search->exhausted) {
+            // Not pressing did not work either: the jump is needed. Continue
+            // its timing search where it was paused.
+            auto p = m_parked.find(key);
+            if (p != m_parked.end()) {
+                *search = std::move(p->second);
+                m_parked.erase(p);
+            }
+        }
     }
 
     auto spent = [&](Search const* s) {
@@ -1095,8 +1215,9 @@ void Agent::planNext(FailureReport const& rep) {
         if (search) {
             // Every timing variation of the suspected input failed (or there was
             // no room to vary it): the cause is probably an earlier input, so
-            // widen the window and look further back.
-            ++hot.escalation;
+            // widen the window and look further back. (Not after "remove the
+            // press" failed: then the press is needed, and its timing is next.)
+            if (search->type != ExperimentType::RemovePress) ++hot.escalation;
             for (auto s = m_searches.begin(); s != m_searches.end();) {
                 s = std::abs(s->first - report.hotspot) <= 1 ? m_searches.erase(s) : std::next(s);
             }
@@ -1169,6 +1290,18 @@ bool Agent::initSearch(Search& s, FailureReport const& report, ActionTrace const
         }
         s.blockEnd = s.blockStart + s.insertLen - 1;
     };
+
+    // The jump carried the player into something that was not below it
+    // (above, or level with it): the jump itself may be the mistake. Test not
+    // pressing at all, once per trouble spot, before varying its timing.
+    if (needsGroundToAct(mode) && block >= 0 && report.needDir <= 0 &&
+        walkingUnderClears(report, report.blocks[static_cast<size_t>(block)], last && last->mini) &&
+        (report.kind == FailureKind::HeldTooLong || report.kind == FailureKind::TooEarly || report.kind == FailureKind::TooLate) &&
+        std::find(m_removeTried.begin(), m_removeTried.end(), report.hotspot) == m_removeTried.end()) {
+        m_removeTried.push_back(report.hotspot);
+        useBlock(ExperimentType::RemovePress, 0);
+        return true;
+    }
 
     float ups = unitsPerSecond(speed);
     float lead = (mode == GameMode::Cube || mode == GameMode::Robot) ? 0.2f * ups : 0.12f * ups;
@@ -1250,6 +1383,10 @@ bool Agent::initSearch(Search& s, FailureReport const& report, ActionTrace const
 
 void Agent::feedback(Search& s, FailureKind kind, bool worse, float endX, float endY) {
     ++s.tries;
+    if (s.type == ExperimentType::RemovePress) {
+        s.exhausted = true; // a single test: not pressing either works or it does not
+        return;
+    }
     // Two tries in a row that died at exactly the same spot: the input being
     // varied has no influence on this death, so stop varying it.
     if (s.lastEndX >= 0.f && std::fabs(endX - s.lastEndX) < 0.5f && std::fabs(endY - s.lastEndY) < 0.5f) {
@@ -1356,6 +1493,10 @@ void Agent::buildExperiment(Search const& s, ActionTrace const& base, FailureRep
             ex.testFrom = s.blockStart;
             ex.testTo = std::max(s.blockEnd, s.blockEnd + s.shift);
             break;
+        case ExperimentType::RemovePress:
+            ex.testFrom = s.blockStart;
+            ex.testTo = std::max(s.blockEnd, deathCell + 1);
+            break;
         case ExperimentType::HoldRange:
         case ExperimentType::ReleaseRange:
             ex.testFrom = s.blockStart + s.shift;
@@ -1401,6 +1542,11 @@ void Agent::buildExperiment(Search const& s, ActionTrace const& base, FailureRep
                                  report.deathProgress * 100.f);
             break;
         }
+        case ExperimentType::RemovePress:
+            // no press from the removed one until past the place of death
+            set(s.blockStart, std::max(s.blockEnd, deathCell + 1), 0);
+            ex.description = fmt("Removed the press at %.1f%%: testing not jumping there", at);
+            break;
         case ExperimentType::InsertPress: {
             set(s.blockStart + s.shift, s.blockStart + s.shift + s.insertLen - 1, 1);
             float before = (report.deathX - static_cast<float>(s.blockStart + s.shift) * cs) / kBlock;

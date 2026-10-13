@@ -18,6 +18,7 @@ std::vector<PressBlock> findPressBlocks(std::vector<Step> const& steps, float en
             cur = PressBlock{};
             cur.firstStep = i;
             cur.startX = s.x;
+            cur.startY = s.y;
             cur.startTick = s.tick;
         } else if (s.action == 0 && open) {
             open = false;
@@ -163,6 +164,12 @@ FailureReport analyzeFailure(
         esc > 0 ? ", suspecting an earlier input" : ""
     );
     rep.text = buf;
+    rep.needDir = needDir;
+    if (death.hasKiller && death.hasExtent) {
+        rep.hasKillerExtent = true;
+        rep.killerBottom = (last.upsideDown ? -death.y : death.y) + death.killerBottom;
+        rep.upsideDown = last.upsideDown;
+    }
     return rep;
 }
 

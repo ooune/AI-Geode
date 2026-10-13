@@ -84,6 +84,7 @@ char const* decisionSourceName(DecisionSource source) {
         case DecisionSource::AvoidRepeat: return "avoiding repeated failure";
         case DecisionSource::Shield: return "collision avoided";
         case DecisionSource::Debounce: return "debounce";
+        case DecisionSource::Economy: return "no input needed";
         default: return "?";
     }
 }

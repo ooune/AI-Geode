@@ -45,8 +45,9 @@ struct PredictedPath {
     int32_t uncertainFrom = -1;    // step where an unmodelled object / unknown surface was reached
     bool landed = false;
     float landX = 0.f, landY = 0.f;
-    float clearance = 1e9f;        // smallest gap to a hazard along the path
+    float clearance = 1e9f;        // smallest gap to a hazard (or the side of a block) along the path
     int32_t steps = 0;
+    int presses = 0;               // new presses the path makes (inputs it costs)
 };
 
 // Floor / ceiling of the playing area, as surfaces (not player centres).
@@ -69,6 +70,13 @@ struct SimStart {
     int32_t tick = 0;
     Bounds bounds;
     int32_t robotBoostLeft = 0;    // robot: boost steps still available while held
+    // Input latency: button states already sent that take effect during the
+    // first `lag` simulated steps (the plan starts after them).
+    int lag = 0;
+    uint8_t pending[4] = {0, 0, 0, 0};
+    // Accuracy measurement: only the movement matters, hazards never end the
+    // path and blocks never kill (no margins involved).
+    bool measureOnly = false;
 };
 
 // Forward simulation of the player for every game mode, with hitbox collision
@@ -102,6 +110,10 @@ public:
         // Keeping the current button state unchanged for the whole horizon.
         Certainty keep = Certainty::Safe;
         int32_t keepTTC = -1;
+        // Releasing now and never pressing within the horizon ("no jump").
+        Certainty never = Certainty::Safe;
+        int32_t neverTTC = -1;
+        int32_t neverRisk = -1;
         int32_t computedTick = INT32_MIN; // the tick whose state this was simulated from
         bool reused = false;             // carried over from an earlier tick (not recomputed)
         int simulations = 0;
@@ -161,6 +173,15 @@ public:
     PredictedPath const& executedPath() const { return m_executedPress ? m_press : m_release; }
     PredictedPath const& otherPath() const { return m_executedPress ? m_release : m_press; }
     PredictedPath const& keepPath() const { return m_keep; }
+    PredictedPath const& neverPath() const { return m_never; }
+
+    // Accuracy of the model against the real game (measured continuously by
+    // re-simulating recent real steps with the inputs actually used).
+    int inputLatency() const { return m_latency; }            // steps between sending the button and it acting
+    float latencyError(int lag) const { return lag >= 0 && lag < kLags ? m_lagErr[static_cast<size_t>(lag)] : 0.f; }
+    uint32_t latencySamples() const { return m_lagSamples; }
+    // Why predictions are or are not used for decisions in this mode.
+    std::string trustReason(GameMode mode, bool mini) const;
     bool executedPress() const { return m_executedPress; }
     bool hasExecuted() const { return m_executedValid; }
     PredictedPath const& pressPath() const { return m_press; }
@@ -223,7 +244,11 @@ private:
     int32_t m_computedTick = INT32_MIN;   // when the current plan was actually computed
     GameMode m_computedMode = GameMode::Count;
     uint64_t m_reused = 0;
-    PredictedPath m_press, m_release, m_tmp, m_keep;
+    PredictedPath m_press, m_release, m_tmp, m_keep, m_never;
+    static constexpr int kLags = 3;
+    int m_latency = 0;
+    std::array<float, kLags> m_lagErr{};   // average re-simulation error per assumed latency
+    uint32_t m_lagSamples = 0;             // windows with an input change (where latency matters)
     bool m_bestPresses = false;
     bool m_executedPress = false;
     bool m_executedValid = false;

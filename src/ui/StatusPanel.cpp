@@ -85,20 +85,33 @@ void StatusPanel::refresh() {
             } else if (!st.predictionValid) {
                 text += "\nPrediction: nothing to avoid ahead";
             } else {
+                // The decision, explained from the candidate evaluations that
+                // were actually made for it.
                 auto const& sf = st.safety;
-                text += fmt::format("\nPrediction: press {} | release {} | {}",
-                                    outcome(st.pressOutcome, st.pressTTC), outcome(st.releaseOutcome, st.releaseTTC),
-                                    st.predictionTrusted ? fmt::format("model ok, drift {:.3f}/step", pr.model().driftPerTick(ai.lastObservation().mode))
-                                                         : std::string("calibrating - not acting on it yet"));
-                if (st.predictionTrusted) {
-                    text += fmt::format("\nExecuting: {} ({}) | safety: {}{} | overrides this attempt {}, no safe option {}",
-                                        sf.executed ? "button down" : "button up",
-                                        sf.executed == sf.proposed ? fmt::format("as proposed by {}", aigd::decisionSourceName(sf.proposedSource))
-                                                                   : fmt::format("{} wanted the other", aigd::decisionSourceName(sf.proposedSource)),
-                                        aigd::safetyVerdictName(sf.verdict), sf.predictionCurrent ? "" : " (stale prediction)",
-                                        st.overridesThisAttempt, st.noSafeOptionThisAttempt);
-                    if (!sf.reason.empty()) text += "\nSafety: " + sf.reason;
-                }
+                bool const steered = aigd::isFlyingMode(sf.mode);
+                auto clearOr = [&](aigd::Certainty c, int32_t ttc) {
+                    if (c == aigd::Certainty::Collision) return fmt::format("collision in {} steps", ttc + 1);
+                    return std::string(c == aigd::Certainty::Safe ? "predicted clear" : "uncertain");
+                };
+                std::string obstacle = sf.hazardAhead ? fmt::format("hazard {:.1f} blocks ahead ({:+.0f} high)", sf.hazardDx / aigd::kBlock, sf.hazardDy)
+                                                      : std::string("no hazard ahead");
+                char const* pressName = steered ? "Hold" : "Jump";
+                char const* releaseName = steered ? "Release" : "No jump";
+                text += fmt::format("\n{} | {}: {} | {}: {} | Selected: {} | Executed: {}", obstacle, pressName,
+                                    clearOr(sf.outcome[1], sf.ttc[1]), releaseName,
+                                    clearOr(steered ? sf.outcome[0] : sf.never, steered ? sf.ttc[0] : sf.neverTTC),
+                                    sf.proposed ? pressName : releaseName, sf.executed ? pressName : releaseName);
+                bool learned = sf.proposedSource == aigd::DecisionSource::AvoidRepeat || sf.proposedSource == aigd::DecisionSource::KnownGood ||
+                               sf.proposedSource == aigd::DecisionSource::Experiment;
+                text += fmt::format("\nProposed by {}{} | {} | {}{}", aigd::decisionSourceName(sf.proposedSource),
+                                    learned ? " (learned from earlier attempts)" : "",
+                                    sf.trusted ? fmt::format("prediction trusted, drift {:.3f}/step, latency {}", pr.model().driftPerTick(sf.mode), pr.inputLatency())
+                                               : std::string("PREDICTION NOT USED"),
+                                    aigd::safetyVerdictName(sf.verdict), sf.predictionCurrent || !sf.trusted ? "" : " (stale prediction)");
+                if (!sf.reason.empty()) text += "\nWhy: " + sf.reason;
+                text += fmt::format("\nThis attempt: {} presses, {} unnecessary presses skipped, {} safety overrides, {} with no safe option",
+                                    st.pressesThisAttempt, st.pressesAvoidedThisAttempt, st.overridesThisAttempt, st.noSafeOptionThisAttempt);
+                (void)outcome;
             }
         }
 

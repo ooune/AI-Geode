@@ -18,7 +18,9 @@ namespace aigd {
 // HoldRange / ReleaseRange are for flying modes, where altitude is the sum of
 // many inputs: "hold continuously from N cells before the obstacle" lets the
 // search move N instead of nudging one short tap.
-enum class ExperimentType : uint8_t { None = 0, ShiftBlock, ShiftStart, ShiftEnd, InsertPress, HoldRange, ReleaseRange };
+// RemovePress: the jump itself was the mistake (it carried the player into
+// something above): try not pressing at all.
+enum class ExperimentType : uint8_t { None = 0, ShiftBlock, ShiftStart, ShiftEnd, InsertPress, HoldRange, ReleaseRange, RemovePress };
 
 // A controlled change to the best known way of playing a short section: e.g.
 // "press 2 cells later than last time". Experiments are proposed by the failure
@@ -80,6 +82,7 @@ enum class SafetyVerdict : uint8_t {
     Kept,             // danger near, but the executed action is still the best available
     Overridden,       // the proposed action was unsafe and was replaced by a safer one
     NoSafeOption,     // every candidate is predicted to collide; the least bad one was executed
+    NoInputNeeded,    // a press was proposed, but not pressing is predicted clear: no press
 };
 char const* safetyVerdictName(SafetyVerdict v);
 
@@ -103,6 +106,13 @@ struct SafetyRecord {
     SafetyVerdict verdict = SafetyVerdict::NoPrediction;
     bool alternativeAvailable = false;
     std::string reason;
+    // decision explanation
+    bool predictionValid = false;    // something relevant ahead was simulated
+    bool trusted = false;            // ... and the model was trusted to decide
+    Certainty never = Certainty::Safe; // not pressing at all within the horizon
+    int32_t neverTTC = -1;
+    bool hazardAhead = false;        // nearest hazard ahead (relative to the player)
+    float hazardDx = 0.f, hazardDy = 0.f;
 };
 
 struct AgentStatus {
@@ -156,6 +166,11 @@ struct AgentStatus {
     SafetyRecord safety;           // the last decision's safety check
     uint32_t overridesThisAttempt = 0;
     uint32_t noSafeOptionThisAttempt = 0;
+    uint32_t pressesAvoidedThisAttempt = 0;   // proposed presses not executed because not pressing was clear
+    uint32_t pressesThisAttempt = 0;          // presses actually executed
+    uint32_t decisionsTrusted = 0;            // decisions with a trusted prediction / with an untrusted one
+    uint32_t decisionsUntrusted = 0;
+    std::string trust;                        // why predictions are (not) used, at the last decision
 };
 
 class Agent {
@@ -285,6 +300,7 @@ private:
     Experiment m_pendingExp;
     ActionTrace m_incumbent;
     std::map<int32_t, Search> m_searches;
+    std::map<int32_t, Search> m_parked;          // timing searches paused while "remove the press" is tested
     std::map<int32_t, Constraint> m_constraints;
     int32_t m_lastSearchHotspot = INT32_MIN;
     float m_focusFrom = 0.f;
@@ -303,6 +319,7 @@ private:
     // re-checked every step instead of being kept while the state key is unchanged.
     bool m_danger = false;
     std::vector<SafetyRecord> m_safetyLog;
+    std::vector<int32_t> m_removeTried;          // hotspots where "remove the press" was already tried
     FailureReport m_lastReport;
     AgentStatus m_status;
 

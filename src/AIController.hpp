@@ -100,6 +100,7 @@ private:
     void saveAsync();
     void saveNow();
     void press(PlayLayer* layer, bool down);
+    void logAttemptQuality(aigd::GameMode mode, bool mini) const;
     void endAttemptWithoutOutcome(PlayLayer* layer);
     void manageCheckpoints(PlayLayer* layer, aigd::Observation const& obs);
     int32_t currentTick(PlayLayer* layer) const;

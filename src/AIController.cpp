@@ -326,6 +326,7 @@ void AIController::onPlayerDestroyed(PlayLayer* layer, PlayerObject* player, Gam
                   aigd::certaintyName(r.outcome[1]), r.ttc[1], r.keepFor[1], r.proposed, aigd::decisionSourceName(r.proposedSource),
                   r.executed, aigd::safetyVerdictName(r.verdict), r.predictionCurrent ? "" : " (stale prediction)", r.reason);
     }
+    logAttemptQuality(obs.mode, obs.mini);
     m_agent.onDeath(obs, death);
     if (!m_agent.status().predictionNote.empty()) log::info("Prediction check: {}", m_agent.status().predictionNote);
     m_deathPending = true;
@@ -353,11 +354,30 @@ void AIController::onPlayerDestroyed(PlayLayer* layer, PlayerObject* player, Gam
     if (++m_attemptsSinceSave >= kSaveEveryAttempts) saveAsync();
 }
 
+// One line per attempt with what the decisions were based on: how often the
+// prediction was trusted (and if not, why), what the safety logic did, and
+// how well the physics model matches the game. This is the evidence for
+// whether predictions control the AI in game.
+void AIController::logAttemptQuality(aigd::GameMode mode, bool mini) const {
+    auto const& st = m_agent.status();
+    auto const& model = m_predictor.model();
+    log::info("Decisions: {} with a trusted prediction, {} untrusted{}{} | presses {}, presses skipped as unnecessary {}, safety overrides {}, "
+              "no safe option {} | model ({}): drift {:.3f}/step, input latency {} step(s) (re-simulation error {:.2f}/{:.2f}/{:.2f} for 0/1/2, "
+              "{} windows), caution {:.2f}, one-step error {:.2f}, {} estimate(s) replaced",
+              st.decisionsTrusted, st.decisionsUntrusted, st.trust.empty() ? "" : " - ", st.trust, st.pressesThisAttempt,
+              st.pressesAvoidedThisAttempt, st.overridesThisAttempt, st.noSafeOptionThisAttempt, aigd::gameModeName(mode),
+              model.driftPerTick(mode), m_predictor.inputLatency(), m_predictor.latencyError(0), m_predictor.latencyError(1),
+              m_predictor.latencyError(2), m_predictor.latencySamples(), m_predictor.caution(), m_predictor.lastStepError(),
+              model.regimeChanges());
+    (void)mini;
+}
+
 void AIController::onLevelComplete(PlayLayer* layer) {
     if (layer != m_layer || !m_agent.attemptActive()) return;
     auto obs = m_observer.observe(layer, currentTick(layer));
     obs.x = std::max(obs.x, layer->m_levelLength);
     if (m_holding) press(layer, false);
+    logAttemptQuality(obs.mode, obs.mini);
     m_agent.onComplete(obs);
     m_deathPending = false;
     log::info("Level completed on attempt {} ({} completions so far)", m_agent.status().attempt, m_level->completions);

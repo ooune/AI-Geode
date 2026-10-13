@@ -38,6 +38,7 @@ struct PressBlock {
     size_t firstStep = 0;
     size_t lastStep = 0;   // inclusive
     float startX = 0.f;
+    float startY = 0.f;    // player height when the press started
     float endX = 0.f;      // x where the button was released (or the attempt ended)
     int32_t startTick = 0;
     int32_t endTick = 0;

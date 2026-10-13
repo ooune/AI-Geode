@@ -55,7 +55,34 @@ SimStart Predictor::startFrom(Observation const& obs, bool holding) const {
     s.bounds = m_bounds;
     if (obs.mode == GameMode::Robot && m_robotAlive)
         s.robotBoostLeft = std::max(0, m_model.params(obs.mode, obs.mini).boostSteps - m_robotSince);
+    // With input latency L, the next L steps still run with buttons that were
+    // sent before: the last L recorded states (oldest first), and the state in
+    // effect before them is the one L+1 records back.
+    if (m_latency > 0 && m_histCount > static_cast<size_t>(m_latency)) {
+        auto at = [&](int back) -> Rec const& { return m_hist[(m_histHead + kHistory - 1 - static_cast<size_t>(back)) % kHistory]; };
+        s.lag = m_latency;
+        for (int j = 0; j < m_latency; ++j) s.pending[j] = at(m_latency - 1 - j).held ? 1 : 0;
+        s.holding = at(m_latency).held;
+        // the newest state counts as "current" for the caller's decision
+        (void)holding;
+    }
     return s;
+}
+
+std::string Predictor::trustReason(GameMode mode, bool mini) const {
+    char buf[160];
+    if (!m_model.calibrated(mode, mini)) return "calibrating: not enough observed jumps/flights in this mode yet";
+    float d = m_model.driftPerTick(mode);
+    if (d >= 0.15f) {
+        std::snprintf(buf, sizeof(buf), "not trusted: the model drifts %.3f units/step from the real game (limit 0.15)", d);
+        return buf;
+    }
+    if (m_caution >= 3.f) {
+        std::snprintf(buf, sizeof(buf), "not trusted: %u recent deaths on paths predicted safe (caution %.2f)", m_mispredictions, m_caution);
+        return buf;
+    }
+    std::snprintf(buf, sizeof(buf), "trusted: drift %.3f units/step, input latency %d step(s)", d, m_latency);
+    return buf;
 }
 
 bool Predictor::trusted(GameMode mode, bool mini) const {
@@ -138,19 +165,24 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
         }
     };
 
+    int const lag = holds.empty() ? std::clamp(s.lag, 0, 4) : 0;
+    out.presses = 0;
     for (int step = 0; step < steps; ++step) {
         bool hold;
+        int const ps = step - lag; // plan step
         if (!holds.empty()) {
             hold = holds[static_cast<size_t>(step)] != 0;
+        } else if (ps < 0) {
+            hold = s.pending[step] != 0;
         } else {
-            if (nextPress >= 0 && step == nextPress) {
+            if (nextPress >= 0 && ps == nextPress) {
                 pressActive = true;
-                pressStart = step;
+                pressStart = ps;
                 effects = 0;
-                nextPress = plan.repeatEvery > 0 ? step + plan.repeatEvery : -1;
+                nextPress = plan.repeatEvery > 0 ? ps + plan.repeatEvery : -1;
             }
             if (pressActive) {
-                int32_t heldFor = step - pressStart;
+                int32_t heldFor = ps - pressStart;
                 if (plan.holdFor > 0 && heldFor >= plan.holdFor) pressActive = false;
                 else if (plan.holdFor == 0 && tapRelease && heldFor >= 2) pressActive = false;
                 else if (plan.holdFor == 0 && !tapRelease && effects >= target && heldFor >= 2) pressActive = false;
@@ -160,6 +192,7 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
         bool const edge = hold && !prevHold;
         prevHold = hold;
         out.holds.push_back(hold ? 1 : 0);
+        if (edge && ps >= 0) ++out.presses;
 
         float const prevBottom = y - h;
         float const prevTop = y + h;
@@ -303,6 +336,7 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
                     }
                     break;
                 case Obstacle::Kind::Hazard: {
+                    if (s.measureOnly) break;
                     float sep = (ox > 0.f && oy > 0.f) ? -std::min(ox, oy) : std::max(-ox, -oy);
                     out.clearance = std::min(out.clearance, sep);
                     if (ox > m && oy > m) {
@@ -317,14 +351,16 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
                     if (ox <= 0.f) break;
                     float const ix = overlap(x - in, x + in, o.l, o.r);
                     float const iy = overlap(y - in, y + in, o.b, o.t);
-                    // how close the inner hitbox came to the block (a side-on graze is risky)
-                    out.clearance = std::min(out.clearance, std::max(-ix, -iy));
+                    // How close the inner hitbox came to the side of the block (a
+                    // side-on graze is risky). Standing on or sliding along a
+                    // block is not a near miss.
+                    if (iy > 0.f) out.clearance = std::min(out.clearance, -ix);
                     // Reaching a top or bottom surface: stand on it / slide along it,
                     // unless the small inner hitbox is already inside the block.
                     bool fromAbove = vy <= 0.f && prevBottom >= o.t - kLandTolerance && y - h < o.t;
                     bool fromBelow = vy >= 0.f && prevTop <= o.b + kLandTolerance && y + h > o.b;
                     if (fromAbove || fromBelow) {
-                        if (ix > m && iy > m) {
+                        if (!s.measureOnly && ix > m && iy > m) {
                             recordHit(step, idx, true);
                             stop = true;
                             break;
@@ -339,6 +375,7 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
                     }
                     if (onGround && ((g > 0.f && std::fabs((y - h) - o.t) < 0.5f) || (g < 0.f && std::fabs((y + h) - o.b) < 0.5f)))
                         supported = true;
+                    if (s.measureOnly) break;
                     if (ix > m && iy > m) {
                         recordHit(step, idx, true);
                         stop = true;
@@ -378,13 +415,19 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
 }
 
 float Predictor::score(PredictedPath const& p) const {
+    // Safety first; then a little extra clearance (it stops counting at 10
+    // units, the margins are far smaller); then fewer inputs. Every press
+    // costs, so among equally safe plans "do nothing" wins: a jump is chosen
+    // because it is needed or clearly safer, never just because it is possible.
+    constexpr float kClearanceCap = 10.f;
+    constexpr float kInputCost = 4.f;
     if (p.outcome == Certainty::Collision) return -1000.f + static_cast<float>(p.collisionStep);
     float base = p.outcome == Certainty::Safe ? 1000.f : 500.f;
     if (p.outcome == Certainty::Uncertain) {
         int32_t when = p.collisionStep >= 0 ? p.collisionStep : p.uncertainFrom;
         if (when >= 0) base += static_cast<float>(when) * 0.5f;
     }
-    return base + std::min(p.clearance, 30.f);
+    return base + std::min(p.clearance, kClearanceCap) - kInputCost * static_cast<float>(p.presses);
 }
 
 bool Predictor::sameState(Observation const& obs, bool holding) const {
@@ -407,10 +450,11 @@ void Predictor::evaluate(SimStart const& s, std::span<Obstacle const> obs, Plan 
     ++m_totalSims;
     if (tmp.outcome != Certainty::Collision) {
         // How long this plan keeps the branch's first button state.
-        int32_t keep = static_cast<int32_t>(tmp.holds.size());
-        for (size_t i = 1; i < tmp.holds.size(); ++i) {
-            if (tmp.holds[i] != tmp.holds[0]) {
-                keep = static_cast<int32_t>(i);
+        size_t const first = static_cast<size_t>(std::clamp(s.lag, 0, 4));
+        int32_t keep = static_cast<int32_t>(tmp.holds.size() > first ? tmp.holds.size() - first : 0);
+        for (size_t i = first + 1; i < tmp.holds.size(); ++i) {
+            if (tmp.holds[i] != tmp.holds[first]) {
+                keep = static_cast<int32_t>(i - first);
                 break;
             }
         }
@@ -472,6 +516,7 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     m_stateFlipped = obs.upsideDown;
     m_executedValid = false;
     m_keep = PredictedPath{};
+    m_never = PredictedPath{};
     m_press = PredictedPath{};
     m_release = PredictedPath{};
     if (!supports(obs.mode) || obs.obstacles.empty()) return m_advice;
@@ -616,6 +661,17 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     ++m_totalSims;
     m_advice.keep = m_keep.outcome;
     m_advice.keepTTC = m_keep.outcome == Certainty::Collision ? m_keep.collisionStep : -1;
+    // ... and what happens without pressing at all ("no jump").
+    if (holding) {
+        simulate(s, span, Plan{-1, 0, 0, false}, m_never);
+        ++m_advice.simulations;
+        ++m_totalSims;
+    } else {
+        m_never = m_keep;
+    }
+    m_advice.never = m_never.outcome;
+    m_advice.neverTTC = m_never.outcome == Certainty::Collision ? m_never.collisionStep : -1;
+    m_advice.neverRisk = m_never.outcome != Certainty::Safe ? m_never.collisionStep : -1;
     // Prefer not pressing unless pressing now is clearly better: waiting keeps
     // options open. But if the best "wait" plan presses within two steps anyway,
     // waiting gains nothing and risks being too late: press unless waiting is
@@ -774,6 +830,14 @@ void Predictor::observe(Observation const& obs, bool heldDuringStep) {
 
     if (m_histCount > 0) {
         Rec const& p = m_hist[(m_histHead + kHistory - 1) % kHistory];
+        // With input latency L the button acting during this step was sent L
+        // decisions earlier (k records back from the previous one).
+        auto sentBack = [&](int k) -> bool {
+            if (static_cast<size_t>(k) >= m_histCount) return false;
+            return m_hist[(m_histHead + kHistory - 1 - static_cast<size_t>(k)) % kHistory].held;
+        };
+        bool const effHeld = m_latency == 0 ? heldDuringStep : sentBack(m_latency - 1);
+        bool const effBefore = sentBack(m_latency);
         if (p.tick + 1 == r.tick) {
             Observation prev;
             prev.x = p.x;
@@ -786,13 +850,14 @@ void Predictor::observe(Observation const& obs, bool heldDuringStep) {
             prev.mode = p.mode;
             prev.tick = p.tick;
             prev.playerSpeed = p.playerSpeed;
-            m_model.observeStep(prev, obs, heldDuringStep, p.held);
+            m_model.observeStep(prev, obs, effHeld, effBefore);
 
             // one-step prediction error (diagnostics)
             if (p.mode == obs.mode && p.mini == obs.mini && !p.dead && !obs.dead) {
-                SimStart s{p.x, p.y, p.vy, p.mode, p.onGround, p.upsideDown, p.mini, p.held, p.speedClass, p.tick, m_bounds,
+                SimStart s{p.x, p.y, p.vy, p.mode, p.onGround, p.upsideDown, p.mini, effBefore, p.speedClass, p.tick, m_bounds,
                            p.robotBoostLeft};
-                uint8_t hold = heldDuringStep ? 1 : 0;
+                s.measureOnly = true;
+                uint8_t hold = effHeld ? 1 : 0;
                 simulate(s, obs.obstacles, Plan{}, m_resim, std::span<uint8_t const>(&hold, 1));
                 if (!m_resim.points.empty()) {
                     m_predY = m_resim.points.back().y;
@@ -809,8 +874,14 @@ void Predictor::observe(Observation const& obs, bool heldDuringStep) {
     m_histCount = std::min(m_histCount + 1, kHistory);
 
     // Every 16 steps, re-simulate the last 32 real steps with the inputs that
-    // were actually used and compare the end point with reality.
-    if (++m_sinceResim >= 16 && m_histCount > static_cast<size_t>(kResimSteps)) {
+    // were actually used and compare the end point with reality. This measures
+    // movement only (measureOnly): hazards and error margins play no part, so
+    // a near miss that the model's hitboxes call a hit cannot count as a
+    // 20-unit error (before, that inflated the drift, the inflated drift
+    // widened the margins, and predictions ended up untrusted). It is done for
+    // each assumed input latency (0, 1, 2 steps); the one that matches the
+    // real game best is used for planning.
+    if (++m_sinceResim >= 16 && m_histCount > static_cast<size_t>(kResimSteps + kLags)) {
         m_sinceResim = 0;
         auto at = [&](size_t back) -> Rec const& { return m_hist[(m_histHead + kHistory - 1 - back) % kHistory]; };
         Rec const& s0 = at(kResimSteps);
@@ -820,22 +891,45 @@ void Predictor::observe(Observation const& obs, bool heldDuringStep) {
             ok = q.mode == s0.mode && q.mini == s0.mini && !q.dead && q.speedClass == s0.speedClass;
         }
         if (ok) {
-            m_holdBuf.clear();
-            for (int i = kResimSteps - 1; i >= 0; --i) m_holdBuf.push_back(at(static_cast<size_t>(i)).held ? 1 : 0);
-            SimStart s{s0.x, s0.y, s0.vy, s0.mode, s0.onGround, s0.upsideDown, s0.mini, s0.held, s0.speedClass, s0.tick, m_bounds,
-                       s0.robotBoostLeft};
-            simulate(s, obs.obstacles, Plan{}, m_resim, m_holdBuf);
-            Rec const& end = at(0);
-            float err;
-            if (m_resim.uncertainFrom >= 0) {
-                err = -1.f; // unmodelled object involved: not the model's fault
-            } else if (m_resim.outcome == Certainty::Collision || static_cast<int>(m_resim.points.size()) < kResimSteps) {
-                err = 20.f; // the model thought we would die but we did not
-            } else {
+            std::array<float, kLags> errs{};
+            bool valid = true;
+            bool differs = false;
+            std::vector<uint8_t> base;
+            for (int L = 0; L < kLags && valid; ++L) {
+                m_holdBuf.clear();
+                for (int i = kResimSteps - 1; i >= 0; --i) m_holdBuf.push_back(at(static_cast<size_t>(i + L)).held ? 1 : 0);
+                if (L == 0) base = m_holdBuf;
+                else if (m_holdBuf != base) differs = true;
+                SimStart s{s0.x, s0.y, s0.vy, s0.mode, s0.onGround, s0.upsideDown, s0.mini, at(static_cast<size_t>(kResimSteps + L)).held,
+                           s0.speedClass, s0.tick, m_bounds, s0.robotBoostLeft};
+                s.measureOnly = true;
+                simulate(s, obs.obstacles, Plan{}, m_resim, m_holdBuf);
+                if (m_resim.uncertainFrom >= 0 || m_resim.points.empty()) {
+                    valid = false; // unmodelled object involved: not the model's fault
+                    break;
+                }
+                Rec const& end = at(0);
                 auto const& e = m_resim.points.back();
-                err = std::hypot(e.x - end.x, e.y - end.y);
+                errs[static_cast<size_t>(L)] = std::hypot(e.x - end.x, e.y - end.y);
             }
-            if (err >= 0.f) m_model.recordAccuracy(s0.mode, err, kResimSteps);
+            if (valid) {
+                m_model.recordAccuracy(s0.mode, errs[static_cast<size_t>(m_latency)], kResimSteps);
+                if (differs) {
+                    // Only windows with an input change say anything about latency.
+                    for (int L = 0; L < kLags; ++L) {
+                        float& a = m_lagErr[static_cast<size_t>(L)];
+                        a = m_lagSamples == 0 ? errs[static_cast<size_t>(L)] : a * 0.9f + errs[static_cast<size_t>(L)] * 0.1f;
+                    }
+                    ++m_lagSamples;
+                    if (m_lagSamples >= 12) {
+                        int best = m_latency;
+                        for (int L = 0; L < kLags; ++L)
+                            if (m_lagErr[static_cast<size_t>(L)] < m_lagErr[static_cast<size_t>(best)]) best = L;
+                        float cur = m_lagErr[static_cast<size_t>(m_latency)];
+                        if (best != m_latency && cur > 0.5f && m_lagErr[static_cast<size_t>(best)] < 0.5f * cur) m_latency = best;
+                    }
+                }
+            }
         }
     }
 
