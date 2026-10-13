@@ -5,6 +5,7 @@ add_library(aigd_core STATIC
     src/Json.cpp
     src/Overlay.cpp
     src/Physics.cpp
+    src/PlanManager.cpp
     src/Predictor.cpp
     src/StepClock.cpp
     src/Storage.cpp

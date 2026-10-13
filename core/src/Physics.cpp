@@ -128,6 +128,19 @@ void PhysicsModel::reset() {
 
 void PhysicsModel::loadCalibration(PhysicsCalibration const& cal) {
     m_cal = cal;
+    // GD's horizontal speeds are exact constants. A saved estimate far from
+    // them can only come from the old tick counting (before v0.3.0, which
+    // took 2-step moves for 1 step and learned ~1.2x the speed): drop it.
+    for (int sc = 0; sc < 5; ++sc) {
+        if (m_cal.vxN[static_cast<size_t>(sc)] == 0) continue;
+        double const mean = m_cal.vxSum[static_cast<size_t>(sc)] / m_cal.vxN[static_cast<size_t>(sc)];
+        double const nominal = unitsPerSecond(sc) / static_cast<double>(kTicksPerSecond);
+        if (std::fabs(mean - nominal) > 0.1 * nominal) {
+            m_cal.vxSum[static_cast<size_t>(sc)] = 0.0;
+            m_cal.vxN[static_cast<size_t>(sc)] = 0;
+            ++m_vxReplaced;
+        }
+    }
     for (size_t i = 0; i < PhysicsCalibration::kSlots; ++i) refit(i);
 }
 
@@ -178,6 +191,21 @@ void PhysicsModel::observeStep(Observation const& prev, Observation const& cur, 
         if (m_cal.vxN[sc] < 10 || std::fabs(dx - mean) < 0.05 * mean) {
             m_cal.vxSum[sc] += dx;
             ++m_cal.vxN[sc];
+            m_vxAltN[static_cast<size_t>(sc)] = 0;
+        } else {
+            // A long unbroken run of samples that agree with each other but not
+            // with the estimate: the estimate is wrong (or the game changed).
+            auto& an = m_vxAltN[static_cast<size_t>(sc)];
+            auto& as = m_vxAltSum[static_cast<size_t>(sc)];
+            if (an && std::fabs(dx - as / an) >= 0.05 * (as / an)) an = 0;
+            if (an == 0) as = 0.0;
+            as += dx;
+            if (++an >= 40) {
+                m_cal.vxSum[sc] = as;
+                m_cal.vxN[sc] = an;
+                an = 0;
+                ++m_vxReplaced;
+            }
         }
     }
 

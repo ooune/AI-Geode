@@ -50,6 +50,10 @@ struct LearnerConfig {
     // Safety layer (all in physics steps, i.e. time, so they hold at any speed):
     int safetySlackSteps = 3;         // change the input while at least this many steps remain to do so
     int dangerWindowSteps = 16;       // re-check every step while a change may be needed within this many steps
+    // Live plan: a still-valid plan is followed without a new search for up to
+    // this many steps, as long as at least planMinLeft steps of it remain.
+    int planFollowSteps = 12;
+    int planMinLeft = 30;
 
     // --- Input hygiene ---
     int minToggleTicks = 2;           // never change the button state faster than this

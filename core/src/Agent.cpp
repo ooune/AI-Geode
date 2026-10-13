@@ -145,6 +145,7 @@ void Agent::resetTransient() {
     m_cutAtPivot = false;
     m_avoidedThisAttempt.clear();
     m_removeTried.clear();
+    m_plan.clear();
     m_nextChange.clear();
     m_lastReport = {};
     m_curAction = 0;
@@ -230,6 +231,12 @@ void Agent::beginAttempt(Observation const& first, bool fromCheckpoint) {
     m_cutAtPivot = false;
     m_danger = false;
     m_safetyLog.clear();
+    m_plan.clear();
+    m_expChecked = false;
+    m_status.planEvent.clear();
+    m_status.plansInvalidatedThisAttempt = 0;
+    m_status.actionsCancelledThisAttempt = 0;
+    m_status.decisionsFollowingPlan = 0;
     m_status.overridesThisAttempt = 0;
     m_status.noSafeOptionThisAttempt = 0;
     m_status.pressesAvoidedThisAttempt = 0;
@@ -262,7 +269,10 @@ bool Agent::act(Observation const& obs) {
     // that was ahead at the time is recorded as a successful lead distance.
     for (auto it = m_leads.begin(); it != m_leads.end();) {
         if (obs.x > it->obstacleX + kBlock) {
-            if (m_cfg.learningEnabled && m_patterns) m_patterns->leads[it->key].add(it->lead);
+            if (m_cfg.learningEnabled && m_patterns) {
+                m_patterns->leads[it->key].add(it->lead);
+                m_patterns->situationLeads[it->situation].add(it->lead);
+            }
             it = m_leads.erase(it);
         } else {
             ++it;
@@ -276,7 +286,39 @@ bool Agent::act(Observation const& obs) {
     // was predicted for the input being executed. Then every step is checked.
     bool const watched = m_predictor && m_cfg.usePrediction && !obs.obstacles.empty();
     bool const offPath = watched && m_predictor->hasExecuted() && m_predictor->offPredictedPath(obs);
-    if (key == m_curKey && obs.tick - m_lastDecisionTick < m_cfg.maxStickTicks && !(watched && (m_danger || offPath))) return holdingNow;
+
+    // ---- Live plan: does the real state still match what it was made for? ----
+    // Checked on every observation, against the state the plan expected for
+    // exactly this physics step (position, height, grounded or airborne,
+    // mode, speed, gravity) - not merely the x position. A material
+    // difference cancels the plan's pending inputs (its learning record is
+    // untouched) and forces a new decision from the actual state now.
+    bool planInvalidated = false;
+    if (m_plan.active()) {
+        float const drift = m_predictor ? m_predictor->model().driftPerTick(obs.mode) : 0.f;
+        float const tol = 1.f + 2.f * drift * static_cast<float>(std::max(0, m_plan.age(obs.tick)));
+        PlanCheck const chk = m_plan.validate(obs, tol);
+        if (chk.hadPlan && !chk.valid && !chk.finished) {
+            planInvalidated = true;
+            ++m_status.plansInvalidatedThisAttempt;
+            m_status.actionsCancelledThisAttempt += static_cast<uint32_t>(chk.cancelled);
+            m_status.planEvent = fmt("%s - cancelling %d pending action%s; replanning from the actual state", chk.reason.c_str(),
+                                     chk.cancelled, chk.cancelled == 1 ? "" : "s");
+        }
+    }
+    int32_t const planCell = xCell(obs.x, m_cfg.cellSize);
+    int const plannedHold = m_plan.holdFor(obs.tick);
+    // A still-valid, safe plan made by a trusted model is followed for the
+    // step it planned for (also between cells, where the state key does not
+    // change), without a new search. It is re-made every planFollowSteps
+    // steps, near danger, when the plan runs short, or during an experiment.
+    bool const following = watched && !planInvalidated && !m_danger && plannedHold >= 0 && m_plan.plan().followable &&
+                           m_plan.age(obs.tick) >= 1 && m_predictor->trusted(obs.mode, obs.mini) &&
+                           m_plan.age(obs.tick) < m_cfg.planFollowSteps && m_plan.remaining(obs.tick) > m_cfg.planMinLeft &&
+                           m_plan.plan().outcome == Certainty::Safe && !m_activeExp.covers(planCell);
+    if (!following && !planInvalidated && key == m_curKey && obs.tick - m_lastDecisionTick < m_cfg.maxStickTicks &&
+        !(watched && (m_danger || offPath || m_plan.active())))
+        return holdingNow;
 
     if (!m_steps.empty()) m_steps.back().reward += progressReward(obs.x - m_steps.back().x);
 
@@ -311,7 +353,25 @@ bool Agent::act(Observation const& obs) {
     // Trajectory prediction for both actions, used to vet alternatives and to
     // find the deciding decision afterwards.
     Predictor::Advice const* adv = nullptr;
-    if (m_predictor && m_cfg.usePrediction && !obs.obstacles.empty()) {
+    if (following) {
+        a = plannedHold;
+        decided = true;
+        src = DecisionSource::Plan;
+        ++m_status.decisionsFollowingPlan;
+    } else if (m_predictor && m_cfg.usePrediction && !obs.obstacles.empty()) {
+        // A press timing learned for this kind of obstacle is tried first by
+        // the search (and only used if it simulates well).
+        if (needsGroundToAct(obs.mode) && obs.onGround && obs.hazard.present && obs.hazard.dx > 0.f && m_patterns) {
+            float lead = -1.f;
+            auto sit = m_patterns->situationLeads.find(obstacleKey(obs));
+            if (sit != m_patterns->situationLeads.end() && sit->second.count >= 2) lead = static_cast<float>(sit->second.mean());
+            else {
+                auto lt = m_patterns->leads.find(timingKey(obs.mode, obs.speedClass(), obs.mini));
+                if (lt != m_patterns->leads.end() && lt->second.count >= 3) lead = static_cast<float>(lt->second.mean());
+            }
+            float const vx = unitsPerSecond(obs.speedClass()) / static_cast<float>(kTicksPerSecond);
+            if (lead > 0.f) m_predictor->setHint(static_cast<int32_t>(std::lround((obs.hazard.dx - lead) / vx)));
+        }
         adv = &m_predictor->advise(obs, holdingNow, !m_danger && !offPath);
         m_status.predictionValid = adv->valid;
         m_status.predictionTrusted = adv->trusted;
@@ -326,13 +386,45 @@ bool Agent::act(Observation const& obs) {
     auto predicted = [&](int k) { return k ? adv->press : adv->release; };
 
     int32_t cell = xCell(obs.x, m_cfg.cellSize);
-    if (m_activeExp.tests(cell)) {
+    if (m_activeExp.tests(cell) && cell == m_activeExp.testFrom && !m_expChecked) {
+        // A learned test sequence is only meaningful in the state it was
+        // planned for: at its first changed cell the player must be exactly
+        // where the reference attempt was. Otherwise it is cancelled (and
+        // retried on a later attempt), instead of being played into a
+        // situation it was not made for.
+        m_expChecked = true;
+        // Materially different: another game mode, or - for jump-type modes,
+        // where a press only acts on the ground - grounded vs. airborne or
+        // another height. (Flying-mode tests hold or release over a range of
+        // cells, which does not depend on the exact altitude.)
+        size_t const ei = static_cast<size_t>(cell - m_activeExp.fromCell);
+        uint64_t const ref = m_activeExp.baseKeyAt(cell);
+        bool const groundMode = needsGroundToAct(obs.mode);
+        bool const differs = ref != 0 && ei < m_activeExp.baseYs.size() &&
+                             (keyMode(ref) != keyMode(key) ||
+                              (groundMode && ((m_activeExp.baseGround[ei] != 0) != obs.onGround ||
+                                              std::fabs(m_activeExp.baseYs[ei] - obs.y) > 4.f)));
+        if (differs) {
+            ++m_status.experimentsCancelled;
+            m_status.planEvent = fmt("Experiment cancelled: the state at its first changed cell differs from the reference attempt (%s)",
+                                     m_activeExp.description.c_str());
+            // Its search was built on a reference attempt the AI no longer
+            // plays like: start that search again from current play (the
+            // next death there) instead of re-testing the outdated sequence.
+            for (auto sr = m_searches.begin(); sr != m_searches.end();)
+                sr = std::abs(sr->first - m_activeExp.hotspot) <= 1 ? m_searches.erase(sr) : std::next(sr);
+            for (auto sr = m_parked.begin(); sr != m_parked.end();)
+                sr = std::abs(sr->first - m_activeExp.hotspot) <= 1 ? m_parked.erase(sr) : std::next(sr);
+            m_activeExp = {};
+        }
+    }
+    if (!following && m_activeExp.tests(cell)) {
         // The one change the experiment is testing.
         a = m_activeExp.actionAt(cell);
         forced = true;
         decided = true;
         src = DecisionSource::Experiment;
-    } else if (m_activeExp.covers(cell) && m_activeExp.baseKeyAt(cell) == key) {
+    } else if (!following && m_activeExp.covers(cell) && m_activeExp.baseKeyAt(cell) == key) {
         // Same state as in the reference attempt: do the same, so the
         // experiment's result is a fair comparison. In any other state the
         // decision is made normally.
@@ -342,7 +434,7 @@ bool Agent::act(Observation const& obs) {
         src = DecisionSource::Reference;
     }
 
-    {
+    if (!following) {
         // Contextual failure memory: has this decision, in exactly this state,
         // been identified as the cause of deaths, again and again? This
         // applies to every source, including experiments and reference
@@ -415,7 +507,7 @@ bool Agent::act(Observation const& obs) {
     // Never toggle faster than the configured minimum (prevents input spam).
     // Applied before the safety check, so that the check judges the action
     // that will really be executed; the check itself may override it.
-    if (a != m_curAction && obs.tick - m_lastToggleTick < m_cfg.minToggleTicks) {
+    if (!following && a != m_curAction && obs.tick - m_lastToggleTick < m_cfg.minToggleTicks) {
         a = m_curAction;
         forced = false;
         explored = false;
@@ -583,7 +675,7 @@ bool Agent::act(Observation const& obs) {
             m_danger = margin(0) < m_cfg.dangerWindowSteps;
         }
         m_status.trust.clear();
-    } else if (m_predictor && m_cfg.usePrediction && (!adv || !adv->valid) && m_predictor->trusted(obs.mode, obs.mini) && a == 1 &&
+    } else if (!following && m_predictor && m_cfg.usePrediction && (!adv || !adv->valid) && m_predictor->trusted(obs.mode, obs.mini) && a == 1 &&
                !holdingNow && obs.onGround &&
                needsGroundToAct(obs.mode) && src != DecisionSource::Experiment && e->streak[0] == 0 &&
                (m_curAction == 0 || obs.tick - m_lastToggleTick >= m_cfg.minToggleTicks)) {
@@ -608,8 +700,29 @@ bool Agent::act(Observation const& obs) {
             rec.reason = "Prediction not used: " + m_status.trust;
         }
     }
+    if (following) {
+        rec.verdict = SafetyVerdict::Clear;
+        rec.trusted = true;
+        rec.predictionValid = true;
+        rec.reason = fmt("Following the plan made %d steps ago (state as expected: height %+.1f, %s)", m_plan.age(obs.tick),
+                         m_plan.lastCheck.dy, obs.onGround ? "on the ground" : "in the air");
+    }
     rec.executed = static_cast<uint8_t>(a);
     if (a == 1 && m_curAction == 0) ++m_status.pressesThisAttempt;
+    // The executed action's predicted path becomes the live plan (made by a
+    // trusted model from exactly this state); without one there is no plan.
+    if (!following && m_predictor) {
+        // the path of the action executed now (its first planned input must be exactly that action)
+        PredictedPath const& mine = a ? m_predictor->pressPath() : m_predictor->releasePath();
+        size_t const first = static_cast<size_t>(m_predictor->inputLatency());
+        bool const matches = mine.holds.size() > first && mine.holds[first] == static_cast<uint8_t>(a);
+        if (adv && trusted && adv->computedTick == obs.tick && matches) {
+            bool const byPrediction = src == DecisionSource::Planner || src == DecisionSource::Shield || src == DecisionSource::Economy;
+            m_plan.adopt(mine, obs, obs.tick, adv->fromSeed ? PlanSource::Learned : PlanSource::Search, *adv, byPrediction);
+        } else if (m_plan.active()) {
+            m_plan.release(obs.tick, trusted ? "replaced" : "no trusted prediction: the learned policy decides");
+        }
+    }
     if (rec.verdict == SafetyVerdict::Overridden) ++m_status.overridesThisAttempt;
     if (rec.verdict == SafetyVerdict::NoSafeOption) ++m_status.noSafeOptionThisAttempt;
     if (rec.verdict != SafetyVerdict::Clear && rec.verdict != SafetyVerdict::NoPrediction && rec.verdict != SafetyVerdict::NoInputNeeded) {
@@ -629,7 +742,7 @@ bool Agent::act(Observation const& obs) {
         m_lastToggleTick = obs.tick;
         m_inputs.emplace_back(obs.x, static_cast<uint8_t>(a));
         if (a == 1 && obs.hazard.present && obs.hazard.dx >= 0.f && obs.hazard.dx < 6.f * kBlock && m_leads.size() < 8) {
-            m_leads.push_back({obs.x + obs.hazard.dx, obs.hazard.dx, timingKey(obs.mode, obs.speedClass(), obs.mini)});
+            m_leads.push_back({obs.x + obs.hazard.dx, obs.hazard.dx, timingKey(obs.mode, obs.speedClass(), obs.mini), obstacleKey(obs)});
         }
     }
 
@@ -920,6 +1033,7 @@ Agent::ActionTrace Agent::buildTrace(float endX) const {
     t.actions.assign(static_cast<size_t>(endCell - t.startCell + 1), 0);
     t.ground.assign(t.actions.size(), 1);
     t.keys.assign(t.actions.size(), 0);
+    t.ys.assign(t.actions.size(), 0.f);
     t.endX = endX;
     // The action recorded for a cell is the one active at the cell's centre.
     size_t j = 0;
@@ -931,6 +1045,7 @@ Agent::ActionTrace Agent::buildTrace(float endX) const {
         t.actions[i] = covered ? m_steps[j].action : 0;
         t.ground[i] = covered ? (m_steps[j].onGround ? 1 : 0) : 1;
         t.keys[i] = covered ? m_steps[j].key : 0;
+        t.ys[i] = covered ? m_steps[j].y : 0.f;
     }
     return t;
 }
@@ -1475,9 +1590,17 @@ void Agent::buildExperiment(Search const& s, ActionTrace const& base, FailureRep
     ex.toCell = std::max(deathCell + 3, s.blockEnd + std::max(0, s.shift) + 1);
     ex.actions.resize(static_cast<size_t>(ex.toCell - ex.fromCell + 1));
     ex.baseKeys.resize(ex.actions.size());
+    ex.baseYs.resize(ex.actions.size(), 0.f);
+    ex.baseGround.resize(ex.actions.size(), 1);
     for (int32_t c = ex.fromCell; c <= ex.toCell; ++c) {
-        ex.actions[static_cast<size_t>(c - ex.fromCell)] = base.at(c);
-        ex.baseKeys[static_cast<size_t>(c - ex.fromCell)] = base.keyAt(c);
+        size_t const i = static_cast<size_t>(c - ex.fromCell);
+        ex.actions[i] = base.at(c);
+        ex.baseKeys[i] = base.keyAt(c);
+        size_t const bi = static_cast<size_t>(c - base.startCell);
+        if (c >= base.startCell && bi < base.ys.size()) {
+            ex.baseYs[i] = base.ys[bi];
+            ex.baseGround[i] = base.ground[bi];
+        }
     }
     // The cells that make up the change being tested.
     switch (s.type) {

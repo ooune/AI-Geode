@@ -69,7 +69,9 @@ void buildOverlay(PredictedPath const& main, PredictedPath const* alternative, s
 // action if wanted, and a label with the action, its safety, the time to a
 // collision and whether the safety layer overrode the policy. Returns false
 // when there is nothing current to show (the label then says why).
+// While the AI follows its live plan, `plan` is drawn from the current step
+// on instead (the path that is actually being followed).
 bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decision, int32_t nowTick, bool showAlternative,
-                          std::span<Obstacle const> obstacles, OverlayGeometry& out);
+                          std::span<Obstacle const> obstacles, OverlayGeometry& out, LivePlan const* plan = nullptr);
 
 } // namespace aigd

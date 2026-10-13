@@ -32,6 +32,7 @@ struct Obj {
     ObjKind kind;
     float x, y, w, h; // bottom-left corner and size
     GameMode mode = GameMode::Cube; // for mode portals
+    bool hidden = false;            // solid in the world, but not reported to the AI (tests the unexpected)
 };
 
 struct Level {
@@ -43,6 +44,9 @@ struct Level {
     void spike(float bx, float by = 0.f) { objs.push_back({ObjKind::Spike, bx * 30.f, by * 30.f, 30.f, 30.f}); }
     void block(float bx, float by = 0.f, float bw = 1.f, float bh = 1.f) {
         objs.push_back({ObjKind::Block, bx * 30.f, by * 30.f, bw * 30.f, bh * 30.f});
+    }
+    void hiddenBlock(float bx, float by = 0.f, float bw = 1.f, float bh = 1.f) {
+        objs.push_back({ObjKind::Block, bx * 30.f, by * 30.f, bw * 30.f, bh * 30.f, GameMode::Cube, true});
     }
     void modePortal(float bx, GameMode m) { objs.push_back({ObjKind::ModePortal, bx * 30.f, 0.f, 30.f, 600.f, m}); }
     void shipPortal(float bx) { modePortal(bx, GameMode::Ship); }
@@ -152,6 +156,7 @@ public:
         for (auto const& o : m_level.objs) {
             if (o.x > x1) break;
             if (o.x + o.w < x0) continue;
+            if (o.hidden) continue;
             aigd::Obstacle ob;
             if (o.kind == ObjKind::Spike) {
                 Rect r = spikeHitbox(o);

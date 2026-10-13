@@ -83,6 +83,8 @@ public:
     std::string const& notice() const { return m_notice; }
     size_t indexedObjects() const { return m_observer.indexedObjects(); }
     aigd::Predictor const& predictor() const { return m_predictor; }
+    aigd::PlanManager const& plans() const { return m_agent.plans(); }
+    int32_t lastTick() const { return m_lastTick; }
     size_t obstacleCount() const { return m_obstacles.size(); }
     // Fills the trajectory overlay for the current plan; false = draw nothing.
     bool overlayGeometry(aigd::OverlayGeometry& out) const;

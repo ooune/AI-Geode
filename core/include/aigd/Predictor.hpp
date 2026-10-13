@@ -31,11 +31,17 @@ struct Plan {
                               // teleport; at least 2 steps), -1 = keep holding to the end
     int32_t repeatEvery = 0;  // press again this many steps after each press started (0 = once)
     bool rejump = false;      // cube/robot: keep holding through the first landing (jump again)
+    int32_t secondAt = -1;    // cube/robot: a second press this many steps after the first landing (-1 none)
 };
+
+// How far the timing search got for one decision.
+enum class SearchStage : uint8_t { None = 0, Coarse, Refined, TwoJump };
+char const* searchStageName(SearchStage s);
 
 struct PredictedPath {
     std::vector<PathPoint> points; // one per simulated step, world coordinates
     std::vector<uint8_t> holds;    // button state used at each simulated step
+    std::vector<uint8_t> ground;   // on the ground (or a block) after each simulated step
     Plan plan;
     Certainty outcome = Certainty::Safe;
     int32_t collisionStep = -1;    // first step with a (definite or potential) collision
@@ -45,6 +51,7 @@ struct PredictedPath {
     int32_t uncertainFrom = -1;    // step where an unmodelled object / unknown surface was reached
     bool landed = false;
     float landX = 0.f, landY = 0.f;
+    int32_t landStep = -1;         // simulated step of the first landing
     float clearance = 1e9f;        // smallest gap to a hazard (or the side of a block) along the path
     int32_t steps = 0;
     int presses = 0;               // new presses the path makes (inputs it costs)
@@ -115,6 +122,17 @@ public:
         int32_t neverTTC = -1;
         int32_t neverRisk = -1;
         int32_t computedTick = INT32_MIN; // the tick whose state this was simulated from
+        // The search (diagnostics, tests)
+        SearchStage stage = SearchStage::None;
+        Plan bestPlan;                   // best plan overall (its first action is bestPresses)
+        float bestScore = 0.f;
+        bool bestLanded = false;
+        float bestLandX = 0.f;
+        int firstSafeSim = -1;           // simulations needed until the first fully safe candidate
+        bool seeded = false;             // a learned timing was tried first
+        bool fromSeed = false;           // ... and the chosen timing is (within the resolution of) it
+        bool budgetHit = false;          // the computation budget ended the search early
+        int resolution = 1;              // smallest timing step the search refined to
         bool reused = false;             // carried over from an earlier tick (not recomputed)
         int simulations = 0;
         float micros = 0.f;
@@ -134,6 +152,14 @@ public:
     SimStart startFrom(Observation const& obs, bool holding) const;
 
     void setHorizon(int steps) { m_horizon = std::max(30, std::min(steps, 480)); }
+    // Most simulations per decision (bounded work per game update). Near an
+    // imminent hazard a smaller share is used, to find a viable action fast.
+    void setBudget(int sims) { m_budget = std::max(16, sims); }
+    int budget() const { return m_budget; }
+    // A press delay (steps from now) that worked before in a comparable
+    // situation. It is evaluated first, like any other candidate; it is never
+    // executed without being simulated. Applies to the next advise() only.
+    void setHint(int32_t pressAt) { m_hint = pressAt; }
     int horizon() const { return m_horizon; }
     bool trusted(GameMode mode, bool mini) const;
     bool trusted(bool mini) const { return trusted(GameMode::Cube, mini); }
@@ -179,6 +205,8 @@ public:
     PredictedPath const& otherPath() const { return m_executedPress ? m_release : m_press; }
     PredictedPath const& keepPath() const { return m_keep; }
     PredictedPath const& neverPath() const { return m_never; }
+    // The search's objective for a simulated path (safety, capped clearance, input cost).
+    float scoreOf(PredictedPath const& p) const { return score(p); }
 
     // Accuracy of the model against the real game (measured continuously by
     // re-simulating recent real steps with the inputs actually used).
@@ -230,6 +258,9 @@ private:
 
     PhysicsModel& m_model;
     int m_horizon = 180;
+    int m_budget = 200;
+    int m_budgetNow = 200;
+    int32_t m_hint = -1;
     float m_caution = 1.f;
     uint32_t m_mispredictions = 0;
     uint64_t m_totalSims = 0;

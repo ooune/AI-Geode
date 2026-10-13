@@ -69,6 +69,15 @@ SimStart Predictor::startFrom(Observation const& obs, bool holding) const {
     return s;
 }
 
+char const* searchStageName(SearchStage s) {
+    switch (s) {
+        case SearchStage::Coarse: return "coarse";
+        case SearchStage::Refined: return "refined";
+        case SearchStage::TwoJump: return "two jumps";
+        default: return "-";
+    }
+}
+
 bool Predictor::sentAt(int32_t step, int currentFrom, bool current) const {
     if (step >= currentFrom) return current;
     // records are newest first; record j covers the steps (tick_{j+1}, tick_j]
@@ -119,6 +128,7 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
 
     out.points.clear();
     out.holds.clear();
+    out.ground.clear();
     out.plan = plan;
     out.outcome = Certainty::Safe;
     out.collisionStep = -1;
@@ -179,6 +189,9 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
 
     int const lag = holds.empty() ? std::clamp(s.lag, 0, 4) : 0;
     out.presses = 0;
+    out.landStep = -1;
+    int32_t secondPress = -1;   // plan step of the second press (set at the first landing)
+    bool jumped = false;
     for (int step = 0; step < steps; ++step) {
         bool hold;
         int const ps = step - lag; // plan step
@@ -187,6 +200,12 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
         } else if (ps < 0) {
             hold = s.pending[step] != 0;
         } else {
+            if (secondPress >= 0 && ps == secondPress) {
+                pressActive = true;
+                pressStart = ps;
+                effects = 0;
+                secondPress = -2;
+            }
             if (nextPress >= 0 && ps == nextPress) {
                 pressActive = true;
                 pressStart = ps;
@@ -400,6 +419,7 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
         }
 
         out.points.push_back({x, y});
+        out.ground.push_back(onGround ? 1 : 0);
         out.steps = step + 1;
         if (definite || stop) break;
 
@@ -414,11 +434,16 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
             }
             if (!sup) onGround = false;
         }
+        if (effect) jumped = true;
         if (wasAir && onGround && !out.landed) {
             out.landed = true;
             out.landX = x;
             out.landY = y;
+            out.landStep = step;
         }
+        if (wasAir && onGround && jumped && plan.secondAt >= 0 && secondPress == -1 && holds.empty() && ps >= 0)
+            secondPress = ps + 1 + plan.secondAt;
+        out.ground.back() = onGround ? 1 : 0; // after walking off an edge
     }
 
     if (definite) out.outcome = Certainty::Collision;
@@ -457,9 +482,14 @@ bool Predictor::offPredictedPath(Observation const& obs) const {
 
 void Predictor::evaluate(SimStart const& s, std::span<Obstacle const> obs, Plan const& plan, PredictedPath& tmp,
                          PredictedPath& best, bool& haveBest, int branch) {
+    if (haveBest && m_advice.simulations >= m_budgetNow) {
+        m_advice.budgetHit = true; // bounded work per decision
+        return;
+    }
     simulate(s, obs, plan, tmp);
     ++m_advice.simulations;
     ++m_totalSims;
+    if (tmp.outcome == Certainty::Safe && m_advice.firstSafeSim < 0) m_advice.firstSafeSim = m_advice.simulations;
     if (tmp.outcome != Certainty::Collision) {
         // How long this plan keeps the branch's first button state.
         size_t const first = static_cast<size_t>(std::clamp(s.lag, 0, 4));
@@ -485,7 +515,8 @@ void Predictor::evaluate(SimStart const& s, std::span<Obstacle const> obs, Plan 
 
 Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding, bool allowReuse) {
     // The same state again in the same tick: nothing can have changed.
-    if (sameState(obs, holding) && (allowReuse || m_computedTick == obs.tick)) return m_advice;
+    // (A new learned-timing hint always gets a fresh search.)
+    if (sameState(obs, holding) && (allowReuse || m_computedTick == obs.tick) && m_hint < 0) return m_advice;
     // Reuse the last plan where re-planning cannot change anything (or every
     // other step for continuously controlled modes) - but never while a
     // collision is near, and never once the player is not where the executed
@@ -521,6 +552,9 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     m_computedMode = obs.mode;
     m_adviceHolding = holding;
     m_advice.computedTick = obs.tick;
+    m_budgetNow = m_budget;
+    int32_t const hint = m_hint;
+    m_hint = -1;
     m_stateX = obs.x;
     m_stateY = obs.y;
     m_stateVy = obs.vy;
@@ -588,6 +622,14 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     // Pressing at step k behaves exactly like never pressing up to step k: if
     // "never" already collides by then, so does every later k (no need to simulate).
     int32_t const neverHit = m_release.outcome == Certainty::Collision ? m_release.collisionStep : INT32_MAX;
+    // Near an imminent hazard: find a viable action fast rather than the
+    // finest one.
+    if (neverHit < 30) m_budgetNow = std::min(m_budget, m_advice.simulations + 48);
+    // Timing resolution the model and the real decision rate support: no
+    // single-step refinement when the AI only acts every ~2 steps or the
+    // model drifts.
+    int const res = std::max(1, static_cast<int>(std::lround(m_interval)) + (m_model.driftPerTick(s.mode) > 0.05f ? 1 : 0));
+    m_advice.resolution = res;
 
     // continuation shapes tried for each delay
     std::array<Plan, 3> shapes{};
@@ -605,9 +647,21 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
         int k;
         size_t shape;
         Certainty outcome;
+        bool clearedFirst = false; // jumped, landed, and only ran into something after landing
     };
     std::array<Tried, 64> tried{};
     size_t nTried = 0;
+    // A timing learned in comparable situations goes first (verified by
+    // simulation like everything else, never forced).
+    if (hint > 0 && hint < m_horizon && hint <= neverHit) {
+        m_advice.seeded = true;
+        for (int d : {0, -res, res}) {
+            if (hint + d < 1) continue;
+            Plan p = shapes[0];
+            p.pressAt = hint + d;
+            evaluate(s, span, p, m_tmp, m_release, haveRelease, 0);
+        }
+    }
     for (int k : kCoarseDelays) {
         if (k >= m_horizon) break;
         for (size_t si = 0; si < nShapes; ++si) {
@@ -616,14 +670,19 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
             Plan p = shapes[si];
             p.pressAt = k;
             Certainty out;
+            bool cleared = false;
             if (k > neverHit) {
                 out = Certainty::Collision;
             } else {
+                int const simsBefore = m_advice.simulations;
                 evaluate(s, span, p, m_tmp, m_release, haveRelease, 0);
                 bool kept = m_release.plan.pressAt == k && m_release.plan.holdFor == p.holdFor && m_release.plan.repeatEvery == p.repeatEvery;
-                out = kept ? m_release.outcome : m_tmp.outcome;
+                PredictedPath const& r = kept ? m_release : m_tmp;
+                out = r.outcome;
+                cleared = m_advice.simulations > simsBefore && r.outcome != Certainty::Safe && r.landed && r.landStep >= 0 &&
+                          r.collisionStep > r.landStep;
             }
-            if (nTried < tried.size()) tried[nTried++] = {k, si, out};
+            if (nTried < tried.size()) tried[nTried++] = {k, si, out, cleared};
         }
     }
     // Refine: single-step resolution around the best delay and wherever the
@@ -640,7 +699,7 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
         size_t si = 0;
         for (size_t i = 0; i < nShapes; ++i)
             if (shapes[i].holdFor == m_release.plan.holdFor && shapes[i].repeatEvery == m_release.plan.repeatEvery) si = i;
-        for (int d : {-2, -1, 1, 2}) addRefine(m_release.plan.pressAt + d, si);
+        for (int d : {-2 * res, -res, res, 2 * res}) addRefine(m_release.plan.pressAt + d, si);
     }
     for (size_t i = 1; i < nTried; ++i) {
         for (size_t j = i; j-- > 0;) {
@@ -658,6 +717,106 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
         Plan p = m_release.plan;
         p.rejump = true;
         evaluate(s, span, p, m_tmp, m_release, haveRelease, 0);
+    }
+    m_advice.stage = nRefine > 0 ? SearchStage::Refined : SearchStage::Coarse;
+
+    // ---- Consecutive obstacles: a second jump after the first landing ----
+    // A plan whose first jump lands and then runs into the next obstacle gets
+    // a second press, timed from its landing (coarse, then refined). The pair
+    // is scored as a whole (two presses cost two inputs), so a first-jump
+    // timing that sets up an easy second jump beats one that only clears the
+    // first obstacle - also a later first jump than the earliest that works.
+    // Only when no single-jump plan is safe: otherwise the second jump is a
+    // later decision (and the search stays cheap).
+    if ((s.mode == GameMode::Cube || s.mode == GameMode::Robot) && !m_advice.budgetHit && m_press.outcome != Certainty::Safe &&
+        m_release.outcome != Certainty::Safe) {
+        auto needsSecond = [](PredictedPath const& p) {
+            return p.outcome != Certainty::Safe && p.landed && p.landStep >= 0 && p.collisionStep > p.landStep;
+        };
+        struct Base {
+            Plan plan;
+            int branch;
+        };
+        std::array<Base, 6> bases{};
+        size_t nBases = 0;
+        if (needsSecond(m_press) && !m_press.plan.rejump) bases[nBases++] = {m_press.plan, 1};
+        // First-jump timings that cleared the first obstacle and only ran into
+        // the next one after landing: a spread of them (earliest, middle,
+        // latest), not just the one that happened to collide latest.
+        std::array<int, 64> cleared{};
+        size_t nCleared = 0;
+        for (size_t i = 0; i < nTried; ++i)
+            if (tried[i].clearedFirst && tried[i].shape == 0 && nCleared < cleared.size()) cleared[nCleared++] = tried[i].k;
+        std::sort(cleared.begin(), cleared.begin() + static_cast<std::ptrdiff_t>(nCleared));
+        for (size_t idx : {size_t(0), nCleared / 3, (2 * nCleared) / 3, nCleared ? nCleared - 1 : 0}) {
+            if (idx >= nCleared || nBases >= bases.size()) continue;
+            Plan p = shapes[0];
+            p.pressAt = cleared[idx];
+            bool dup = false;
+            for (size_t b = 0; b < nBases; ++b) dup = dup || (bases[b].branch == 0 && bases[b].plan.pressAt == p.pressAt);
+            if (!dup) bases[nBases++] = {p, 0};
+        }
+        if (needsSecond(m_release) && !m_release.plan.rejump && m_release.plan.pressAt > 0 && nBases < bases.size()) {
+            bool dup = false;
+            for (size_t b = 0; b < nBases; ++b) dup = dup || (bases[b].branch == 0 && bases[b].plan.pressAt == m_release.plan.pressAt);
+            if (!dup) bases[nBases++] = {m_release.plan, 0};
+        }
+        bool improved = false;
+        Plan bestPair;
+        float bestPairScore = -1e9f;
+        int bestPairBranch = -1;
+        auto tryPair = [&](Plan const& p, int branch) {
+            PredictedPath& best = branch ? m_press : m_release;
+            bool& have = branch ? havePress : haveRelease;
+            float const prev = score(best);
+            int const simsBefore = m_advice.simulations;
+            evaluate(s, span, p, m_tmp, best, have, branch);
+            if (m_advice.simulations == simsBefore) return -1e9f; // budget
+            bool const kept = best.plan.pressAt == p.pressAt && best.plan.secondAt == p.secondAt;
+            float const sc = kept ? score(best) : score(m_tmp);
+            if (score(best) > prev) improved = true;
+            if (sc > bestPairScore) {
+                bestPairScore = sc;
+                bestPair = p;
+                bestPairBranch = branch;
+            }
+            return sc;
+        };
+        for (size_t b = 0; b < nBases; ++b) {
+            int bestK2 = -1;
+            float bestHere = -1e9f;
+            for (int k2 : {0, 4, 8, 12, 18, 26, 36, 50}) {
+                Plan p = bases[b].plan;
+                p.secondAt = k2;
+                float sc = tryPair(p, bases[b].branch);
+                if (sc > bestHere) {
+                    bestHere = sc;
+                    bestK2 = k2;
+                }
+            }
+            for (int d : {-2 * res, -res, res, 2 * res}) {
+                if (bestK2 < 0 || bestK2 + d < 0) continue;
+                Plan p = bases[b].plan;
+                p.secondAt = bestK2 + d;
+                tryPair(p, bases[b].branch);
+            }
+        }
+        // Refine the best pair's first jump too (a slightly later or earlier
+        // first jump can make the landing, and so the second jump, better).
+        if (bestPairBranch == 0 && bestPair.pressAt > 0) {
+            Plan const center = bestPair;
+            for (int d : {-2 * res, -res, res, 2 * res}) {
+                if (center.pressAt + d < 1 || center.pressAt + d > neverHit) continue;
+                for (int d2 : {-res, 0, res}) {
+                    if (center.secondAt + d2 < 0) continue;
+                    Plan p = center;
+                    p.pressAt += d;
+                    p.secondAt += d2;
+                    tryPair(p, 0);
+                }
+            }
+        }
+        if (improved && (m_press.plan.secondAt >= 0 || m_release.plan.secondAt >= 0)) m_advice.stage = SearchStage::TwoJump;
     }
 
     m_advice.press = m_press.outcome;
@@ -692,6 +851,14 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     m_bestPresses = reallyWaits ? score(m_press) > score(m_release) + 1.f : score(m_press) + 1.f >= score(m_release);
     m_advice.bestPresses = m_bestPresses;
     m_advice.bestPressAt = m_bestPresses ? 0 : m_release.plan.pressAt;
+    {
+        PredictedPath const& b = m_bestPresses ? m_press : m_release;
+        m_advice.bestPlan = b.plan;
+        m_advice.bestScore = score(b);
+        m_advice.bestLanded = b.landed;
+        m_advice.bestLandX = b.landX;
+        m_advice.fromSeed = m_advice.seeded && !m_bestPresses && hint > 0 && std::abs(b.plan.pressAt - hint) <= res;
+    }
 
     if (groundOnly(s.mode) && !s.onGround && !holding && !m_bestPresses && m_release.landed) {
         int32_t landStep = 0;

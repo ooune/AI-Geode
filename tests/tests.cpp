@@ -2023,16 +2023,27 @@ StubbornRun runStubborn(Agent& agent, LevelMemory& mem, sim::Level const& level,
             if (rec.verdict == SafetyVerdict::NoInputNeeded) ++r.pressesSkipped;
             if (rec.verdict == SafetyVerdict::Overridden) ++r.overrideRecords;
             OverlayGeometry g;
-            if (buildDecisionOverlay(rig.predictor, rec, o.tick, false, o.obstacles, g)) {
-                bool const mainIsExecuted = !rig.predictor.executedPath().holds.empty() &&
-                                            (rig.predictor.executedPath().holds.front() != 0) == hold;
+            if (buildDecisionOverlay(rig.predictor, rec, o.tick, false, o.obstacles, g, &agent.plans().plan())) {
+                bool const mainIsExecuted = rec.proposedSource == DecisionSource::Plan
+                                                ? agent.plans().holdFor(o.tick) == (hold ? 1 : 0)
+                                                : (!rig.predictor.executedPath().holds.empty() &&
+                                                   (rig.predictor.executedPath().holds.front() != 0) == hold);
                 if (g.selectedPress != hold || !mainIsExecuted) ++r.overlayMismatches;
                 bool saysOverride = g.label.find("SAFETY OVERRIDE") != std::string::npos;
                 if (saysOverride != (rec.verdict == SafetyVerdict::Overridden)) ++r.overlayMismatches;
             }
         }
         r.wanted.push_back(static_cast<uint8_t>(a < 0 ? (hold ? 1 : 0) : a));
-        if (hold && (r.applied.empty() || r.applied.back() == 0)) ++r.presses;
+        if (hold && (r.applied.empty() || r.applied.back() == 0)) {
+            ++r.presses;
+            if (std::getenv("AIGD_PRESS_DEBUG")) {
+                auto const& pl = agent.plans().plan();
+                std::printf("      press t=%d x=%.1f %s src=%s plan(k=%d hold=%d second=%d stage=%s age=%d) | %s\n", o.tick, o.x,
+                            o.onGround ? "ground" : "air", decisionSourceName(agent.status().safety.proposedSource), pl.params.pressAt,
+                            pl.params.holdFor, pl.params.secondAt, searchStageName(pl.stage), agent.plans().age(o.tick),
+                            agent.status().safety.reason.c_str());
+            }
+        }
         r.applied.push_back(hold ? 1 : 0);
         if (a >= 0 && (hold ? 1 : 0) != a) {
             ++r.overridden;
@@ -2722,6 +2733,354 @@ TEST(game_like_frame_gaps_keep_predictions_trusted) {
         CHECK(done > 0);
         CHECK(trusted > untrusted);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Live plan, cancellation and timing optimisation (v0.3)
+
+namespace {
+// One planner-driven attempt (no learned opinion), recording what the live
+// plan did on every step.
+struct PlanRun {
+    bool completed = false, died = false;
+    int presses = 0;
+    int cancelTick = -1;                 // first plan invalidation
+    std::string cancelReason;
+    int cancelledActions = 0;
+    bool replannedSameTick = false;      // a full decision at the cancellation tick
+    bool newPlanFromActualState = false; // the next plan starts from the real (landed) state
+    int stalePlanInputs = 0;             // inputs from a plan made before the cancellation, executed after it
+    int contradictions = 0;              // executed input disagreeing with the record / the plan followed
+    int followed = 0;
+    int maxSims = 0;
+};
+
+PlanRun runPlanned(Agent& agent, sim::Level const& level, PredictionRig& rig, int maxTicks = 20000) {
+    PlanRun r;
+    sim::World w(level);
+    rig.held = false;
+    agent.beginAttempt(rig.observe(w), false);
+    bool prevHold = false;
+    for (int t = 0; t < maxTicks; ++t) {
+        Observation o = rig.observe(w);
+        rig.predictor.observe(o, rig.held);
+        uint32_t const before = agent.plans().invalidated;
+        bool hold = agent.act(o);
+        auto const& rec = agent.status().safety;
+        auto const& plans = agent.plans();
+        if (plans.invalidated > before && r.cancelTick < 0) {
+            r.cancelTick = o.tick;
+            r.cancelReason = plans.lastInvalidation.reason;
+            r.cancelledActions = plans.lastInvalidation.cancelled;
+            r.replannedSameTick = rec.tick == o.tick && rec.proposedSource != DecisionSource::Plan;
+            r.newPlanFromActualState = plans.active() && plans.plan().createdTick == o.tick &&
+                                       std::fabs(plans.plan().startY - o.y) < 0.01f && plans.plan().startGrounded == o.onGround;
+        }
+        if (rec.tick == o.tick) {
+            if ((rec.executed != 0) != hold) ++r.contradictions;
+            if (rec.proposedSource == DecisionSource::Plan) {
+                ++r.followed;
+                if (plans.holdFor(o.tick) != (hold ? 1 : 0)) ++r.contradictions;
+                if (r.cancelTick >= 0 && plans.plan().createdTick < r.cancelTick && hold != prevHold) ++r.stalePlanInputs;
+            }
+        }
+        r.maxSims = std::max(r.maxSims, rig.predictor.lastAdvice().simulations);
+        if (hold && !prevHold) ++r.presses;
+        prevHold = hold;
+        rig.held = hold;
+        w.step(hold);
+        if (w.dead()) {
+            r.died = true;
+            agent.onDeath(w.observe(), w.death());
+            return r;
+        }
+        if (w.complete()) {
+            r.completed = true;
+            agent.onComplete(w.observe());
+            return r;
+        }
+    }
+    agent.abortAttempt(nullptr);
+    return r;
+}
+} // namespace
+
+TEST(plan_early_landing_cancels_the_obsolete_plan) {
+    // Scenarios 1-3 and 7. The jump over the first spike is planned to land
+    // on the floor, with a second jump after landing for the next spike. A
+    // block the AI cannot see makes it land earlier. The landing is detected
+    // from the real state, the pending second press of the old plan is
+    // cancelled (never executed), and the next decision is made from the
+    // actual landed state at once. Learning records are kept.
+    PredictionRig rig;
+    warmUp(rig);
+    sim::Level level;
+    level.name = "early-landing";
+    level.spike(10.f);
+    level.hiddenBlock(11.6f, 0.f, 1.4f, 1.f); // the unexpected landing spot
+    level.spike(15.f);
+    level.finish(26.f);
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = runPlanned(agent, level, rig);
+    auto const& plans = agent.plans();
+    std::printf("    %s; first invalidation at step %d: \"%s\", %d pending action(s) cancelled; replanned in the same step: %s, "
+                "new plan from the landed state: %s; old-plan inputs executed afterwards: %d; %d decisions followed a plan\n",
+                r.completed ? "completed" : "DIED", r.cancelTick, r.cancelReason.c_str(), r.cancelledActions, r.replannedSameTick ? "yes" : "no",
+                r.newPlanFromActualState ? "yes" : "no", r.stalePlanInputs, r.followed);
+    std::printf("    panel: %s\n", agent.status().planEvent.c_str());
+    CHECK(r.cancelTick >= 0);
+    CHECK(r.cancelReason.find("Landing detected earlier than expected") != std::string::npos);
+    CHECK(r.cancelledActions >= 1);
+    CHECK(r.replannedSameTick);
+    CHECK(r.newPlanFromActualState);
+    CHECK(r.stalePlanInputs == 0);
+    CHECK(r.contradictions == 0);
+    CHECK(r.completed);
+    // the cancelled plan is in the plan history with its reason ...
+    bool archived = false;
+    for (auto const& h : plans.history) archived = archived || (h.cancelled && h.reason.find("Landing detected") != std::string::npos);
+    CHECK(archived);
+    // ... and cancelling a plan forgot nothing that was learned
+    CHECK(mem.totalAttempts == 1);
+    CHECK(mem.q.size() > 0);
+    CHECK(countIf(mem.q, [](QEntry const& e) { return e.hasEvidence(); }) > 0);
+}
+
+TEST(plan_valid_plan_is_followed_without_new_searches) {
+    // When nothing unexpected happens the plan stays valid and is followed:
+    // fewer searches, no cancellations, same result.
+    PredictionRig rig;
+    warmUp(rig);
+    sim::Level level = sim::levelSpikes();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    uint64_t sims0 = rig.predictor.totalSimulations();
+    auto r = runPlanned(agent, level, rig);
+    std::printf("    spikes: %s, %d decisions followed a valid plan, %u plans made, %u invalidated, %.1f simulations per step\n",
+                r.completed ? "completed" : "DIED", r.followed, agent.plans().adopted, agent.plans().invalidated,
+                double(rig.predictor.totalSimulations() - sims0) / 2100.0);
+    CHECK(r.completed);
+    CHECK(r.followed > 0);
+    CHECK(agent.plans().invalidated == 0);
+    CHECK(r.contradictions == 0);
+    CHECK(r.presses == 9);
+}
+
+TEST(plan_gravity_change_invalidates_pending_actions) {
+    // Scenario 8: a gravity portal changes the physics every plan made before
+    // it assumed: the plan is invalidated at once.
+    PredictionRig rig;
+    warmUp(rig);
+    sim::Level level;
+    level.name = "gravity";
+    level.block(3.f, 5.f, 40.f, 1.f); // ceiling
+    level.gravityPortal(12.f);
+    level.finish(30.f);
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = runPlanned(agent, level, rig);
+    bool gravity = r.cancelReason.find("gravity change") != std::string::npos;
+    if (std::getenv("AIGD_PLAN_DEBUG")) std::printf("      first invalidation at %d: %s\n", r.cancelTick, r.cancelReason.c_str());
+    for (auto const& h : agent.plans().history) {
+        gravity = gravity || h.reason.find("gravity change") != std::string::npos;
+        if (std::getenv("AIGD_PLAN_DEBUG"))
+            std::printf("      plan %d..%d %s: %s\n", h.createdTick, h.endedTick, h.cancelled ? "cancelled" : "ended", h.reason.c_str());
+    }
+    std::printf("    gravity portal: %s; plan invalidated by the gravity change: %s\n", r.completed ? "completed" : "DIED", gravity ? "yes" : "no");
+    CHECK(gravity);
+    CHECK(r.contradictions == 0);
+}
+
+TEST(optimiser_prefers_the_jump_that_sets_up_the_next_one) {
+    // Scenario 4: two spikes in a row. Among the first-jump timings that
+    // clear the first spike, the earliest is not the best: the search scores
+    // each first jump together with the second jump it allows, and picks a
+    // (near-)optimal pair - not the first timing that works.
+    PredictionRig rig;
+    warmUp(rig);
+    for (float second : {13.f, 13.5f, 14.f, 14.5f}) {
+        sim::Level level;
+        level.name = "pair";
+        level.spike(10.f);
+        level.spike(second);
+        level.finish(30.f);
+        sim::World w(level);
+        for (int i = 0; i < 150; ++i) w.step(false); // the first spike ~3 blocks ahead
+        Observation o = rig.observe(w);
+        rig.predictor.observe(o, false);
+        SimStart s = rig.predictor.startFrom(o, false);
+        // brute force over first-press delay and second-press timing
+        int earliest = -1, bestK = -1;
+        float best = -1e9f;
+        PredictedPath p;
+        for (int k = 1; k < 70; ++k) {
+            float bestHere = -1e9f;
+            for (int k2 = -1; k2 < 70; ++k2) {
+                Plan plan{k, 0, 0, false, k2};
+                rig.predictor.simulate(s, o.obstacles, plan, p);
+                bestHere = std::max(bestHere, rig.predictor.scoreOf(p));
+            }
+            if (bestHere > 900.f && earliest < 0) earliest = k;
+            if (bestHere > best) {
+                best = bestHere;
+                bestK = k;
+            }
+        }
+        auto const& adv = rig.predictor.advise(o, false, false);
+        std::printf("    spikes at 10 and %.1f: earliest safe first jump in %d steps, best in %d (score %.1f); search chose %s in %d, "
+                    "second press %d after landing, score %.1f, stage %s, %d simulations\n",
+                    second, earliest, bestK, best, adv.bestPresses ? "press" : "wait", adv.bestPlan.pressAt, adv.bestPlan.secondAt,
+                    adv.bestScore, searchStageName(adv.stage), adv.simulations);
+        CHECK(adv.bestScore > 900.f);            // a safe pair was found
+        CHECK(adv.bestScore >= best - 4.f);      // and it is (near) the best possible
+        if (bestK > earliest + 2) CHECK(adv.bestPlan.pressAt > earliest); // not just the earliest that works
+    }
+}
+
+TEST(optimiser_uses_learned_timing_without_forcing_it) {
+    // Scenarios 6 and 11: a learned press timing is tried first. Where it fits
+    // the current state it is chosen and a safe plan is found with fewer
+    // simulations; where the state differs it is simulated, found worse, and
+    // not used.
+    PredictionRig rig;
+    warmUp(rig);
+    sim::Level level = spikeLevel("hint", {10.f}, 20.f);
+    sim::World w(level);
+    for (int i = 0; i < 150; ++i) w.step(false); // the spike ~3 blocks ahead
+    Observation o = rig.observe(w);
+    rig.predictor.observe(o, false);
+    auto const plain = rig.predictor.advise(o, false, false);
+    rig.predictor.setHint(plain.bestPlan.pressAt);
+    auto const good = rig.predictor.advise(o, false, false);
+    std::printf("    no hint: first safe candidate after %d simulations; good hint: after %d, chosen from the hint: %s\n", plain.firstSafeSim,
+                good.firstSafeSim, good.fromSeed ? "yes" : "no");
+    CHECK(good.seeded && good.fromSeed);
+    CHECK(good.firstSafeSim < plain.firstSafeSim);
+    CHECK(good.bestPlan.pressAt == plain.bestPlan.pressAt);
+
+    // A timing from a different situation (pressing far too early) is not reused.
+    rig.predictor.setHint(3);
+    auto const bad = rig.predictor.advise(o, false, false);
+    std::printf("    wrong hint (press in 3): seeded %s, chosen from the hint %s, chosen press in %d (%s)\n", bad.seeded ? "yes" : "no",
+                bad.fromSeed ? "yes" : "no", bad.bestPlan.pressAt, certaintyName(bad.release));
+    CHECK(bad.seeded && !bad.fromSeed);
+    CHECK(bad.bestPlan.pressAt == plain.bestPlan.pressAt);
+    CHECK(bad.release == Certainty::Safe);
+}
+
+TEST(optimiser_stays_within_its_budget) {
+    // Scenario 9: with a small budget the search still finds viable actions
+    // (the course is completed) and never exceeds the budget (+2 fixed
+    // reference simulations: keep the input / never press).
+    PredictionRig rig;
+    warmUp(rig);
+    rig.predictor.setBudget(40);
+    sim::Level level = sim::levelBlocks();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = runPlanned(agent, level, rig);
+    std::printf("    budget 40: blocks %s, at most %d simulations in one decision\n", r.completed ? "completed" : "DIED", r.maxSims);
+    CHECK(r.completed);
+    CHECK(r.maxSims <= 42);
+}
+
+TEST(optimiser_resolution_follows_model_and_decision_rate) {
+    // With observations every ~2 steps (as in game) refining to single steps
+    // is pointless: the search refines at the rate the AI can act.
+    PredictionRig rig;
+    warmUpGaps(rig, false);
+    sim::Level level = spikeLevel("res", {10.f}, 20.f);
+    sim::World w(level);
+    for (int i = 0; i < 40; ++i) w.step(false);
+    Observation o = rig.observe(w);
+    o.tick = 100000; // a new history
+    rig.predictor.observe(o, false);
+    auto const& adv = rig.predictor.advise(o, false, false);
+    std::printf("    %.2f steps per decision -> timing resolution %d step(s)\n", rig.predictor.decisionInterval(), adv.resolution);
+    CHECK(adv.resolution >= 2);
+    PredictionRig every;
+    warmUp(every);
+    every.predictor.observe(o, false);
+    CHECK(every.predictor.advise(o, false, false).resolution == 1);
+}
+
+TEST(learned_sequence_is_not_replayed_in_a_different_state) {
+    // Scenario 6 for learned test sequences: an experiment planned for a
+    // grounded approach is cancelled - not played - when the player arrives
+    // at its first changed cell in the air (an earlier decision changed).
+    sim::Level level = sim::levelBasics();
+    LevelMemory mem = freshLevel(level);
+    PatternMemory pat;
+    LearnerConfig cfg;
+    Agent agent(cfg);
+    agent.attach(&mem, &pat);
+    runAttempt(agent, level); // dies without jumping; an experiment is planned
+    Experiment ex = agent.pendingExperiment();
+    CHECK(ex.active);
+    // Second attempt: the same approach (the real walk), except that the
+    // player arrives at the experiment's first changed cell in the air.
+    sim::World w(level);
+    agent.beginAttempt(w.observe(), false);
+    float const firstX = static_cast<float>(ex.testFrom) * cfg.cellSize;
+    bool pressedAtTest = false;
+    while (!w.dead()) {
+        Observation o = w.observe();
+        if (o.x >= firstX) {
+            o.y += 40.f;
+            o.vy = 6.f;
+            o.onGround = false;
+            pressedAtTest = agent.act(o);
+            break;
+        }
+        agent.act(o);
+        w.step(false);
+    }
+    int forcedSteps = 0;
+    for (auto const& s : agent.steps()) forcedSteps += s.source == DecisionSource::Experiment ? 1 : 0;
+    agent.abortAttempt(nullptr);
+    std::printf("    experiment \"%s\": %u cancelled (%s), %d forced steps played\n", ex.description.c_str(),
+                agent.status().experimentsCancelled, agent.status().planEvent.c_str(), forcedSteps);
+    CHECK(agent.status().experimentsCancelled == 1);
+    CHECK(forcedSteps == 0);
+    CHECK(!pressedAtTest);
+    CHECK(agent.status().planEvent.find("Experiment cancelled") != std::string::npos);
+}
+
+TEST(wrong_saved_x_speed_is_corrected) {
+    // The calibration saved by earlier versions in game: x speed 1.5579 at
+    // 1x from 10 samples (the real speed is 1.2983). Loading it must not keep
+    // the wrong value, and a wrong estimate built up during play must be
+    // replaced once correct samples keep arriving.
+    float const nominal = unitsPerSecond(1) / 240.f;
+    PhysicsCalibration saved;
+    saved.vxSum[1] = 15.5790043;
+    saved.vxN[1] = 10;
+    PhysicsModel model;
+    model.loadCalibration(saved);
+    std::printf("    saved 1.5579/step -> after loading: %.4f (true %.4f)\n", model.vxPerTick(1), nominal);
+    CHECK(std::fabs(model.vxPerTick(1) - nominal) < 0.01f);
+
+    // Wrong during play (old tick counting), then real steps: corrected.
+    PredictionRig rig;
+    warmUpGaps(rig, true);
+    float const wrong = rig.model.vxPerTick(1);
+    warmUpGaps(rig, false, 9);
+    std::printf("    learned with one tick per call: %.4f; after real steps: %.4f (true %.4f)\n", wrong, rig.model.vxPerTick(1), nominal);
+    CHECK(wrong > nominal * 1.1f);
+    CHECK(std::fabs(rig.model.vxPerTick(1) - nominal) < nominal * 0.01f);
 }
 
 // ---------------------------------------------------------------------------

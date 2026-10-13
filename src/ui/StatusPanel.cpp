@@ -111,6 +111,39 @@ void StatusPanel::refresh() {
                 if (!sf.reason.empty()) text += "\nWhy: " + sf.reason;
                 text += fmt::format("\nThis attempt: {} presses, {} unnecessary presses skipped, {} safety overrides, {} with no safe option",
                                     st.pressesThisAttempt, st.pressesAvoidedThisAttempt, st.overridesThisAttempt, st.noSafeOptionThisAttempt);
+                // The live plan and how its timing was found (all from the
+                // actual plan / search, nothing assumed).
+                auto const& plans = ai.plans();
+                auto const& lp = plans.plan();
+                if (lp.active) {
+                    int32_t const now = ai.lastTick();
+                    std::string params = lp.params.pressAt < 0   ? std::string("no press")
+                                       : lp.params.pressAt == 0 ? std::string("press now")
+                                                                : fmt::format("press in {} steps", lp.params.pressAt);
+                    if (lp.params.holdFor > 0) params += fmt::format(", hold {}", lp.params.holdFor);
+                    else if (lp.params.holdFor < 0) params += ", keep holding";
+                    if (lp.params.secondAt >= 0) params += fmt::format(", second press {} steps after landing", lp.params.secondAt);
+                    text += fmt::format("\nPlan: {} (made {} step(s) ago), {} pending input change(s) | {} | {} | {} candidates, stage {}, score {:.1f}{}",
+                                        st.safety.proposedSource == aigd::DecisionSource::Plan ? "following" : "made this step",
+                                        plans.age(now), lp.pendingChanges(now), params, aigd::planSourceName(lp.source), lp.candidates,
+                                        aigd::searchStageName(lp.stage), lp.score,
+                                        lp.landed ? fmt::format(", lands at x={:.0f}", lp.landX) : std::string());
+                    auto const& adv = ai.predictor().lastAdvice();
+                    text += fmt::format("\nSearch: resolution {} step(s){}{}{}", adv.resolution,
+                                        adv.seeded ? (adv.fromSeed ? ", learned timing tried first and kept" : ", learned timing tried first, search found better")
+                                                   : "",
+                                        adv.budgetHit ? ", stopped by the computation budget" : "",
+                                        adv.firstSafeSim > 0 ? fmt::format(", first safe candidate after {} simulations", adv.firstSafeSim) : std::string());
+                } else {
+                    text += "\nPlan: none (no trusted prediction - the learned policy decides each step)";
+                }
+                if (plans.lastCheck.hadPlan)
+                    text += fmt::format("\nActual vs planned: height {:+.1f}, position {:+.1f}, {} (planned {})", plans.lastCheck.dy, plans.lastCheck.dx,
+                                        plans.lastCheck.actualGrounded ? "on the ground" : "in the air",
+                                        plans.lastCheck.expectedGrounded ? "on the ground" : "in the air");
+                if (!st.planEvent.empty()) text += "\nReplanned: " + st.planEvent;
+                text += fmt::format("\nThis attempt: {} plans made, {} invalidated, {} pending actions cancelled, {} decisions followed a plan",
+                                    plans.adopted, st.plansInvalidatedThisAttempt, st.actionsCancelledThisAttempt, st.decisionsFollowingPlan);
                 (void)outcome;
             }
         }

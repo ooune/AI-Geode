@@ -103,7 +103,7 @@ public:
     // How often an estimate was replaced because the game consistently did
     // something else (physics changed, or the first estimate was wrong).
     uint32_t regimeChanges() const {
-        uint32_t n = 0;
+        uint32_t n = m_vxReplaced;
         for (auto const& c : m_cal.modes) {
             for (auto const* st : {&c.accHold, &c.accRelease, &c.impulse, &c.flipVy, &c.waveVy}) n += st->regimeChanges;
         }
@@ -127,6 +127,9 @@ private:
     float m_lastResimError = 0.f;
     uint32_t m_accuracyN = 0;
     int32_t m_robotSinceTakeoff = 1 << 20;
+    std::array<double, 5> m_vxAltSum{};   // x speed: run of samples disagreeing with the estimate
+    std::array<uint32_t, 5> m_vxAltN{};
+    uint32_t m_vxReplaced = 0;
 };
 
 } // namespace aigd

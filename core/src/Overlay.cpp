@@ -77,8 +77,33 @@ void buildOverlay(PredictedPath const& main, PredictedPath const* alternative, s
 }
 
 bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decision, int32_t nowTick, bool showAlternative,
-                          std::span<Obstacle const> obstacles, OverlayGeometry& out) {
+                          std::span<Obstacle const> obstacles, OverlayGeometry& out, LivePlan const* plan) {
     out.clear();
+    if (plan && plan->active && decision.proposedSource == DecisionSource::Plan && decision.tick == nowTick) {
+        // Following the live plan: draw what is left of it, from now on.
+        int const from = std::max(0, plan->indexOf(nowTick));
+        auto const style = plan->outcome == Certainty::Safe ? OverlayGeometry::Style::PathSafe
+                         : plan->outcome == Certainty::Uncertain ? OverlayGeometry::Style::PathUncertain
+                                                                 : OverlayGeometry::Style::PathDanger;
+        size_t prev = static_cast<size_t>(from);
+        for (size_t i = prev + 4; i < plan->steps.size(); i += 4) {
+            out.segments.push_back({plan->steps[prev].x, plan->steps[prev].y, plan->steps[i].x, plan->steps[i].y, style});
+            prev = i;
+        }
+        if (plan->landed) out.dots.push_back({plan->landX, 0.f, OverlayGeometry::Style::Landing});
+        out.outcome = plan->outcome;
+        out.verdict = decision.verdict;
+        out.selectedPress = decision.executed != 0;
+        out.predictionAge = nowTick - plan->createdTick;
+        bool const steered = decision.mode == GameMode::Ship || decision.mode == GameMode::Wave || decision.mode == GameMode::Ufo ||
+                             decision.mode == GameMode::Swing;
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "%s - %s - following plan (made %d step(s) ago, still matching)",
+                      steered ? (out.selectedPress ? "HOLD" : "RELEASE") : (out.selectedPress ? "PRESS" : "RELEASE"),
+                      plan->outcome == Certainty::Safe ? "safe" : "risky", out.predictionAge);
+        out.label = buf;
+        return true;
+    }
     auto const& adv = predictor.lastAdvice();
     out.verdict = decision.verdict;
     if (!adv.valid || !predictor.hasExecuted()) {

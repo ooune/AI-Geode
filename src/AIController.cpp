@@ -373,6 +373,12 @@ void AIController::logAttemptQuality(aigd::GameMode mode, bool mini) const {
               model.driftPerTick(mode), m_predictor.inputLatency(), m_predictor.latencyError(0), m_predictor.latencyError(1),
               m_predictor.latencyError(2), m_predictor.latencySamples(), m_predictor.caution(), m_predictor.lastStepError(),
               model.regimeChanges());
+    auto const& plans = m_agent.plans();
+    log::info("Plans: {:.2f} physics steps per AI call (max recently {}), x speed {:.4f}/step | {} plans made, {} invalidated, {} pending "
+              "actions cancelled, {} decisions followed a plan, {} experiments cancelled{}{}",
+              m_clock.averageInterval(), m_clock.recentMaxInterval(), model.vxPerTick(aigd::speedClassFromPlayerSpeed(m_lastObs.playerSpeed)),
+              plans.adopted, st.plansInvalidatedThisAttempt, st.actionsCancelledThisAttempt, st.decisionsFollowingPlan, st.experimentsCancelled,
+              st.planEvent.empty() ? "" : " | last: ", st.planEvent);
     (void)mini;
 }
 
@@ -572,7 +578,8 @@ bool AIController::overlayGeometry(aigd::OverlayGeometry& out) const {
     if (!m_layer || !m_supported || !m_settings.aiEnabled || !m_settings.prediction || !m_settings.showTrajectory) return false;
     if (!m_agent.attemptActive()) return false;
     // The executed decision's path, labelled with what is really being done.
-    return aigd::buildDecisionOverlay(m_predictor, m_agent.status().safety, m_lastTick, m_settings.showAlternative, m_obstacles, out);
+    return aigd::buildDecisionOverlay(m_predictor, m_agent.status().safety, m_lastTick, m_settings.showAlternative, m_obstacles, out,
+                                      &m_agent.plans().plan());
 }
 
 void AIController::openMemoryFolder() const {

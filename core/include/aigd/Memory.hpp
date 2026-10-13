@@ -3,6 +3,7 @@
 #include <aigd/Physics.hpp>
 #include <aigd/Types.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <deque>
@@ -131,6 +132,21 @@ inline uint32_t timingKey(GameMode mode, int speedClass, bool mini) {
     return static_cast<uint32_t>(mode) * 16u + static_cast<uint32_t>(speedClass) * 2u + (mini ? 1u : 0u);
 }
 
+// The kind of obstacle ahead, independent of where it is: what a learned
+// press timing may be reused for.
+inline uint32_t obstacleKey(Observation const& o) {
+    auto band = [](Feature const& f) -> uint32_t {
+        if (!f.present) return 0u;
+        int b = static_cast<int>(std::lround(f.dy / 10.f));
+        return static_cast<uint32_t>(std::clamp(b, -6, 6) + 7); // 1..13
+    };
+    uint32_t k = timingKey(o.mode, o.speedClass(), o.mini);
+    k = k * 2u + (o.upsideDown ? 1u : 0u);
+    k = k * 16u + band(o.hazard);
+    k = k * 16u + band(o.solid);
+    return k;
+}
+
 // Everything remembered about one level.
 struct LevelMemory {
     static constexpr size_t kMaxHistory = 300;
@@ -180,6 +196,10 @@ struct PatternMemory {
     static constexpr int kFormatVersion = 2;
     QTable q;
     std::map<uint32_t, TimingStat> leads;
+    // Press lead distances that worked, per kind of obstacle (mode, speed,
+    // size, gravity and the obstacle's height relative to the player). Used
+    // to try a timing first in comparable situations; always re-simulated.
+    std::map<uint32_t, TimingStat> situationLeads;
     PhysicsCalibration physics; // what the trajectory predictor learned about the game's physics
 };
 

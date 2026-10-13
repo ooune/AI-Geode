@@ -3,6 +3,7 @@
 #include <aigd/Config.hpp>
 #include <aigd/FailureAnalyzer.hpp>
 #include <aigd/Memory.hpp>
+#include <aigd/PlanManager.hpp>
 #include <aigd/Predictor.hpp>
 #include <aigd/Trajectory.hpp>
 #include <aigd/Types.hpp>
@@ -42,6 +43,9 @@ struct Experiment {
     int32_t testFrom = 0;
     int32_t testTo = -1;
     std::vector<uint64_t> baseKeys; // per cell, the reference attempt's state key (0 = unknown)
+    std::vector<float> baseYs;      // per cell, the reference attempt's height
+    std::vector<uint8_t> baseGround;// per cell, whether the reference attempt was on the ground
+    int cancellations = 0;          // times it was cancelled because the state did not match the reference
     std::string description;
     // The search that produced this experiment (used to remember what worked).
     int32_t blockStart = 0;
@@ -171,6 +175,13 @@ struct AgentStatus {
     uint32_t decisionsTrusted = 0;            // decisions with a trusted prediction / with an untrusted one
     uint32_t decisionsUntrusted = 0;
     std::string trust;                        // why predictions are (not) used, at the last decision
+
+    // live plan
+    std::string planEvent;                    // the last invalidation / cancellation, in words
+    uint32_t plansInvalidatedThisAttempt = 0;
+    uint32_t actionsCancelledThisAttempt = 0; // pending input changes cancelled with invalid plans
+    uint32_t decisionsFollowingPlan = 0;      // decisions that followed a still-valid plan (no new search)
+    uint32_t experimentsCancelled = 0;        // learned test sequences cancelled because the state differed
 };
 
 class Agent {
@@ -211,6 +222,8 @@ public:
     FailureReport const& lastReport() const { return m_lastReport; }
     // Safety-critical decisions of the current/last attempt (most recent last).
     std::vector<SafetyRecord> const& safetyLog() const { return m_safetyLog; }
+    // The live execution plan (separate from all learned memory).
+    PlanManager const& plans() const { return m_plan; }
 
     // Forget transient search state (used after memory is reset/imported).
     void resetTransient();
@@ -222,6 +235,7 @@ private:
         std::vector<uint8_t> actions;
         std::vector<uint8_t> ground;  // player on the ground at the cell centre
         std::vector<uint64_t> keys;   // state key of the decision active at the cell centre
+        std::vector<float> ys;        // player height at the cell centre
         float endX = 0.f;
         FailureReport report;
         uint8_t at(int32_t cell) const {
@@ -273,6 +287,7 @@ private:
         float obstacleX;
         float lead;
         uint32_t key;
+        uint32_t situation;
     };
 
     LearnerConfig m_cfg;
@@ -320,6 +335,8 @@ private:
     bool m_danger = false;
     std::vector<SafetyRecord> m_safetyLog;
     std::vector<int32_t> m_removeTried;          // hotspots where "remove the press" was already tried
+    PlanManager m_plan;                          // live plan: pending inputs + the states they expect
+    bool m_expChecked = false;                   // the active experiment's state was checked at its first changed cell
     FailureReport m_lastReport;
     AgentStatus m_status;
 
