@@ -324,6 +324,67 @@ With nothing relevant ahead, no path is drawn.
 Until a mode is calibrated, its predictions are shown (marked as calibrating)
 but not acted on.
 
+### Real time, live plans and timing optimisation (v0.3.0)
+
+**What a real game session showed (v0.2.2 on Dry Out).** Every attempt logged *0 decisions with a trusted prediction*. The measured drift was 0.25 units/step, and the re-simulation error was about 8 units for every assumed input latency. The one-step error, however, was 0.00. A trace the mod saved in the game explains it: consecutive observations were **1, 2 or 3 physics steps apart**. x advanced by exactly 1.2983, 2.5967 or 3.895 units at 1× speed, and the vertical speed changed by 1–3 steps of gravity. The level-time based tick counted many of these as a single step. As a result:
+- the x speed was calibrated at 1.2× the true value (1.5579 instead of 1.2983);
+- the 32-step accuracy check compared the model with about 43 real steps;
+- the prediction was never trusted, so none of the prediction-based decisions acted in game.
+
+The simulator observes every step, which is why no test had shown this.
+
+**Step clock** (`core/StepClock`). The number of physics steps between two calls is read from the horizontal movement, which advances by exactly one speed unit per step. Respawns and teleports are treated as discontinuities. The controller uses it for every tick, and skips a call only when no step has happened. The predictor's history accepts gaps of up to 8 steps:
+- calibration uses only single-step pairs;
+- the accuracy check and the latency estimate replay the button state step by step across gaps;
+- the average steps per call is measured.
+
+A game-like test (one call every 1–3 steps) reproduces the in-game failure with one tick per call: x speed 2.08 instead of 1.30, drift 0.186, not trusted. With the step clock the speed is exact, drift is 0.000, the prediction is trusted, and basics, spikes and blocks are each completed on the first attempt.
+
+**Audit of plans and actions (before v0.3.0).**
+- The planner stored no future inputs. It re-planned every step (receding horizon) and executed only the first action, so it could not keep obsolete actions.
+- The learned per-state values are keyed by the full state (x cell, height band, vertical-speed band, grounded, button), not by x alone.
+- Obsolete actions could survive in two places:
+  - **timing experiments** forced their tested inputs by x cell, whatever state the player was in when it got there. A jump tested for a grounded approach was "pressed" in the air, or held into a landing re-jump;
+  - **holding the button in the air** re-jumps on landing in GD. When the prediction was not trusted (always, in game, see above), nothing stopped a hold that no longer made sense after an early landing.
+- No component compared the real state with what a plan expected, so a plan was never "cancelled": it was simply re-made, or (for experiments) not re-made at all.
+
+**Live plan** (`core/PlanManager`). The predicted path of the action just executed becomes the live plan. For every physics step it records the input and the state expected after that step (position, height, grounded or airborne), plus the mode, speed and gravity it was made for. It is kept apart from all learned memory: cancelling a plan never changes the Q-table, the evidence or the history.
+- **On every observation the plan is validated** against exactly that step's expected state, not just the x position. It is invalidated when:
+  - the player landed earlier than expected, or is still airborne where a landing was expected;
+  - the height or position differs by more than a tolerance that grows with the model's measured drift;
+  - the mode, speed, gravity or size changed;
+  - the state changed within the step the plan was made in.
+
+  An invalid plan's pending input changes are **cancelled**, the record keeps the reason, and a new decision is made **in the same step** from the actual state (also when the AI would otherwise keep its input).
+- **A valid plan is followed** without a new search when all of these hold:
+  - the model is trusted and no danger is near;
+  - the plan is younger than 12 steps, has more than 30 steps left, and is predicted safe;
+  - no experiment is running;
+  - the plan was made by the prediction itself (planner, safety check or "no input needed").
+
+  Behind a learned-policy decision the plan is only validated, and the policy keeps deciding. Following plans cut the agent's cost from 95–230 µs to 25–55 µs per step.
+- **Learned test sequences are checked too.** An experiment is only played if, at its first changed cell, the player is in the reference attempt's state. For jump modes that means grounded vs. airborne and height within 4 units; for all modes the same mode. Otherwise it is cancelled ("Experiment cancelled: the state at its first changed cell differs from the reference attempt"), and its search starts again from current play instead of re-testing the outdated sequence.
+
+**Timing optimisation** (`Predictor::advise`):
+- coarse-to-fine timing search as before (wait 1, 2, 4, 6, 9, ... steps, then refinement around the best and wherever the outcome changes). It now refines only to the resolution the model and the real decision rate support: 1 step when every step is observed and the model is accurate, 2 or more in game (about 1.7 steps per call) or with drift;
+- **two jumps for consecutive obstacles.** Considered only when no single-jump plan is safe. First-jump timings that cleared the first obstacle and only ran into the next one after landing (earliest, middle and latest of them) get a second press timed from their landing, coarse then refined. The best pair's first jump is refined as well. The pair is scored as a whole, so a first jump that sets up an easy second one wins. In the test, the earliest working first jump is in 7 steps, the best pair starts in 17, and the search chooses 18 (score 1000.7 vs. 1002.0 at best, 71 simulations);
+- **learned timings first.** Press lead distances that worked are kept per kind of obstacle (mode, speed, size, gravity, obstacle height relative to the player) and globally per mode and speed. The matching one is converted into a press delay and simulated first. It is never executed without simulation. In the test, a good learned timing finds the first safe candidate after 4 simulations instead of 8, and a wrong one (from a different situation) is simulated, found worse, and not used;
+- **bounded work:** at most 200 simulations per decision (configurable), and at most 48 more when a collision is less than 30 steps away (find a viable action fast). In the test, a budget of 40 still completes the blocks level, with never more than 42 simulations (40 + the two fixed reference paths);
+- the objective is unchanged from v0.2.2: safety first, then capped clearance, then a cost per press.
+
+**Diagnostics.**
+- The status panel shows the live plan:
+  - following it or made this step, and its age;
+  - pending input changes;
+  - its parameters (e.g. *press in 18 steps, second press 0 steps after landing*);
+  - where its timing came from (search / learned timing / fallback);
+  - candidates simulated, search stage and score, and landing x.
+- It also shows the search resolution, whether a learned timing was tried and kept, whether the budget stopped the search, and how many simulations it took to find the first safe candidate.
+- Actual vs. planned: height and position difference, grounded vs. airborne.
+- The last cancellation, e.g. *"Landing detected earlier than expected (landed at y=45.0, planned airborne at y=43.6) - cancelling 2 pending actions; replanning from the actual state"*.
+- Per attempt: plans made, invalidated, pending actions cancelled, decisions that followed a plan.
+- The Geode log gets a `Plans:` line per attempt, with the measured physics steps per AI call, the calibrated x speed, the plan counts and the last cancellation.
+
 ### Practice-mode learning
 With **Practice Mode Learning** on, the AI:
 - switches the level to practice mode;
@@ -418,6 +479,25 @@ Add `--bench` to also run the multi-seed learning benchmark.
   - **H**: learning with prediction still completes ship and blocks, records per-state evidence and keeps it through save/reload;
   - the cost of a whole decision per step;
   - on the code before the fix, B, C and D failed (both ships crashed) and E reported nothing;
+- **real time, live plans and optimisation (v0.3.0):**
+  - the step clock counts steps exactly (1, 2, 3 per call, repeated calls, respawns);
+  - the wrong x speed saved in the real game (1.5579) is dropped on load, and a wrong estimate learned during play is replaced by correct samples;
+  - a game-like observer (1–3 steps per call) reproduces the in-game failure with the old tick counting, and shows the fix (exact x speed, drift 0.000, trusted; basics, spikes, blocks completed on attempt 1);
+  - **early landing** (a block the AI cannot see):
+    - the landing is detected from the real state, *"Landing detected earlier than expected"*;
+    - the 2 pending inputs of the old plan are cancelled;
+    - a new plan is made in the same step from the landed state;
+    - 0 inputs of the old plan are executed afterwards;
+    - the level is completed;
+    - the cancelled plan is in the plan history, and nothing learned is lost;
+  - a valid plan is followed (1364 decisions on spikes, 0 invalidations, exactly 9 jumps, 1.8 simulations per step);
+  - a gravity portal invalidates the plan (*"Plan invalidated by a gravity change"*);
+  - two spikes in a row: a safe jump pair is found, later than the earliest workable first jump;
+  - a learned timing speeds up the search when it fits and is not used when it does not;
+  - the search stays within its budget and still finds viable actions;
+  - the timing resolution follows the measured decision rate (2 steps at ~1.7 steps per call, 1 when every step is observed);
+  - a learned test sequence is cancelled, not played, when the player reaches its first changed cell in a different state;
+  - no contradictory inputs: in every run the executed input equals the recorded decision and, when following, the plan's input;
 - **decision pipeline (v0.2.2):**
   - the planner makes **no jump** over a level of flat blocks with hazards far above (0 presses);
   - a learned policy that wants to jump at every chance makes **0 presses** on that level, and **exactly the 9 needed jumps** on the spikes level (415 proposed presses dropped). The planner alone also makes exactly 9;
@@ -443,7 +523,7 @@ Add `--bench` to also run the multi-seed learning benchmark.
 
 ### Results
 
-Unit tests: 65 tests, 1997 checks, 0 failures.
+Unit tests: 76 tests, 2066 checks, 0 failures.
 
 Trajectory prediction against the simulator:
 - calibration recovers the simulator's physics exactly (g 0.2200, k 0.2326,
@@ -568,6 +648,13 @@ Report:
 - any death where the log's last record says *safe* or *kept* with a current prediction: that is a model error;
 - any input mismatch error in the log: that would be a controller bug.
 
+**For v0.3.0, check first** (Geode log, per attempt):
+1. The `Plans:` line: *physics steps per AI call* tells how often the game really calls the AI (the v0.2.2 session implied ~1.3–1.7). *x speed* should be 1.2983 at normal speed (0.5×: 1.0465, 2×: 1.6143); 1.5579 was the old, wrong value. It is dropped automatically when the memory is loaded.
+2. The `Decisions:` line: most decisions should now be *with a trusted prediction*, with drift well below 0.15.
+3. Early landing: in a section where the AI jumps early and lands before the next obstacle, the panel should show *Replanned: Landing detected earlier than expected - cancelling N pending actions; replanning from the actual state*, and the next jump should be timed from the landed position (the plan line shows the new parameters).
+4. Consecutive obstacles: the plan line should show a second press (*second press N steps after landing*, stage *two jumps*) when one jump cannot clear both.
+5. Performance: the `Decisions:` and `Plans:` lines show how many decisions followed a plan; the AI's own cost is a few percent of one core at most.
+
 **For v0.2.2, check first** (from the Geode log, one `Decisions:` line per attempt):
 1. Most decisions near obstacles should be *with a trusted prediction*. If not, the line says why (drift, caution or calibration). That is the first thing to fix before judging behaviour.
 2. *input latency*: 0 means the game applies the button on the next step, as the model assumes. 1 or 2 means it is later, and the predictor now compensates. Its three re-simulation errors show how clear the evidence is.
@@ -596,6 +683,13 @@ sizes and landing tolerance are still unconfirmed.
   - the wave hitbox (12 units, inner 6) and the ship hitbox (24 units) are guesses;
   - the game's own corridor bounds (`m_portalY` / `m_lastModeHeight`) are not used yet because their meaning is unconfirmed; bounds are learned by contact instead;
   - the planner tries a limited set of input shapes, so a sequence it never tries (for example an unusual tap rhythm) cannot be found by planning, only by learning.
+- **v0.3.0 has not been tested in game.** The step-clock fix is based on a real trace from the game and reproduced in the simulator, but whether predictions are now trusted in game can only be confirmed there.
+- **The calibration saved by earlier versions was wrong** (x speed learned 1.2× too high, and the calibration then rejected every correct sample because it was more than 5% off). On loading, a saved speed more than 10% away from GD's exact speed for that speed class is now dropped. During play, 40 consistent samples that disagree with the estimate replace it. Both are tested with the value saved in the real game (1.5579 → 1.2982).
+- **Between two AI calls the button cannot change.** At ~1.7 steps per call, a plan's input change can happen a step late. The search refines only to that resolution, and the plan tolerances absorb one step, but frame-perfect timings are out of reach while the game calls the AI less often than every step.
+- **Plans behind learned-policy decisions are not followed**, only validated: the learned policy's future decisions cannot be simulated.
+- **Two-jump search is only for cube and robot**, and only when no single-jump plan is safe. Ship, wave and the other modes optimise one input change ahead (hold durations, delays, repeated taps) as before.
+- **Learned timings are per kind of obstacle** (mode, speed, size, gravity, obstacle height), not per complete obstacle layout. They only order the search; they are never executed unsimulated.
+- **Benchmark vs. v0.2.2:** identical on every line except blocks (default median 13 → 15, mean 14 → 14; learning speed 1.0: 13 → 15; learning speed 0.1: mean 30 → 27). Two early versions of the experiment state check made learning much slower (spikes at learning speed 1.0: 10 → 34; ship at 0.1: 147 → 347). They were measured, traced to a cancel-and-retry loop and to over-strict height checks in flying modes, and fixed.
 - **v0.2.2 has not been tested in game.** The in-game log of v0.2.1 shows that prediction was not trusted there. v0.2.2 removes the cause found in the code (false collisions inside the accuracy measurement), but whether trust now holds in game, and what input latency the game really has, can only be read from the new `Decisions:` log lines of a real session.
 - **The "no unnecessary jump" rule depends on a trusted prediction.** While the prediction is not trusted, the learned policy decides alone, and only the prior's press margin and the "remove the press" experiment work against unnecessary jumps.
 - **"Remove the press" uses the killer's geometry** to decide whether walking under it was possible. Where the observer reports no killer extent, it is tried once per trouble spot anyway.
