@@ -3148,6 +3148,39 @@ static void runBench() {
     }
 }
 
+TEST(upside_down_cube_contact_is_not_a_ceiling) {
+    // In game (Dry Out, 48.8%) an upside-down cube rested on something the
+    // observer did not report. v0.3.0 learned that contact as a level-wide
+    // ceiling and then predicted a surface under hanging spikes (one-step
+    // error 18.5, repeated deaths). Cube and robot contacts must not create a
+    // ceiling; ship contacts still do.
+    PhysicsModel model;
+    Predictor p(model);
+    std::vector<Obstacle> obs{{900.f, 90.f, 930.f, 120.f, Obstacle::Kind::Solid}};
+    Observation o;
+    o.mode = GameMode::Cube;
+    o.upsideDown = true;
+    o.onGround = true;
+    o.playerSpeed = 0.9f;
+    o.obstacles = obs;
+    for (int t = 0; t < 10; ++t) {
+        o.tick = t;
+        o.x = 600.f + 1.3f * static_cast<float>(t);
+        o.y = 305.7f;
+        p.observe(o, false);
+    }
+    CHECK_MSG(!p.bounds().hasCeil || p.bounds().ceilEstimated, "cube learned a ceiling at %.1f", p.bounds().ceil);
+
+    Predictor ship(model);
+    o.mode = GameMode::Ship;
+    for (int t = 0; t < 10; ++t) {
+        o.tick = t;
+        o.x = 600.f + 1.3f * static_cast<float>(t);
+        ship.observe(o, false);
+    }
+    CHECK(ship.bounds().hasCeil && !ship.bounds().ceilEstimated);
+}
+
 // ---------------------------------------------------------------------------
 
 int main(int argc, char** argv) {

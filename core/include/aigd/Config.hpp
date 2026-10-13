@@ -49,6 +49,7 @@ struct LearnerConfig {
     float imaginedScale = 0.5f;       // weight of "imagined" deaths learned from predictions
     // Safety layer (all in physics steps, i.e. time, so they hold at any speed):
     int safetySlackSteps = 3;         // change the input while at least this many steps remain to do so
+    int farCollisionSteps = 60;       // a predicted collision at least this far ahead is not yet "no way out"
     int dangerWindowSteps = 16;       // re-check every step while a change may be needed within this many steps
     // Live plan: a still-valid plan is followed without a new search for up to
     // this many steps, as long as at least planMinLeft steps of it remain.

@@ -296,7 +296,8 @@ bool Agent::act(Observation const& obs) {
     bool planInvalidated = false;
     if (m_plan.active()) {
         float const drift = m_predictor ? m_predictor->model().driftPerTick(obs.mode) : 0.f;
-        float const tol = 1.f + 2.f * drift * static_cast<float>(std::max(0, m_plan.age(obs.tick)));
+        // (2.5 units: the game snaps the player onto surfaces when landing)
+        float const tol = 2.5f + 2.f * drift * static_cast<float>(std::max(0, m_plan.age(obs.tick)));
         PlanCheck const chk = m_plan.validate(obs, tol);
         if (chk.hadPlan && !chk.valid && !chk.finished) {
             planInvalidated = true;
@@ -619,9 +620,19 @@ bool Agent::act(Observation const& obs) {
             // Every candidate collides: take the one that collides later (more
             // time for the next step to find a way), and say so.
             int pick = adv->ttc(b) > adv->ttc(a) ? b : a;
-            rec.verdict = SafetyVerdict::NoSafeOption;
-            rec.reason = fmt("No safe option: release collides in %d, press in %d steps; executing %s (collides later)",
-                             adv->ttc(0) + 1, adv->ttc(1) + 1, buttonName(obs.mode, pick));
+            if (std::min(adv->ttc(0), adv->ttc(1)) >= m_cfg.farCollisionSteps) {
+                // Both collide only far ahead: one input cannot clear
+                // everything in view yet, later decisions still can. Same
+                // choice, but this is not "no way out".
+                rec.verdict = pick != a ? SafetyVerdict::Overridden : SafetyVerdict::Kept;
+                rec.reason = fmt("Both options collide only far ahead (release in %d, press in %d steps); executing %s (collides later), "
+                                 "later decisions can still act",
+                                 adv->ttc(0) + 1, adv->ttc(1) + 1, buttonName(obs.mode, pick));
+            } else {
+                rec.verdict = SafetyVerdict::NoSafeOption;
+                rec.reason = fmt("No safe option: release collides in %d, press in %d steps; executing %s (collides later)",
+                                 adv->ttc(0) + 1, adv->ttc(1) + 1, buttonName(obs.mode, pick));
+            }
             overridden = pick != a;
             a = pick;
         } else {

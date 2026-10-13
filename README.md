@@ -523,7 +523,7 @@ Add `--bench` to also run the multi-seed learning benchmark.
 
 ### Results
 
-Unit tests: 76 tests, 2066 checks, 0 failures.
+Unit tests: 77 tests, 2068 checks, 0 failures.
 
 Trajectory prediction against the simulator:
 - calibration recovers the simulator's physics exactly (g 0.2200, k 0.2326,
@@ -683,7 +683,13 @@ sizes and landing tolerance are still unconfirmed.
   - the wave hitbox (12 units, inner 6) and the ship hitbox (24 units) are guesses;
   - the game's own corridor bounds (`m_portalY` / `m_lastModeHeight`) are not used yet because their meaning is unconfirmed; bounds are learned by contact instead;
   - the planner tries a limited set of input shapes, so a sequence it never tries (for example an unusual tap rhythm) cannot be found by planning, only by learning.
-- **v0.3.0 has not been tested in game.** The step-clock fix is based on a real trace from the game and reproduced in the simulator, but whether predictions are now trusted in game can only be confirmed there.
+- **v0.3.0 in game (Dry Out):** the step clock worked. The calibrated x speed was 1.2982 (true value 1.2983), most decisions had a trusted prediction, and the AI got from 37.8% to 48.8% (v0.2.2 was stuck at 21.4%). At 48.8% it died repeatedly in an upside-down cube section: it had learned a contact with something the observer does not report as a level-wide ceiling, and then predicted a surface under hanging spikes (one-step error 18.5).
+- **v0.3.1:**
+  - contacts in cube and robot mode no longer create a ceiling bound (test `upside_down_cube_contact_is_not_a_ceiling`, which fails without the fix);
+  - the plan tolerance is 2.5 units, since the game snaps the player onto surfaces;
+  - when both inputs only collide far ahead (60+ steps), the record no longer says "NO SAFE OPTION" (later decisions can still act).
+
+  Not tested in game at the time of writing.
 - **The calibration saved by earlier versions was wrong** (x speed learned 1.2× too high, and the calibration then rejected every correct sample because it was more than 5% off). On loading, a saved speed more than 10% away from GD's exact speed for that speed class is now dropped. During play, 40 consistent samples that disagree with the estimate replace it. Both are tested with the value saved in the real game (1.5579 → 1.2982).
 - **Between two AI calls the button cannot change.** At ~1.7 steps per call, a plan's input change can happen a step late. The search refines only to that resolution, and the plan tolerances absorb one step, but frame-perfect timings are out of reach while the game calls the AI less often than every step.
 - **Plans behind learned-policy decisions are not followed**, only validated: the learned policy's future decisions cannot be simulated.

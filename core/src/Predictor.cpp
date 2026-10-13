@@ -974,7 +974,11 @@ void Predictor::updateBounds(Observation const& obs, bool held) {
                 m_bounds.floorEstimated = false;
                 m_bounds.hasFloor = true;
             }
-        } else if (!atBottom && !blockAt(false)) {
+        } else if (!atBottom && !blockAt(false) && obs.mode != GameMode::Cube && obs.mode != GameMode::Robot) {
+            // (Cube and robot have no corridor ceiling: an upside-down contact
+            // that no known block explains is something local the observer
+            // does not report, not a level-wide ceiling. Learning it as one
+            // made the model expect a surface under hanging spikes in game.)
             float surf = obs.y + h;
             if (!m_bounds.hasCeil || m_bounds.ceilEstimated || surf > m_bounds.ceil) {
                 m_bounds.ceil = surf;
