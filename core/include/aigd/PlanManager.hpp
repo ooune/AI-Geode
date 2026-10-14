@@ -42,7 +42,7 @@ struct LivePlan {
     SearchStage stage = SearchStage::None;
     PlanSource source = PlanSource::None;
     bool landed = false;
-    float landX = 0.f;
+    float landX = 0.f, landY = 0.f;
     float startX = 0.f, startY = 0.f; // the state it was made from
     bool startGrounded = false;
     // Made by the prediction itself (planner, safety check, "no input

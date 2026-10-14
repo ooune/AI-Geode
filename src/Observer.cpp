@@ -158,6 +158,8 @@ bool movesGroups(int id) {
 
 void Observer::reset() {
     m_mapSources.clear();
+    m_mapAuditCursor = 0;
+    m_lastMapRefresh = m_lastMapAudit = -1;
     m_items.clear();
     m_items.shrink_to_fit();
     m_cursor = 0;
@@ -192,6 +194,8 @@ bool Observer::ensureIndex(PlayLayer* layer) {
 void Observer::buildMap(PlayLayer* layer, aigd::LevelMap& map, float floorSurface, MapStats& stats) {
     stats = MapStats{};
     m_mapSources.clear();
+    m_mapAuditCursor = 0;
+    m_lastMapRefresh = m_lastMapAudit = -1;
     map.clear();
     if (!layer || !layer->m_objects) return;
     stats.levelObjects = layer->m_objects->count();
@@ -247,7 +251,8 @@ void Observer::buildMap(PlayLayer* layer, aigd::LevelMap& map, float floorSurfac
 
 void Observer::refreshMap(aigd::LevelMap& map, float x, int32_t tick) {
     if (map.empty() || m_mapSources.empty()) return;
-    bool const all = (tick & 7) == 0;
+    bool const all = m_lastMapRefresh < 0 || tick < m_lastMapRefresh || tick - m_lastMapRefresh >= 8;
+    if (all) m_lastMapRefresh = tick;
     auto const& dyn = map.dynamicObjects();
     for (size_t k = 0; k < dyn.size(); ++k) {
         uint32_t const i = dyn[k];
@@ -258,20 +263,32 @@ void Observer::refreshMap(aigd::LevelMap& map, float x, int32_t tick) {
         auto const& r = obj->getObjectRect();
         map.updateObject(i, r.getMinX(), r.getMinY(), r.getMaxX(), r.getMaxY(), !obj->m_isGroupDisabled);
     }
-    if (tick % 30 == 0) {
-        // static objects ahead: check that they really do not move
-        thread_local std::vector<uint32_t> hits;
-        map.query(x, x + 600.f, hits);
-        int checked = 0;
-        for (uint32_t i : hits) {
+    if (m_lastMapAudit < 0 || tick < m_lastMapAudit || tick - m_lastMapAudit >= 30) {
+        m_lastMapAudit = tick;
+        // Keep the immediate approach fresh while the whole-level sweep
+        // discovers changes elsewhere. At most 64 nearby reads per audit.
+        thread_local std::vector<uint32_t> nearby;
+        map.query(x - 90.f, x + 600.f, nearby);
+        size_t checked = 0;
+        for (uint32_t i : nearby) {
+            auto const& m = map.at(i);
+            if (m.dynamic || m.source >= m_mapSources.size()) continue;
             if (checked++ >= 64) break;
+            GameObject* obj = m_mapSources[m.source];
+            auto const& r = obj->getObjectRect();
+            map.updateObject(i, r.getMinX(), r.getMinY(), r.getMaxX(), r.getMaxY(), !obj->m_isGroupDisabled);
+        }
+        // Sweep all loaded objects in bounded batches, including disabled
+        // objects and objects outside the viewport. Queries exclude disabled
+        // objects, so auditing only query hits could never discover reactivation.
+        size_t const count = std::min<size_t>(64, map.size());
+        for (size_t k = 0; k < count; ++k) {
+            uint32_t const i = static_cast<uint32_t>(m_mapAuditCursor++ % map.size());
             auto const& m = map.at(i);
             if (m.dynamic || m.source >= m_mapSources.size()) continue;
             GameObject* obj = m_mapSources[m.source];
             auto const& r = obj->getObjectRect();
-            bool const enabled = !obj->m_isGroupDisabled;
-            if (std::fabs(r.getMinX() - m.l) > 1.f || std::fabs(r.getMinY() - m.b) > 1.f || enabled != m.enabled)
-                map.updateObject(i, r.getMinX(), r.getMinY(), r.getMaxX(), r.getMaxY(), enabled);
+            map.updateObject(i, r.getMinX(), r.getMinY(), r.getMaxX(), r.getMaxY(), !obj->m_isGroupDisabled);
         }
     }
 }

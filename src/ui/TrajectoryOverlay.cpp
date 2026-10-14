@@ -79,7 +79,10 @@ void TrajectoryOverlay::render(aigd::OverlayGeometry const& g) {
 
     if (g.hasOrb && !g.orbLabel.empty()) {
         m_orbLabel->setVisible(true);
-        m_orbLabel->setString(g.orbLabel.c_str());
+        if (g.orbLabel != m_orbText) {
+            m_orbText = g.orbLabel;
+            m_orbLabel->setString(m_orbText.c_str());
+        }
         m_orbLabel->setPosition({g.orbLabelX, g.orbLabelY});
     } else {
         m_orbLabel->setVisible(false);
@@ -89,14 +92,16 @@ void TrajectoryOverlay::render(aigd::OverlayGeometry const& g) {
         return;
     }
     m_label->setVisible(true);
-    m_label->setString(g.label.c_str());
+    if (g.label != m_text) {
+        m_text = g.label;
+        m_label->setString(m_text.c_str());
+    }
     auto c = color(g.outcome == aigd::Certainty::Safe ? Style::PathSafe
                    : g.outcome == aigd::Certainty::Uncertain ? Style::PathUncertain : Style::PathDanger);
     m_label->setColor({static_cast<GLubyte>(c.r * 255), static_cast<GLubyte>(c.g * 255), static_cast<GLubyte>(c.b * 255)});
     if (g.hasCollision) {
         m_label->setPosition({g.collisionX, g.collisionY + 22.f});
-    } else if (!g.segments.empty()) {
-        auto const& last = g.segments.back();
-        m_label->setPosition({last.x1, last.y1 + 22.f});
+    } else if (g.hasEndpoint) {
+        m_label->setPosition({g.endpointX, g.endpointY + 22.f});
     }
 }

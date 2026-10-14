@@ -45,8 +45,8 @@ public:
     };
     void buildMap(PlayLayer* layer, aigd::LevelMap& map, float floorSurface, MapStats& stats);
     // Moving/toggled objects near x are re-read every step (all of them every
-    // 8 steps); every 30 steps a few static objects ahead are checked for
-    // unexpected movement (they are then treated as moving).
+    // 8 elapsed steps); every 30 elapsed steps up to 64 nearby static objects
+    // and 64 objects in a whole-level sweep are checked for unexpected changes.
     void refreshMap(aigd::LevelMap& map, float x, int32_t tick);
 
     static aigd::GameMode modeOf(PlayerObject* player);
@@ -63,6 +63,9 @@ private:
 
     std::vector<Item> m_items;
     std::vector<GameObject*> m_mapSources; // MapObject::source -> game object
+    size_t m_mapAuditCursor = 0;
+    int32_t m_lastMapRefresh = -1;
+    int32_t m_lastMapAudit = -1;
     size_t m_cursor = 0;
     float m_lastX = 0.f;
     unsigned m_indexedCount = ~0u;

@@ -84,6 +84,7 @@ void PlanManager::adopt(PredictedPath const& path, Observation const& from, int3
     m_plan.source = source;
     m_plan.landed = path.landed;
     m_plan.landX = path.landX;
+    m_plan.landY = path.landY;
     m_plan.startX = from.x;
     m_plan.startY = from.y;
     m_plan.startGrounded = from.onGround;

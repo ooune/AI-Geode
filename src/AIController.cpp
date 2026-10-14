@@ -288,7 +288,10 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
         // From the level map: wide enough for the strategic planner's
         // sequences (up to 420 steps), moving objects refreshed first.
         m_observer.refreshMap(m_map, obs.x, tick);
-        float const strategicReach = 420.f * aigd::unitsPerSecond(obs.speedClass()) / aigd::kTicksPerSecond + 120.f;
+        // Include the longest orb continuation and a speed portal ahead.
+        // The loaded map covers the level; this is the bounded simulation query.
+        float const strategicReach = 600.f * aigd::unitsPerSecond(4) / aigd::kTicksPerSecond + 120.f;
+        reach = std::max(reach, strategicReach);
         reach = std::max(reach, m_settings.strategicPlanning ? strategicReach : 0.f);
         // (gravity portals: the model of their effect has not been checked in game)
         m_map.collect(obs.x - 90.f, obs.x + reach + 60.f, m_obstacles, m_events, false, &m_orbs);

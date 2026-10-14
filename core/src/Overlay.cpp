@@ -10,6 +10,11 @@ void OverlayGeometry::clear() {
     segments.clear();
     dots.clear();
     boxes.clear();
+    hasEndpoint = false;
+    endpointX = endpointY = 0.f;
+    selectedPress = stale = false;
+    predictionAge = 0;
+    verdict = SafetyVerdict::NoPrediction;
     hasCollision = false;
     stepsToCollision = -1;
     outcome = Certainty::Safe;
@@ -37,6 +42,11 @@ void buildOverlay(PredictedPath const& main, PredictedPath const* alternative, s
                   OverlayGeometry& out, int stride, size_t maxHazards) {
     out.clear();
     out.outcome = main.outcome;
+    if (!main.points.empty()) {
+        out.hasEndpoint = true;
+        out.endpointX = main.points.back().x;
+        out.endpointY = main.points.back().y;
+    }
     auto style = main.outcome == Certainty::Safe ? OverlayGeometry::Style::PathSafe
                : main.outcome == Certainty::Uncertain ? OverlayGeometry::Style::PathUncertain
                                                        : OverlayGeometry::Style::PathDanger;
@@ -123,7 +133,7 @@ void addOrbLayer(Predictor const& predictor, OverlayGeometry& out, int stride) {
 bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decision, int32_t nowTick, bool showAlternative,
                           std::span<Obstacle const> obstacles, OverlayGeometry& out, LivePlan const* plan, bool showOrbs) {
     out.clear();
-    if (plan && plan->active && decision.proposedSource == DecisionSource::Plan && decision.tick == nowTick) {
+    if (plan && plan->active && !plan->steps.empty() && plan->indexOf(nowTick) < static_cast<int>(plan->steps.size()) && decision.proposedSource == DecisionSource::Plan && decision.tick == nowTick) {
         // Following the live plan: draw what is left of it, from now on.
         int const from = std::max(0, plan->indexOf(nowTick));
         auto const style = plan->outcome == Certainty::Safe ? OverlayGeometry::Style::PathSafe
@@ -134,7 +144,13 @@ bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decisi
             out.segments.push_back({plan->steps[prev].x, plan->steps[prev].y, plan->steps[i].x, plan->steps[i].y, style});
             prev = i;
         }
-        if (plan->landed) out.dots.push_back({plan->landX, 0.f, OverlayGeometry::Style::Landing});
+        auto const& end = plan->steps.back();
+        if (prev + 1 < plan->steps.size())
+            out.segments.push_back({plan->steps[prev].x, plan->steps[prev].y, end.x, end.y, style});
+        out.hasEndpoint = true;
+        out.endpointX = end.x;
+        out.endpointY = end.y;
+        if (plan->landed) out.dots.push_back({plan->landX, plan->landY, OverlayGeometry::Style::Landing});
         out.outcome = plan->outcome;
         out.verdict = decision.verdict;
         out.selectedPress = decision.executed != 0;

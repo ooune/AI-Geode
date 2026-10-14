@@ -50,6 +50,8 @@ struct OverlayGeometry {
     std::vector<Segment> segments;
     std::vector<Dot> dots;
     std::vector<Box> boxes;
+    bool hasEndpoint = false;
+    float endpointX = 0.f, endpointY = 0.f;
     bool hasCollision = false;
     float collisionX = 0.f, collisionY = 0.f;
     int32_t stepsToCollision = -1;

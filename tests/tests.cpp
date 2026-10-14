@@ -4320,6 +4320,66 @@ void prepareRig(PredictionRig& rig, std::initializer_list<OrbType> types) {
 }
 } // namespace
 
+TEST(overlay_resets_metadata_and_keeps_selected_endpoint) {
+    OverlayGeometry g;
+    g.stale = true;
+    g.selectedPress = true;
+    g.predictionAge = 8;
+    g.verdict = SafetyVerdict::Overridden;
+    PredictedPath selected, alternative;
+    selected.points = {{10.f, 20.f}, {30.f, 40.f}};
+    alternative.points = {{10.f, 20.f}, {100.f, 200.f}};
+    buildOverlay(selected, &alternative, {}, g);
+    CHECK(!g.stale && !g.selectedPress && g.predictionAge == 0);
+    CHECK(g.verdict == SafetyVerdict::NoPrediction);
+    CHECK(g.hasEndpoint && g.endpointX == 30.f && g.endpointY == 40.f);
+    g.clear();
+    CHECK(!g.hasEndpoint);
+}
+
+TEST(followed_plan_overlay_keeps_tail_and_landing_height) {
+    PhysicsModel physics;
+    Predictor predictor(physics);
+    LivePlan plan;
+    plan.active = true;
+    plan.createdTick = 0;
+    plan.landed = true;
+    plan.landX = 70.f;
+    plan.landY = 120.f;
+    for (int i = 0; i < 7; ++i)
+        plan.steps.push_back({i + 1, 0, 10.f * (i + 1), 120.f, true});
+    SafetyRecord decision;
+    decision.tick = 1;
+    decision.proposedSource = DecisionSource::Plan;
+    OverlayGeometry g;
+    CHECK(buildDecisionOverlay(predictor, decision, 1, false, {}, g, &plan, false));
+    CHECK(!g.segments.empty());
+    CHECK(g.segments.back().x1 == 70.f && g.segments.back().y1 == 120.f);
+    CHECK(g.hasEndpoint && g.endpointX == 70.f);
+    CHECK(g.dots.size() == 1 && g.dots[0].y == 120.f);
+    decision.tick = 100;
+    CHECK(!buildDecisionOverlay(predictor, decision, 100, false, {}, g, &plan, false));
+}
+
+TEST(full_level_map_tracks_small_motion_and_reactivation) {
+    LevelMap map;
+    MapObject near, far;
+    near.l = 100.f; near.r = 130.f; near.t = 30.f;
+    far.l = 10000.f; far.r = 10030.f; far.t = 30.f;
+    far.enabled = false;
+    map.build({near, far}, 12000.f, 0.f);
+    auto version = map.version();
+    map.updateObject(0, 100.25f, 0.f, 130.25f, 30.f, true);
+    CHECK(map.version() > version);
+    CHECK(map.at(0).l == 100.25f);
+    std::vector<uint32_t> hits;
+    map.query(9900.f, 10100.f, hits);
+    CHECK(hits.empty());
+    map.updateObject(1, 10000.f, 0.f, 10030.f, 30.f, true);
+    map.query(9900.f, 10100.f, hits);
+    CHECK(hits.size() == 1 && hits[0] == 1);
+}
+
 TEST(orbs_are_detected_and_classified) {
     // Every orb type is in the level map with its activation area, type and
     // (dash orbs) direction; simulated types are told apart from others.

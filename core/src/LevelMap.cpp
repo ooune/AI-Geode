@@ -72,7 +72,7 @@ void LevelMap::build(std::vector<MapObject> objects, float levelLength, float fl
 void LevelMap::updateObject(uint32_t index, float l, float b, float r, float t, bool enabled) {
     if (index >= m_objs.size()) return;
     MapObject& o = m_objs[index];
-    bool const moved = std::fabs(o.l - l) > 0.5f || std::fabs(o.b - b) > 0.5f || std::fabs(o.r - r) > 0.5f || std::fabs(o.t - t) > 0.5f;
+    bool const moved = std::fabs(o.l - l) > 0.01f || std::fabs(o.b - b) > 0.01f || std::fabs(o.r - r) > 0.01f || std::fabs(o.t - t) > 0.01f;
     if (!moved && o.enabled == enabled) return;
     if (!m_isDynamic[index]) {
         // A static object that moves: from now on it is treated as dynamic.
