@@ -60,6 +60,7 @@ void AIController::loadSettings() {
     m_settings.predictionHorizon = static_cast<float>(mod->getSettingValue<double>("prediction-horizon"));
     m_settings.strategicPlanning = mod->getSettingValue<bool>("strategic-planning");
     m_settings.showUnderstanding = mod->getSettingValue<bool>("show-understanding");
+    m_settings.showOrbs = mod->getSettingValue<bool>("show-orb-trajectories");
     m_settings.layers.overview = mod->getSettingValue<bool>("understanding-overview");
     m_settings.layers.objects = mod->getSettingValue<bool>("understanding-objects");
     m_settings.layers.groups = mod->getSettingValue<bool>("understanding-groups");
@@ -242,6 +243,7 @@ void AIController::afterReset(PlayLayer* layer) {
 }
 
 void AIController::press(PlayLayer* layer, bool down) {
+    if (down) m_lastPressTick = m_lastTick;
     m_injecting = true;
     layer->handleButton(down, 1, true);
     m_injecting = false;
@@ -289,19 +291,26 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
         float const strategicReach = 420.f * aigd::unitsPerSecond(obs.speedClass()) / aigd::kTicksPerSecond + 120.f;
         reach = std::max(reach, m_settings.strategicPlanning ? strategicReach : 0.f);
         // (gravity portals: the model of their effect has not been checked in game)
-        m_map.collect(obs.x - 90.f, obs.x + reach + 60.f, m_obstacles, m_events, false);
+        m_map.collect(obs.x - 90.f, obs.x + reach + 60.f, m_obstacles, m_events, false, &m_orbs);
+        for (auto& b : m_orbs) b.used = std::find(m_usedOrbs.begin(), m_usedOrbs.end(), b.id) != m_usedOrbs.end();
         obs.events = m_events;
+        obs.orbs = m_orbs;
         obs.geometryVersion = m_map.version();
     } else {
         m_observer.collectObstacles(obs.x - 90.f, obs.x + reach + 60.f, m_obstacles);
     }
     obs.obstacles = m_obstacles;
+    // orb activations the game reported since the last step
+    m_orbEventsNow.swap(m_orbEvents);
+    m_orbEvents.clear();
+    obs.orbEvents = m_orbEventsNow;
     m_predictor.observe(obs, m_holding);
     if (m_level->levelLength < obs.levelLength) m_level->levelLength = obs.levelLength;
 
     if (!m_agent.attemptActive()) {
         bool fromCheckpoint = layer->m_isPracticeMode && layer->m_checkpointArray && layer->m_checkpointArray->count() > 0;
         if (m_holding) press(layer, false);
+        m_usedOrbs.clear();
         m_agent.beginAttempt(obs, fromCheckpoint);
         m_stallX = obs.x;
         m_stallTick = tick;
@@ -317,6 +326,8 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
     m_lastObs = obs;
     m_lastObs.obstacles = {}; // the span is only valid for this step
     m_lastObs.events = {};
+    m_lastObs.orbs = {};
+    m_lastObs.orbEvents = {};
 
     // Watchdog: classic levels always move right; if nothing happens for a
     // while (stuck object, odd trigger setup) restart instead of hanging.
@@ -455,6 +466,11 @@ void AIController::logAttemptQuality(aigd::GameMode mode, bool mini) const {
               st.strategicPlans, st.strategicOverrides, sp.adopted, st.strategicInvalidated, st.strategicSeeded, st.strategicMatched,
               st.strategicPlans ? st.strategicMicros / st.strategicPlans : 0.0, st.strategicMaxMicros, m_map.dynamicObjects().size(), m_map.promoted(),
               m_map.version(), st.strategicEvent.empty() ? "" : " | last: ", st.strategicEvent);
+    log::info("Orbs: {} met, activations planned {}, confirmed by the game {}, not confirmed {}, skipped {}, orb strategies learned {} | "
+              "model: {}{}{}",
+              st.orbsSeen, st.orbActivationsPlanned, st.orbActivationsConfirmed, st.orbActivationsMissed, st.orbSkips, st.orbStrategiesLearned,
+              m_physics.describeOrbs(), st.orbChoice.empty() ? "" : " | last choice: ", st.orbChoice);
+    for (auto const& msg : st.orbLog) log::info("  Orb: {}", msg);
     auto const& T = st.transfer;
     log::info("Transfer: {} obstacle groups ({} known, {} similar, {} new, {} rejected after failing here, {} speed-adapted) | strategies "
               "simulated {}: executed as learned {}, replaced by the search {}; played directly {} | recorded {} passes, {} failures, {} not attributable | "
@@ -737,6 +753,79 @@ void AIController::importLevelMemory() {
     });
 }
 
+bool AIController::tracksPlayer(PlayerObject* player) const {
+    return m_layer && m_supported && player && player == m_layer->m_player1 && m_settings.aiEnabled;
+}
+
+namespace {
+aigd::OrbType orbTypeOf(GameObject* ring) {
+    switch (ring->m_objectType) {
+        case GameObjectType::PinkJumpRing: return aigd::OrbType::Pink;
+        case GameObjectType::RedJumpRing: return aigd::OrbType::Red;
+        case GameObjectType::GravityRing: return aigd::OrbType::Blue;
+        case GameObjectType::GreenRing: return aigd::OrbType::Green;
+        case GameObjectType::DropRing: return aigd::OrbType::Black;
+        case GameObjectType::DashRing: return aigd::OrbType::Dash;
+        case GameObjectType::GravityDashRing: return aigd::OrbType::GravityDash;
+        case GameObjectType::SpiderOrb: return aigd::OrbType::Spider;
+        case GameObjectType::TeleportOrb: return aigd::OrbType::Teleport;
+        case GameObjectType::CustomRing: return aigd::OrbType::Custom;
+        default: return aigd::OrbType::Yellow;
+    }
+}
+} // namespace
+
+void AIController::onOrbActivated(PlayerObject* player, GameObject* ring, double vyBefore, double vyAfter, bool flippedBefore, bool flippedAfter) {
+    if (!tracksPlayer(player) || !ring) return;
+    aigd::OrbEvent e;
+    e.kind = aigd::OrbEvent::Kind::Activated;
+    e.type = orbTypeOf(ring);
+    e.id = ring->m_uniqueID;
+    e.mode = Observer::modeOf(player);
+    e.mini = player->m_vehicleSize < 0.9f;
+    e.x = player->m_position.x;
+    e.y = player->m_position.y;
+    e.vyBefore = static_cast<float>(vyBefore);
+    e.vyAfter = static_cast<float>(vyAfter);
+    e.flippedBefore = flippedBefore;
+    e.flippedAfter = flippedAfter;
+    // the button went down at the last AI step (vs. held from before)
+    e.newPress = m_holding && m_lastPressTick >= m_lastTick;
+    m_orbEvents.push_back(e);
+    if (std::find(m_usedOrbs.begin(), m_usedOrbs.end(), e.id) == m_usedOrbs.end()) m_usedOrbs.push_back(e.id);
+}
+
+void AIController::onDashStarted(PlayerObject* player, GameObject* ring, double angle) {
+    if (!tracksPlayer(player) || !ring) return;
+    aigd::OrbEvent e;
+    e.kind = aigd::OrbEvent::Kind::DashStarted;
+    e.type = orbTypeOf(ring);
+    e.id = ring->m_uniqueID;
+    e.mode = Observer::modeOf(player);
+    e.mini = player->m_vehicleSize < 0.9f;
+    e.x = player->m_position.x;
+    e.y = player->m_position.y;
+    e.dashAngle = static_cast<float>(angle);
+    e.flippedAfter = player->m_isUpsideDown;
+    m_dashType = e.type;
+    m_orbEvents.push_back(e);
+}
+
+void AIController::onDashStopped(PlayerObject* player, double vyBefore, double vyAfter) {
+    if (!tracksPlayer(player)) return;
+    aigd::OrbEvent e;
+    e.kind = aigd::OrbEvent::Kind::DashStopped;
+    e.type = m_dashType;
+    e.mode = Observer::modeOf(player);
+    e.mini = player->m_vehicleSize < 0.9f;
+    e.x = player->m_position.x;
+    e.y = player->m_position.y;
+    e.vyBefore = static_cast<float>(vyBefore);
+    e.vyAfter = static_cast<float>(vyAfter);
+    e.flippedBefore = e.flippedAfter = player->m_isUpsideDown;
+    m_orbEvents.push_back(e);
+}
+
 bool AIController::understandingGeometry(aigd::UnderstandingOverlay& out) const {
     if (!m_layer || !m_supported || !m_settings.showUnderstanding || !m_mapReady) return false;
     auto const* plan = m_agent.strategic().active() ? &m_agent.strategic().plan() : nullptr;
@@ -750,7 +839,7 @@ bool AIController::overlayGeometry(aigd::OverlayGeometry& out) const {
     if (!m_agent.attemptActive()) return false;
     // The executed decision's path, labelled with what is really being done.
     return aigd::buildDecisionOverlay(m_predictor, m_agent.status().safety, m_lastTick, m_settings.showAlternative, m_obstacles, out,
-                                      &m_agent.plans().plan());
+                                      &m_agent.plans().plan(), m_settings.showOrbs);
 }
 
 void AIController::openMemoryFolder() const {

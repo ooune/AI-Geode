@@ -2,6 +2,7 @@
 #include <aigd/StateKey.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -270,6 +271,13 @@ void Agent::beginAttempt(Observation const& first, bool fromCheckpoint) {
     m_status.strategicEvent.clear();
     m_status.strategicSeeded = 0;
     m_status.strategicMatched = 0;
+    m_orbNotes.clear();
+    m_orbEnter.clear();
+    m_expectOrb = {};
+    m_dashWarned = false;
+    m_status.orbLog.clear();
+    m_status.orbsSeen = m_status.orbActivationsPlanned = m_status.orbActivationsConfirmed = 0;
+    m_status.orbActivationsMissed = m_status.orbSkips = m_status.orbStrategiesLearned = 0;
     if (m_cfg.learningEnabled && m_pendingExp.active && m_pendingExp.toCell >= xCell(first.x, m_cfg.cellSize)) {
         m_activeExp = std::move(m_pendingExp);
     }
@@ -308,6 +316,14 @@ bool Agent::act(Observation const& obs) {
     // Obstacle groups ahead (cross-level strategies): resolved when passed,
     // and a new one is described and looked up when it comes into view.
     trackGroups(obs);
+    // Orbs: which ones the player is in, what the game confirmed, what the
+    // model got wrong. An activation that was planned but not confirmed (or
+    // one that was not planned) makes the current plans obsolete.
+    bool const orbMissed = trackOrbs(obs);
+    if (orbMissed) {
+        if (m_plan.active()) m_plan.release(obs.tick, "orb activation did not happen as planned");
+        m_strategic.invalidate("orb activation did not happen as planned - replanning from the actual state");
+    }
 
     // Strategic plan for the obstacle sequence ahead: checked against the
     // real state on every observation and re-made when the state leaves it.
@@ -366,7 +382,7 @@ bool Agent::act(Observation const& obs) {
                            m_plan.age(obs.tick) >= 1 && m_predictor->trusted(obs.mode, obs.mini) &&
                            m_plan.age(obs.tick) < m_cfg.planFollowSteps && m_plan.remaining(obs.tick) > m_cfg.planMinLeft &&
                            m_plan.plan().outcome == Certainty::Safe && !m_activeExp.covers(planCell);
-    if (!following && !planInvalidated && key == m_curKey && obs.tick - m_lastDecisionTick < m_cfg.maxStickTicks &&
+    if (!following && !planInvalidated && !orbMissed && key == m_curKey && obs.tick - m_lastDecisionTick < m_cfg.maxStickTicks &&
         !(watched && (m_danger || offPath || m_plan.active())))
         return holdingNow;
 
@@ -434,8 +450,23 @@ bool Agent::act(Observation const& obs) {
             if (g->choice.primitive == Primitive::RejumpChain) p.rejump = true;
             if (g->choice.primitive == Primitive::DoubleJump) p.secondAt = std::max(0, static_cast<int32_t>(std::lround(g->choice.secondSteps)));
             if (g->choice.primitive == Primitive::LongJump) p.holdFor = std::max(12, static_cast<int32_t>(std::lround(g->choice.secondSteps)));
+            if (g->choice.primitive == Primitive::OrbActivate) p.pressAt = -1;
             m_predictor->addSeed(p);
             g->seedContact = contact;
+        }
+        // an orb strategy: press when the hitbox has been in the orb for the learned number of steps
+        if (g && g->choice.usable && g->choice.primitive == Primitive::OrbActivate && g->sit.orbs > 0 && !g->pressed) {
+            float const vx = unitsPerSecond(obs.speedClass()) / static_cast<float>(kTicksPerSecond);
+            float const toOrb = (g->sit.orbX - (obs.x + situationHalfSize(obs.mini))) / vx;
+            Plan p;
+            if (g->choice.leadSteps >= 0.f && obs.onGround) {
+                float const contact = (g->sit.startX - (obs.x + situationHalfSize(obs.mini))) / vx;
+                p.pressAt = std::max(0, static_cast<int32_t>(std::lround(contact - g->choice.leadSteps)));
+            }
+            bool const dash = isDashOrb(g->sit.firstOrb);
+            p.orbPressAt = std::max(0, static_cast<int32_t>(std::lround(toOrb)) + (dash ? 0 : static_cast<int32_t>(std::lround(std::max(0.f, g->choice.secondSteps)))));
+            p.orbHoldFor = dash ? std::max(4, static_cast<int32_t>(std::lround(g->choice.secondSteps))) : 0;
+            m_predictor->addSeed(p);
         }
         // The strategic plan for the whole sequence is one more candidate for
         // the search, which also looks as far ahead as the sequence goes, so
@@ -457,6 +488,26 @@ bool Agent::act(Observation const& obs) {
             // input sequence: the strategic plan follows what is executed
             // (below) instead of being invalidated as soon as the two diverge.
             else if (adv->trusted && adv->bestScore >= m_predictor->scoreOf(m_strategic.plan().path)) adoptStrategic = true;
+        }
+        if (adv->orb.present && adv->computedTick == obs.tick && !adv->reused) {
+            auto const& O = adv->orb;
+            m_status.orb = O;
+            bool const isNew = std::none_of(m_orbNotes.begin(), m_orbNotes.end(), [&](OrbNote const& n) { return n.id == O.id; });
+            OrbNote& note = orbNote(O.id, O.type);
+            std::string const name = orbTypeName(O.type);
+            std::string const Name = std::string(1, static_cast<char>(std::toupper(name[0]))) + name.substr(1);
+            if (isNew) {
+                ++m_status.orbsSeen;
+                if (!O.simulated) noteOrb(Name + " detected - its effect is not simulated, so paths through it are uncertain");
+                else if (!O.known) noteOrb(Name + " detected - evaluating activation and skip options (its effect is not calibrated yet: uncertain)");
+                else noteOrb(Name + " detected - evaluating activation and skip options");
+            }
+            // (a collision far beyond the orb is a later obstacle, not the orb)
+            if (O.candidates > 0 && O.activate == Certainty::Collision && O.activateTTC < 200 && !note.warnedCollision) {
+                note.warnedCollision = true;
+                noteOrb(fmt("Orb activation predicted to collide with %s in %d steps - testing alternative timing (%d timings simulated)",
+                            O.activateHitsAbove ? "the ceiling" : "an obstacle", O.activateTTC + 1, O.candidates));
+            }
         }
         if (g && adv->strategySeeded && adv->computedTick == obs.tick && !adv->reused) {
             g->seeded = true;
@@ -835,6 +886,40 @@ bool Agent::act(Observation const& obs) {
         PredictedPath const& mine = a ? m_predictor->pressPath() : m_predictor->releasePath();
         size_t const first = static_cast<size_t>(m_predictor->inputLatency());
         bool const matches = mine.holds.size() > first && mine.holds[first] == static_cast<uint8_t>(a);
+        if (adv && adv->orb.present && adv->computedTick == obs.tick && matches) {
+            auto const& O = adv->orb;
+            bool const sel = mine.activates(O.id);
+            m_status.orbSelected = sel;
+            auto outcomeText = [](Certainty c, int32_t ttc) {
+                return c == Certainty::Collision ? fmt("collision in %d steps", ttc + 1) : std::string(certaintyName(c));
+            };
+            OrbNote& note = orbNote(O.id, O.type);
+            m_status.orbChoice = fmt("%s: activate %s (%d timings) vs. skip %s -> %s", orbTypeName(O.type),
+                                     O.candidates ? outcomeText(O.activate, O.activateTTC).c_str() : "not simulated",
+                                     O.candidates, outcomeText(O.skip, O.skipTTC).c_str(), sel ? "activating" : "skipping");
+            note.lastChoice = m_status.orbChoice;
+            if (sel) {
+                int const i = mine.orbActivations > 1 && mine.orbId[1] == O.id ? 1 : 0;
+                // a press sent now that activates it in this step: the game
+                // must report it at the next observation (not moved by later
+                // decisions any more)
+                bool const now = mine.orbStep[i] == 0 && a == 1;
+                if (!(m_expectOrb.active && m_expectOrb.committed && m_expectOrb.id == O.id))
+                    m_expectOrb = {true, O.id, O.type, obs.tick + 1 + mine.orbStep[i], now};
+                if (!note.selected) {
+                    note.selected = true;
+                    ++m_status.orbActivationsPlanned;
+                    if (isDashOrb(O.type))
+                        noteOrb(fmt("Dash orb selected - evaluating post-dash landing: %s%s", mine.landed ? fmt("lands at x=%.0f, ", mine.landX).c_str() : "",
+                                    outcomeText(mine.outcome, mine.collisionStep).c_str()));
+                    else
+                        noteOrb(fmt("%s selected: activation %s, skipping would be %s", orbTypeName(O.type), outcomeText(mine.outcome, mine.collisionStep).c_str(),
+                                    outcomeText(O.skip, O.skipTTC).c_str()));
+                }
+            } else if (m_expectOrb.active && m_expectOrb.id == O.id && !m_expectOrb.committed) {
+                m_expectOrb.active = false;
+            }
+        }
         if (adv && trusted && adv->computedTick == obs.tick && matches) {
             if (adoptStrategic) m_strategic.adoptController(obs, mine);
             bool const byPrediction = src == DecisionSource::Planner || src == DecisionSource::Shield || src == DecisionSource::Economy;
@@ -1910,6 +1995,12 @@ void Agent::trackGroups(Observation const& obs) {
             if (it->pressed || !it->airborne) {
                 if (m_cfg.learningEnabled) m_strategies->record(it->sit, it->primitive, it->lead, it->second, true, m_level->key);
                 ++T.successes;
+                if (it->primitive == Primitive::OrbActivate && m_cfg.learningEnabled) {
+                    ++m_status.orbStrategiesLearned;
+                    noteOrb(fmt("Learned a reusable orb strategy: %s, %s %.0f steps %s (%s)", orbTypeName(it->sit.firstOrb),
+                                isDashOrb(it->sit.firstOrb) ? "dash held" : "pressed", std::max(0.f, it->second),
+                                isDashOrb(it->sit.firstOrb) ? "long" : "after reaching it", it->sit.describe().c_str()));
+                }
             } else {
                 ++T.unattributed;
             }
@@ -1962,6 +2053,26 @@ void Agent::trackGroups(Observation const& obs) {
 int Agent::transferAction(Observation const& obs, PendingGroup const& g) const {
     auto const& c = g.choice;
     if (!c.usable) return -1;
+    if (c.primitive == Primitive::OrbActivate && g.primitive != Primitive::OrbActivate) {
+        // press when the hitbox has been inside the orb for the learned number of steps
+        float const h = situationHalfSize(obs.mini);
+        for (auto const& o : obs.orbs) {
+            if (o.used || !(o.l <= obs.x + h && o.r >= obs.x - h && o.b <= obs.y + h && o.t >= obs.y - h)) continue;
+            int32_t enter = obs.tick;
+            for (auto const& p : m_orbEnter)
+                if (p.first == o.id) enter = p.second;
+            if (isDashOrb(o.type)) return 1;
+            return obs.tick - enter >= std::lround(std::max(0.f, c.secondSteps)) ? 1 : 0;
+        }
+        if (!g.pressed && obs.onGround && c.leadSteps >= 0.f) {
+            float const vx = unitsPerSecond(obs.speedClass()) / static_cast<float>(kTicksPerSecond);
+            float const contact = (g.sit.startX - (obs.x + situationHalfSize(obs.mini))) / vx;
+            return contact <= c.leadSteps + 0.5f ? 1 : 0;
+        }
+        return 0;
+    }
+    if (c.primitive == Primitive::OrbActivate && g.dashStart >= 0) // dash in progress: hold for the learned time
+        return obs.tick - g.dashStart < std::lround(std::max(4.f, c.secondSteps)) ? 1 : 0;
     if (!g.pressed) {
         if (!obs.onGround) return -1;
         if (c.primitive == Primitive::Wait || c.leadSteps < 0.f) return 0;
@@ -2056,6 +2167,100 @@ void Agent::resolveGroups(float deathX, bool died, bool completed) {
     }
     if (m_strategies) m_status.transferTotal.add(m_status.transfer);
     m_groups.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Orbs
+
+void Agent::noteOrb(std::string msg) {
+    m_status.orbEvent = msg;
+    m_status.orbLog.push_back(std::move(msg));
+    if (m_status.orbLog.size() > 8) m_status.orbLog.erase(m_status.orbLog.begin());
+}
+
+Agent::OrbNote& Agent::orbNote(int32_t id, OrbType type) {
+    for (auto& n : m_orbNotes)
+        if (n.id == id) return n;
+    m_orbNotes.push_back({});
+    m_orbNotes.back().id = id;
+    m_orbNotes.back().type = type;
+    return m_orbNotes.back();
+}
+
+bool Agent::trackOrbs(Observation const& obs) {
+    float const h = situationHalfSize(obs.mini);
+    bool obsolete = false;
+    // when the player's hitbox started overlapping each orb
+    for (auto const& o : obs.orbs) {
+        bool const over = o.l <= obs.x + h && o.r >= obs.x - h && o.b <= obs.y + h && o.t >= obs.y - h;
+        auto it = std::find_if(m_orbEnter.begin(), m_orbEnter.end(), [&](auto const& p) { return p.first == o.id; });
+        if (over && it == m_orbEnter.end()) m_orbEnter.push_back({o.id, obs.tick});
+        else if (!over && it != m_orbEnter.end() && o.r < obs.x - h) m_orbEnter.erase(it);
+    }
+    // what the game reported
+    for (auto const& e : obs.orbEvents) {
+        if (e.kind == OrbEvent::Kind::Activated) {
+            OrbNote& note = orbNote(e.id, e.type);
+            note.activated = true;
+            if (m_expectOrb.active && m_expectOrb.id == e.id) {
+                ++m_status.orbActivationsConfirmed;
+                noteOrb(fmt("%s activation confirmed by the game", orbTypeName(e.type)));
+            } else {
+                noteOrb(fmt("%s activated without being planned (%s) - replanning from the actual state", orbTypeName(e.type),
+                            e.newPress ? "a new press inside it" : "the button was held into it"));
+                obsolete = true;
+            }
+            m_expectOrb.active = false;
+            // the group being handled was handled with this orb
+            if (PendingGroup* g = currentGroup(obs)) {
+                int32_t enter = obs.tick;
+                for (auto const& p : m_orbEnter)
+                    if (p.first == e.id) enter = p.second;
+                g->primitive = Primitive::OrbActivate;
+                g->pressed = true;
+                g->orbId = e.id;
+                g->second = isDashOrb(e.type) ? 0.f : static_cast<float>(std::max(0, obs.tick - enter - 1));
+                if (isDashOrb(e.type)) g->dashStart = obs.tick;
+            }
+        } else if (e.kind == OrbEvent::Kind::DashStopped) {
+            for (auto& g : m_groups)
+                if (g.primitive == Primitive::OrbActivate && g.dashStart >= 0 && g.second <= 0.f) g.second = static_cast<float>(obs.tick - g.dashStart);
+        }
+    }
+    if (m_expectOrb.active && obs.tick > m_expectOrb.tick + (m_expectOrb.committed ? 1 : 2)) {
+        ++m_status.orbActivationsMissed;
+        noteOrb(fmt("Orb activation not confirmed (%s expected %d steps ago) - replanning from actual player state", orbTypeName(m_expectOrb.type),
+                    obs.tick - m_expectOrb.tick));
+        m_expectOrb.active = false;
+        obsolete = true;
+    }
+    // what the model got wrong (the predictor learns from it)
+    if (m_predictor) {
+        auto const& chk = m_predictor->lastOrbCheck();
+        if (chk.activations != m_orbChecksSeen) {
+            m_orbChecksSeen = chk.activations;
+            if (!chk.dash && !chk.wasKnown)
+                noteOrb(fmt("First %s activation observed - its effect is calibrated from it now", orbTypeName(chk.type)));
+            else if (!chk.dash && std::fabs(chk.vyError) > 0.5f)
+                noteOrb(fmt("Predicted %s effect differs from actual movement (velocity off by %+.2f) - model updated", orbTypeName(chk.type), chk.vyError));
+        }
+        if (m_predictor->dashActive() && chk.dashError > 2.f && !m_dashWarned) {
+            m_dashWarned = true;
+            noteOrb(fmt("Predicted dash trajectory differs from actual movement (%.1f units in one step) - updating model confidence", chk.dashError));
+        }
+        if (!m_predictor->dashActive()) m_dashWarned = false;
+    }
+    // orbs passed without activating them
+    for (auto& n : m_orbNotes) {
+        if (n.activated || n.skipReported) continue;
+        for (auto const& o : obs.orbs) {
+            if (o.id != n.id || o.r >= obs.x - h) continue;
+            n.skipReported = true;
+            ++m_status.orbSkips;
+            noteOrb(fmt("Skipped the %s%s", orbTypeName(n.type), n.lastChoice.empty() ? "" : (" (" + n.lastChoice + ")").c_str()));
+        }
+    }
+    return obsolete;
 }
 
 } // namespace aigd

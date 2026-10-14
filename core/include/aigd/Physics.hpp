@@ -65,13 +65,40 @@ struct ModeCalibration {
     uint32_t boostMax = 0; // robot: longest boost seen after a take-off (steps)
 };
 
+// What activating an orb does, gravity-normalised (+ = away from the surface
+// gravity pulls to, in the gravity frame *after* the activation).
+struct OrbPhysics {
+    bool known = false;        // calibrated from activations observed in the game
+    bool flips = false;        // the activation flips gravity
+    float vy = 0.f;            // vertical velocity right after the activation
+    // dash orbs: a straight line while the button is held
+    bool dash = false;
+    bool dashKnown = false;    // the dash movement itself has been observed
+    float dashDx = 1.f;        // x advance per step during the dash, relative to the normal x speed
+    float dashSlope = 1.f;     // (dy/dx during the dash) / tan(the direction from the orb rotation)
+    float dashEndVy = 0.f;     // vertical velocity right after the dash ends
+};
+
+// Running sums for one orb type in one mode/size (plain data, saved).
+struct OrbCalibration {
+    RunningStat vy;            // normalised vy after activation
+    uint32_t n = 0, flips = 0; // activations, and how many flipped gravity
+    RunningStat dashDx, dashSlope, dashEndVy;
+    uint32_t dashEndsReleased = 0, dashEndsOther = 0;
+};
+
 struct PhysicsCalibration {
     static constexpr size_t kSlots = static_cast<size_t>(GameMode::Count) * 2;
+    static constexpr size_t kOrbSlots = static_cast<size_t>(OrbType::Count) * kSlots;
     std::array<ModeCalibration, kSlots> modes{};
     std::array<double, 5> vxSum{};
     std::array<uint32_t, 5> vxN{};
+    std::array<OrbCalibration, kOrbSlots> orbs{};
+    // Holding the button from before reaching an orb: did the orb activate?
+    uint32_t heldEntryActivated = 0, heldEntryIgnored = 0;
 
     static size_t slot(GameMode m, bool mini) { return static_cast<size_t>(m) * 2 + (mini ? 1 : 0); }
+    static size_t orbSlot(OrbType t, GameMode m, bool mini) { return static_cast<size_t>(t) * kSlots + slot(m, mini); }
 };
 
 // Physics model of the player for every game mode, fitted to what the game
@@ -94,6 +121,23 @@ public:
     // Two consecutive observations (one physics step apart) and the button
     // state during that step / the step before (to detect new presses).
     void observeStep(Observation const& prev, Observation const& cur, bool heldDuringStep, bool heldBefore);
+
+    // ---- orbs ----
+    // The effect of an orb type in a mode (calibrated values once observed,
+    // otherwise guesses with known = false).
+    OrbPhysics orb(OrbType type, GameMode mode, bool mini) const;
+    // An activation reported by the game: learns the velocity and gravity
+    // after it. Returns actual - predicted velocity (0 for dash orbs).
+    float observeOrb(OrbEvent const& e);
+    // One step of a dash (positions one physics step apart, gravity-normalised dy).
+    void observeDashStep(OrbType type, GameMode mode, bool mini, float dx, float dy, float rotation, int speedClass);
+    // The end of a dash: velocity right after it, and whether the button had been released.
+    void observeDashEnd(OrbType type, GameMode mode, bool mini, float vyNormalised, bool released);
+    // Whether holding the button from before reaching an orb activates it
+    // (-1 not known yet, 0 no, 1 yes), learned from what the game did.
+    int heldEntryActivates() const;
+    void observeHeldEntry(bool activated);
+    std::string describeOrbs() const;
 
     void recordAccuracy(GameMode mode, float error, int steps);
     float driftPerTick(GameMode mode) const;

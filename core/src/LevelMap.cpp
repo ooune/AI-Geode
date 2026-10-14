@@ -118,11 +118,12 @@ void LevelMap::query(float x0, float x1, std::vector<uint32_t>& out) const {
 }
 
 void LevelMap::collect(float x0, float x1, std::vector<Obstacle>& obstacles, std::vector<PhysicsEvent>& events,
-                       bool gravityVerified) const {
+                       bool gravityVerified, std::vector<Orb>* orbs) const {
     thread_local std::vector<uint32_t> hits;
     query(x0, x1, hits);
     obstacles.clear();
     events.clear();
+    if (orbs) orbs->clear();
     for (uint32_t i : hits) {
         MapObject const& o = m_objs[i];
         if (o.r - o.l <= 0.f || o.t - o.b <= 0.f) continue;
@@ -141,6 +142,23 @@ void LevelMap::collect(float x0, float x1, std::vector<Obstacle>& obstacles, std
                 events.push_back({o.l, o.b, o.r, o.t, k, 0, gravityVerified});
                 break;
             }
+            case MapKind::Orb:
+                if (orbs) {
+                    Orb b;
+                    b.l = o.l;
+                    b.b = o.b;
+                    b.r = o.r;
+                    b.t = o.t;
+                    b.type = static_cast<OrbType>(std::min<int>(o.value, static_cast<int>(OrbType::Count) - 1));
+                    b.rotation = o.rotation;
+                    b.dashSpeed = o.dashSpeed;
+                    b.maxDuration = o.maxDuration;
+                    b.id = o.uniqueId;
+                    orbs->push_back(b);
+                    break;
+                }
+                obstacles.push_back({o.l, o.b, o.r, o.t, Obstacle::Kind::Uncertain});
+                break;
             default: obstacles.push_back({o.l, o.b, o.r, o.t, Obstacle::Kind::Uncertain}); break;
         }
     }

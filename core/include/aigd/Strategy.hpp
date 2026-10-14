@@ -20,6 +20,8 @@ enum class Primitive : uint8_t {
     RejumpChain,  // jump and keep holding through the landing (jumps again on landing)
     DoubleJump,   // jump, land, and jump again `second` steps after landing
     LongJump,     // robot: jump and hold the boost for `second` steps
+    OrbActivate,  // activate the orb of the group: `second` steps after reaching it (dash: held `second` steps);
+                  // `lead` >= 0: a jump `lead` steps before contact comes first
     Count
 };
 char const* primitiveName(Primitive p);

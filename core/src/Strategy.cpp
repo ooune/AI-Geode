@@ -13,6 +13,7 @@ char const* primitiveName(Primitive p) {
         case Primitive::RejumpChain: return "jump and hold through the landing";
         case Primitive::DoubleJump: return "two jumps";
         case Primitive::LongJump: return "long jump";
+        case Primitive::OrbActivate: return "orb activation";
         default: return "?";
     }
 }

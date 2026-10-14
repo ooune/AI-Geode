@@ -29,6 +29,10 @@ struct OverlayGeometry {
         HazardHit,
         Keep,     // what keeping the current button state would do
         Stale,    // a prediction that was not computed for the current step
+        OrbBox,       // an orb's activation area
+        OrbActivated, // the path if the orb is activated (not the selected action)
+        OrbSkipped,   // the path if it is not (not the selected action)
+        OrbPoint,     // where the activation happens
     };
     struct Segment {
         float x0, y0, x1, y1;
@@ -56,6 +60,11 @@ struct OverlayGeometry {
     bool stale = false;           // prediction not computed for the current step
     int32_t predictionAge = 0;
     SafetyVerdict verdict = SafetyVerdict::NoPrediction;
+    // orb layer: the nearest orb, both outcomes, and which one is selected
+    bool hasOrb = false;
+    bool orbSelected = false;     // the selected (executed) path activates it
+    std::string orbLabel;
+    float orbLabelX = 0.f, orbLabelY = 0.f;
 
     void clear();
 };
@@ -75,7 +84,14 @@ void buildOverlay(PredictedPath const& main, PredictedPath const* alternative, s
 // While the AI follows its live plan, `plan` is drawn from the current step
 // on instead (the path that is actually being followed).
 bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decision, int32_t nowTick, bool showAlternative,
-                          std::span<Obstacle const> obstacles, OverlayGeometry& out, LivePlan const* plan = nullptr);
+                          std::span<Obstacle const> obstacles, OverlayGeometry& out, LivePlan const* plan = nullptr, bool showOrbs = true);
+
+// The orb layer alone (added by buildDecisionOverlay when showOrbs): the
+// orb's area; the selected path is the executed one (drawn by the decision
+// overlay, with the orb's effect only if the executed input activates it);
+// the other outcome is drawn in its own style (activated / skipped), plus
+// the activation point, the landing and collision of the activation.
+void addOrbLayer(Predictor const& predictor, OverlayGeometry& out, int stride = 4);
 
 // ---------------------------------------------------------------------------
 // "What the AI believes is in the level": the level-understanding debug view.

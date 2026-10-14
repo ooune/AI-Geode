@@ -94,6 +94,8 @@ struct PredictionRig {
     Predictor predictor{model};
     std::vector<Obstacle> obstacles;
     std::vector<PhysicsEvent> events;
+    std::vector<Orb> orbs;
+    std::vector<OrbEvent> orbEvents;
     bool held = false;
     float ahead = 480.f; // how far ahead obstacles are reported (the game observer's window)
 
@@ -101,8 +103,13 @@ struct PredictionRig {
         Observation o = world.observe();
         world.collectObstacles(o.x - 90.f, o.x + ahead, obstacles);
         world.collectEvents(o.x - 90.f, o.x + ahead, events);
+        world.collectOrbs(o.x - 90.f, o.x + ahead, orbs);
+        orbEvents = world.orbEvents();
         o.obstacles = obstacles;
         o.events = events;
+        o.orbs = orbs;
+        o.orbEvents = orbEvents;
+        o.dashing = world.dashing();
         return o;
     }
 };
@@ -3595,6 +3602,12 @@ LevelMap simMap(sim::Level const& L) {
             case sim::ObjKind::ModePortal: m = {o.x, o.y, o.x + o.w, o.y + o.h, MapKind::ModePortal, static_cast<uint8_t>(o.mode)}; break;
             case sim::ObjKind::GravityPortal: m = {o.x, o.y, o.x + o.w, o.y + o.h, MapKind::GravityPortal, 2}; break;
             case sim::ObjKind::SpeedPortal: m = {o.x, o.y, o.x + o.w, o.y + o.h, MapKind::SpeedPortal, static_cast<uint8_t>(o.speed)}; break;
+            case sim::ObjKind::Orb:
+                m = {o.x, o.y, o.x + o.w, o.y + o.h, MapKind::Orb, static_cast<uint8_t>(o.orbType)};
+                m.rotation = o.rotation;
+                m.maxDuration = o.maxDuration;
+                m.uniqueId = static_cast<int32_t>(i);
+                break;
         }
         m.dynamic = o.moveAt >= 0;
         m.source = i;
@@ -3612,6 +3625,8 @@ struct MapObserver {
     sim::Level const& level;
     std::vector<Obstacle> obstacles;
     std::vector<PhysicsEvent> events;
+    std::vector<Orb> orbs, worldOrbs;
+    std::vector<OrbEvent> orbEvents;
     float ahead = 900.f;
     bool refresh = true;
 
@@ -3625,9 +3640,18 @@ struct MapObserver {
             }
         }
         Observation o = w.observe();
-        map.collect(o.x - 90.f, o.x + ahead, obstacles, events, true);
+        map.collect(o.x - 90.f, o.x + ahead, obstacles, events, true, &orbs);
+        // which orbs were used: what the game tells (activated ids)
+        w.collectOrbs(o.x - 90.f, o.x + ahead, worldOrbs);
+        for (auto& b : orbs)
+            for (auto const& wb : worldOrbs)
+                if (wb.id == b.id) b.used = wb.used;
+        orbEvents = w.orbEvents();
         o.obstacles = obstacles;
         o.events = events;
+        o.orbs = orbs;
+        o.orbEvents = orbEvents;
+        o.dashing = w.dashing();
         o.geometryVersion = map.version();
         return o;
     }
@@ -4181,6 +4205,550 @@ TEST(understanding_overlay_shows_the_executed_plan) {
     CHECK(styles[0] > 0 && styles[1] > 0 && styles[2] > 0);
     CHECK(checked > 0 && matched * 2 >= checked);
     CHECK(!overview.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Orbs and dash orbs (v0.6.0)
+
+namespace {
+bool overlapsOrb(Orb const& b, Observation const& o, float h = 15.f) {
+    return !b.used && b.l <= o.x + h && b.r >= o.x - h && b.b <= o.y + h && b.t >= o.y - h;
+}
+
+// What the first encounters with an orb type in a session give the
+// predictor: activations reported by the game (here the simulator), from
+// which it calibrates the orb's effect. Orbs on the ground, pressed as soon as
+// the hitbox is in them (dash orbs: held 20 steps).
+void calibrateOrb(PredictionRig& rig, OrbType type, float rotation = -30.f) {
+    for (int rep = 0; rep < 3; ++rep) {
+        sim::Level L;
+        L.name = "orb-cal";
+        if (isDashOrb(type)) L.dashOrb(10.f, 0.f, rotation, 0.f, type == OrbType::GravityDash);
+        else L.orb(10.f, 0.f, type);
+        L.block(4, 7, 40, 1); // a ceiling for the orbs that flip gravity
+        L.finish(30);
+        sim::World w(L);
+        rig.held = false;
+        int holdLeft = 0;
+        for (int t = 0; t < 600 && !w.complete() && !w.dead(); ++t) {
+            Observation o = rig.observe(w);
+            rig.predictor.observe(o, rig.held);
+            bool inside = false;
+            for (auto const& b : o.orbs) inside = inside || overlapsOrb(b, o);
+            bool hold = false;
+            if (holdLeft > 0) {
+                hold = true;
+                --holdLeft;
+            } else {
+                hold = inside && !rig.held;
+                if (hold && isDashOrb(type)) holdLeft = 20;
+            }
+            rig.held = hold;
+            w.step(hold);
+        }
+    }
+}
+
+// Runs the world from the first step the player's hitbox is in the orb,
+// pressing for `hold` steps (0 = a 2-step tap), and compares every position
+// with the predictor's path for the same input. Returns the largest error.
+struct OrbComparison {
+    bool activatedPredicted = false, activatedActual = false;
+    float maxError = 0.f;
+    int compared = 0;
+    int32_t predictedDashEnd = -1, actualDashEnd = -1;
+};
+OrbComparison compareOrbPath(PredictionRig& rig, sim::Level const& L, int hold, int steps = 160) {
+    OrbComparison r;
+    sim::World w(L);
+    rig.held = false;
+    Observation o = rig.observe(w);
+    for (int t = 0; t < 2000; ++t) {
+        o = rig.observe(w);
+        rig.predictor.observe(o, rig.held);
+        bool inside = false;
+        for (auto const& b : o.orbs) inside = inside || overlapsOrb(b, o);
+        if (inside) break;
+        rig.held = false;
+        w.step(false);
+    }
+    SimStart st = rig.predictor.startFrom(o, false);
+    st.horizon = steps;
+    Plan p{-1, 0, 0, false};
+    p.orbPressAt = 0;
+    p.orbHoldFor = hold;
+    PredictedPath path;
+    rig.predictor.simulate(st, o.obstacles, p, path);
+    r.activatedPredicted = path.orbActivations > 0;
+    r.predictedDashEnd = path.dashEndStep;
+    if (std::getenv("AIGD_ORB_DEBUG"))
+        std::printf("      path: %d steps, outcome %s, collision step %d at (%.1f, %.1f), uncertain from %d, activations %d\n", path.steps,
+                    certaintyName(path.outcome), path.collisionStep, path.collisionX, path.collisionY, path.uncertainFrom, path.orbActivations);
+    int const held = std::max(2, hold);
+    for (int i = 0; i < static_cast<int>(path.points.size()) && !w.dead(); ++i) {
+        bool const h = i < held;
+        w.step(h);
+        for (auto const& e : w.orbEvents()) {
+            if (e.kind == OrbEvent::Kind::Activated) r.activatedActual = true;
+            if (e.kind == OrbEvent::Kind::DashStopped) r.actualDashEnd = i;
+        }
+        Observation a = w.observe();
+        r.maxError = std::max(r.maxError, std::hypot(a.x - path.points[static_cast<size_t>(i)].x, a.y - path.points[static_cast<size_t>(i)].y));
+        ++r.compared;
+    }
+    if (std::getenv("AIGD_ORB_DEBUG") && w.dead())
+        std::printf("      world died at x=%.1f y=%.1f (killer %s at dx %.1f dy %.1f)\n", w.death().x, w.death().y,
+                    w.death().killer == KillerKind::Hazard ? "hazard" : "block", w.death().killerDx, w.death().killerDy);
+    return r;
+}
+
+// A pit of spikes too long to jump over, with an orb in the air over it:
+// only a jump, then the orb, crosses it.
+sim::Level orbPitLevel(char const* name, float at, OrbType type = OrbType::Yellow) {
+    sim::Level L;
+    L.name = name;
+    for (float b = at; b < at + 7.f; b += 1.f) L.spike(b);
+    L.orb(at + 2.5f, 2.f, type);
+    L.finish(at + 20.f);
+    return L;
+}
+
+// (in place: the rig's predictor refers to the rig's own model)
+void prepareRig(PredictionRig& rig, std::initializer_list<OrbType> types) {
+    warmUp(rig);
+    for (OrbType t : types) calibrateOrb(rig, t);
+}
+} // namespace
+
+TEST(orbs_are_detected_and_classified) {
+    // Every orb type is in the level map with its activation area, type and
+    // (dash orbs) direction; simulated types are told apart from others.
+    sim::Level L;
+    L.name = "orbs";
+    OrbType const types[] = {OrbType::Yellow, OrbType::Pink, OrbType::Red, OrbType::Blue, OrbType::Green, OrbType::Black};
+    float x = 10.f;
+    for (OrbType t : types) L.orb(x += 4.f, 1.f, t);
+    L.dashOrb(x += 4.f, 1.f, -45.f, 0.5f);
+    L.dashOrb(x += 4.f, 1.f, 30.f, 0.f, true);
+    L.finish(x + 10.f);
+    LevelMap map = simMap(L);
+    std::vector<Obstacle> obs;
+    std::vector<PhysicsEvent> ev;
+    std::vector<Orb> orbs;
+    map.collect(0.f, L.length, obs, ev, true, &orbs);
+    CHECK(map.count(MapKind::Orb) == 8);
+    CHECK(orbs.size() == 8 && obs.empty());
+    int ok = 0;
+    for (size_t i = 0; i < orbs.size(); ++i) {
+        OrbType const want = i < 6 ? types[i] : (i == 6 ? OrbType::Dash : OrbType::GravityDash);
+        ok += orbs[i].type == want ? 1 : 0;
+        CHECK(orbs[i].r - orbs[i].l == 30.f && orbs[i].t - orbs[i].b == 30.f);
+    }
+    CHECK(ok == 8);
+    CHECK(orbs[6].rotation == -45.f && std::fabs(orbs[6].maxDuration - 0.5f) < 1e-6f);
+    CHECK(orbSimulated(OrbType::GravityDash) && !orbSimulated(OrbType::Spider) && !orbSimulated(OrbType::Teleport));
+    // without an orb list (older callers) they stay uncertain obstacles
+    map.collect(0.f, L.length, obs, ev, true);
+    CHECK(obs.size() == 8);
+    std::printf("    %zu orbs: %s ... %s (dash direction %.0f deg)\n", orbs.size(), orbTypeName(orbs[0].type), orbTypeName(orbs[7].type),
+                orbs[6].rotation);
+}
+
+TEST(orb_effect_is_learned_and_predicted_after_activation) {
+    // Before any activation was seen, a path through an activation is never
+    // safe. After the game reported activations, the predicted path after
+    // pressing in the orb matches the real one for every jump/gravity orb.
+    for (OrbType t : {OrbType::Yellow, OrbType::Pink, OrbType::Red, OrbType::Blue, OrbType::Green, OrbType::Black}) {
+        sim::Level L;
+        L.name = "orb";
+        L.orb(10.f, 0.f, t);
+        L.block(4, 7, 40, 1);
+        L.finish(40);
+        PredictionRig rig;
+        warmUp(rig);
+        auto before = compareOrbPath(rig, L, 0);
+        // the same path before calibration is uncertain
+        sim::World w(L);
+        Observation o = rig.observe(w);
+        while (o.x < 10 * 30.f - 15.f) {
+            w.step(false);
+            o = rig.observe(w);
+        }
+        SimStart st = rig.predictor.startFrom(o, false);
+        Plan p{-1, 0, 0, false};
+        p.orbPressAt = 0;
+        PredictedPath unk;
+        rig.predictor.simulate(st, o.obstacles, p, unk);
+        calibrateOrb(rig, t);
+        auto after = compareOrbPath(rig, L, 0);
+        OrbPhysics const op = rig.model.orb(t, GameMode::Cube, false);
+        std::printf("    %-11s learned vy %6.2f%s; path error before calibration %6.2f, after %5.2f units (%d steps compared)\n", orbTypeName(t), op.vy,
+                    op.flips ? " (flips gravity)" : "", before.maxError, after.maxError, after.compared);
+        CHECK(unk.outcome != Certainty::Safe);
+        CHECK(after.activatedPredicted && after.activatedActual);
+        CHECK(op.known);
+        CHECK(after.maxError < 0.5f);
+    }
+}
+
+TEST(orb_activation_is_compared_with_skipping_it) {
+    PredictionRig rig;
+    prepareRig(rig, {OrbType::Yellow});
+    // (a) hanging spikes over the orb: activating it hits them, walking on is safe
+    {
+        sim::Level L;
+        L.name = "orb-under";
+        L.orb(12.f, 0.f, OrbType::Yellow);
+        for (float b = 11.f; b < 16.f; b += 1.f) L.spike(b, 3.f);
+        L.finish(30);
+        sim::World w(L);
+        Observation o = rig.observe(w);
+        while (o.x < 10.f * 30.f) {
+            w.step(false);
+            o = rig.observe(w);
+        }
+        auto const& adv = rig.predictor.advise(o, false);
+        auto const& O = adv.orb;
+        std::printf("    hanging spikes over a yellow orb: activate %s%s (%d timings), skip %s -> %s\n", certaintyName(O.activate),
+                    O.activateHitsAbove ? " (hits above)" : "", O.candidates, certaintyName(O.skip), O.chosenActivates ? "activate" : "skip");
+        CHECK(O.present && O.type == OrbType::Yellow && O.simulated && O.known);
+        CHECK(O.candidates > 0 && O.activate == Certainty::Collision && O.activateHitsAbove);
+        CHECK(O.skip == Certainty::Safe && !O.chosenActivates);
+    }
+    // (b) a spike pit only the orb gets across: skipping it collides
+    {
+        sim::Level L = orbPitLevel("orb-pit", 12.f);
+        sim::World w(L);
+        Observation o = rig.observe(w);
+        bool sawActivate = false;
+        Predictor::Advice::OrbChoice last;
+        for (int t = 0; t < 3000 && !w.dead() && !w.complete(); ++t) {
+            o = rig.observe(w);
+            rig.predictor.observe(o, rig.held);
+            auto const& adv = rig.predictor.advise(o, rig.held);
+            bool hold = adv.valid && adv.bestPresses;
+            if (adv.orb.present && adv.orb.candidates > 0 && !sawActivate) last = adv.orb;
+            sawActivate = sawActivate || (adv.orb.present && adv.orb.chosenActivates);
+            if (std::getenv("AIGD_ORB_DEBUG") && o.x > 270.f && o.x < 560.f)
+                std::printf("      x=%.1f y=%.1f %s held=%d -> press=%d | best: press in %d orb %d/%d, %s | orb: cand %d act %s skip %s chosen %d win %d-%d\n", o.x, o.y,
+                            o.onGround ? "G" : "A", rig.held ? 1 : 0, hold ? 1 : 0, adv.bestPlan.pressAt, adv.bestPlan.orbPressAt, adv.bestPlan.orbHoldFor,
+                            certaintyName(rig.predictor.bestPath().outcome), adv.orb.candidates, certaintyName(adv.orb.activate),
+                            certaintyName(adv.orb.skip), adv.orb.chosenActivates ? 1 : 0, adv.orb.windowFrom, adv.orb.windowTo);
+            if (std::getenv("AIGD_ORB_DEBUG") && o.x > 305.f && o.x < 345.f) {
+                PredictedPath const& on = rig.predictor.orbActivatedPath();
+                std::printf("        activated path: orb press %d, activation step %d at (%.1f, %.1f), %s, collision step %d at (%.1f, %.1f) hit [%.0f %.0f %.0f %.0f], "
+                            "land %.1f\n",
+                            on.plan.orbPressAt, on.orbStep[0], on.orbX[0], on.orbY[0], certaintyName(on.outcome), on.collisionStep, on.collisionX,
+                            on.collisionY, on.hit.l, on.hit.b, on.hit.r, on.hit.t, on.landX);
+            }
+            rig.predictor.noteExecuted(hold);
+            rig.held = hold;
+            w.step(hold);
+        }
+        std::printf("    spike pit with a yellow orb: activate %s, skip %s; planner alone %s\n", certaintyName(last.activate), certaintyName(last.skip),
+                    w.complete() ? "COMPLETED" : w.dead() ? "died" : "did not finish");
+        CHECK(last.present && last.skip == Certainty::Collision);
+        CHECK(last.activate != Certainty::Collision);
+        CHECK(sawActivate);
+        CHECK(w.complete());
+    }
+}
+
+TEST(unsafe_post_orb_trajectory_is_detected) {
+    // The activation itself is clear, but the high red-orb jump that follows
+    // runs into hanging spikes further on: the interaction is not safe, and
+    // walking on (skipping it) is.
+    PredictionRig rig;
+    prepareRig(rig, {OrbType::Red});
+    sim::Level L;
+    L.name = "orb-trap";
+    L.orb(12.f, 0.f, OrbType::Red);
+    for (float b = 15.f; b < 19.f; b += 1.f) L.spike(b, 3.f);
+    L.finish(40);
+    sim::World w(L);
+    Observation o = rig.observe(w);
+    while (o.x < 12.f * 30.f - 14.f) {
+        w.step(false);
+        o = rig.observe(w);
+    }
+    auto const& adv = rig.predictor.advise(o, false);
+    auto const& O = adv.orb;
+    PredictedPath const& on = rig.predictor.orbActivatedPath();
+    std::printf("    red orb into a spike row: activation clear at x=%.0f, then %s (collision at x=%.0f)\n", on.orbX[0], certaintyName(O.activate),
+                on.collisionX);
+    CHECK(O.present && O.candidates > 0);
+    CHECK(on.activates(O.id));
+    CHECK(O.activate == Certainty::Collision);
+    CHECK(on.collisionStep > on.orbStep[0] + 8); // the collision is well after the activation
+    CHECK(O.skip == Certainty::Safe && !O.chosenActivates);
+}
+
+TEST(agent_uses_an_orb_when_it_is_needed) {
+    // With the orb calibrated, the agent crosses a spike pit by jumping and
+    // activating the orb, on the first attempt; the game confirms it.
+    PredictionRig rig;
+    prepareRig(rig, {OrbType::Yellow});
+    sim::Level L = orbPitLevel("pit", 14.f);
+    LevelMemory mem = freshLevel(L);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    auto r = runAttempt(agent, L, &rig);
+    auto const& st = agent.status();
+    std::printf("    %s; orbs seen %u, activations planned %u, confirmed %u, missed %u\n", r.completed ? "completed" : "DIED", st.orbsSeen,
+                st.orbActivationsPlanned, st.orbActivationsConfirmed, st.orbActivationsMissed);
+    for (auto const& m : st.orbLog) std::printf("      %s\n", m.c_str());
+    CHECK(r.completed);
+    CHECK(st.orbActivationsPlanned >= 1 && st.orbActivationsConfirmed >= 1 && st.orbActivationsMissed == 0);
+    bool detected = false;
+    for (auto const& m : st.orbLog) detected = detected || m.find("detected - evaluating activation and skip options") != std::string::npos;
+    CHECK(detected);
+}
+
+TEST(dash_orb_movement_is_predicted) {
+    // A dash orb moves the player in a straight line while held, then normal
+    // physics resume with the dash end velocity. Calibrated from two dashes,
+    // the prediction matches the real path for several hold durations.
+    PredictionRig rig;
+    prepareRig(rig, {OrbType::Dash});
+    OrbPhysics const op = rig.model.orb(OrbType::Dash, GameMode::Cube, false);
+    float worst = 0.f;
+    for (int hold : {10, 24, 40}) {
+        sim::Level L;
+        L.name = "dash";
+        L.dashOrb(10.f, 0.f, -30.f);
+        L.finish(50);
+        auto c = compareOrbPath(rig, L, hold, 200);
+        std::printf("    dash held %2d steps: predicted end at step %d, actual %d; largest position error %.2f units over %d steps\n", hold,
+                    c.predictedDashEnd, c.actualDashEnd, c.maxError, c.compared);
+        CHECK(c.activatedPredicted && c.activatedActual);
+        CHECK(std::abs(c.predictedDashEnd - c.actualDashEnd) <= 1);
+        worst = std::max(worst, c.maxError);
+    }
+    std::printf("    model: dash x speed x%.2f, slope x%.2f, end velocity %.2f (known: %s)\n", op.dashDx, op.dashSlope, op.dashEndVy, op.known ? "yes" : "no");
+    CHECK(op.known);
+    CHECK(worst < 1.0f);
+}
+
+TEST(dash_termination_and_movement_after_it) {
+    // A dash orb with a 0.05 s limit ends by itself while the button is still
+    // held, and the player falls afterwards; both are predicted.
+    PredictionRig rig;
+    prepareRig(rig, {OrbType::Dash});
+    sim::Level L;
+    L.name = "dash-limit";
+    L.dashOrb(10.f, 0.f, -45.f, 0.05f);
+    L.finish(50);
+    auto c = compareOrbPath(rig, L, 60, 200);
+    std::printf("    dash limited to 0.05 s, held 60 steps: predicted end at step %d, actual %d; largest error %.2f units\n", c.predictedDashEnd,
+                c.actualDashEnd, c.maxError);
+    CHECK(c.predictedDashEnd >= 0 && std::abs(c.predictedDashEnd - c.actualDashEnd) <= 1);
+    CHECK(c.predictedDashEnd < 20);
+    CHECK(c.maxError < 1.0f);
+}
+
+TEST(planner_handles_orbs_within_obstacle_sequences) {
+    // A spike, a yellow orb over a spike pit, hanging spikes, then a dash orb
+    // across a second pit to a narrow landing block. With calibrated orbs, the
+    // agent (with strategic planning) gets through on its first attempt.
+    PredictionRig rig;
+    prepareRig(rig, {OrbType::Yellow, OrbType::Dash});
+    rig.ahead = 900.f;
+    sim::Level L;
+    L.name = "orb-sequence";
+    L.spike(10);
+    for (float b = 16; b < 23; b += 1.f) L.spike(b);
+    L.orb(18.5f, 2.f, OrbType::Yellow);
+    for (float b = 24; b < 27; b += 1.f) L.spike(b, 4.f);    // hanging spikes after the pit
+    for (float b = 31; b < 37; b += 1.f) L.spike(b);          // second pit
+    L.dashOrb(30.f, 1.f, 0.f);                                 // horizontal dash over it
+    L.block(37, 0, 2, 1);                                      // the narrow landing block
+    for (float b = 39; b < 42; b += 1.f) L.spike(b);
+    L.finish(52);
+    LevelMap map = simMap(L);
+    LevelMemory mem = freshLevel(L);
+    PatternMemory pat;
+    Agent agent(plannerOnly(true));
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    MapRun r = runWithMap(agent, L, map, rig, true, [&](Observation const& o, Agent const& a) {
+        if (!std::getenv("AIGD_ORB_DEBUG") || o.x < 840.f || o.x > 1130.f) return;
+        auto const& adv = rig.predictor.lastAdvice();
+        std::printf("      x=%.1f y=%.1f %s%s -> %s by %s | best press %d orb %d/%d %s | %s\n", o.x, o.y, o.onGround ? "G" : "A", o.dashing ? " DASH" : "",
+                    a.holding() ? "HOLD" : "release", decisionSourceName(a.status().source), adv.bestPlan.pressAt, adv.bestPlan.orbPressAt,
+                    adv.bestPlan.orbHoldFor, certaintyName(rig.predictor.bestPath().outcome), a.status().safety.reason.c_str());
+    });
+    auto const& st = agent.status();
+    std::printf("    %s at %.0f%%; orb activations planned %u, confirmed %u; %u sequence plans\n", r.completed ? "completed" : "DIED",
+                r.progress * 100.f, st.orbActivationsPlanned, st.orbActivationsConfirmed, st.strategicPlans);
+    for (auto const& m : st.orbLog) std::printf("      %s\n", m.c_str());
+    CHECK(r.completed);
+    CHECK(st.orbActivationsConfirmed >= 2);
+}
+
+TEST(obsolete_orb_actions_are_cancelled) {
+    // The plan relies on activating the orb, but the game does not activate
+    // it: the AI says so and replans from the actual state at once.
+    PredictionRig rig;
+    prepareRig(rig, {OrbType::Yellow});
+    sim::Level L = orbPitLevel("pit-fail", 14.f);
+    LevelMemory mem = freshLevel(L);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    sim::World::s_orbsDisabled = true;
+    int32_t missTick = -1;
+    bool replannedAtOnce = false;
+    {
+        sim::World w(L);
+        agent.beginAttempt(rig.observe(w), false);
+        rig.held = false;
+        uint32_t missed = 0;
+        for (int t = 0; t < 3000 && !w.dead() && !w.complete(); ++t) {
+            Observation o = rig.observe(w);
+            rig.predictor.observe(o, rig.held);
+            bool hold = agent.act(o);
+            if (agent.status().orbActivationsMissed > missed && missTick < 0) {
+                missTick = o.tick;
+                auto const& rec = agent.status().safety;
+                replannedAtOnce = rec.tick == o.tick && rec.proposedSource != DecisionSource::Plan;
+            }
+            missed = agent.status().orbActivationsMissed;
+            rig.held = hold;
+            w.step(hold);
+        }
+        if (w.dead()) agent.onDeath(w.observe(), w.death());
+        else agent.abortAttempt(nullptr);
+    }
+    sim::World::s_orbsDisabled = false;
+    std::printf("    activation did not happen: noticed at step %d, replanned in the same step: %s; \"%s\"\n", missTick, replannedAtOnce ? "yes" : "no",
+                agent.status().orbEvent.c_str());
+    CHECK(missTick >= 0);
+    CHECK(replannedAtOnce);
+    bool msg = false;
+    for (auto const& m : agent.status().orbLog) msg = msg || m.find("Orb activation not confirmed") != std::string::npos;
+    CHECK(msg);
+}
+
+TEST(orb_model_is_corrected_when_the_game_differs) {
+    // The game's yellow orb turns out 20% stronger than learned: the
+    // difference is reported and the model moves towards the real value.
+    PredictionRig rig;
+    prepareRig(rig, {OrbType::Yellow});
+    float const before = rig.model.orb(OrbType::Yellow, GameMode::Cube, false).vy;
+    sim::World::s_orbScale = 1.2f;
+    sim::Level L = orbPitLevel("pit-strong", 14.f);
+    LevelMemory mem = freshLevel(L);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    for (int i = 0; i < 3; ++i) runAttempt(agent, L, &rig);
+    sim::World::s_orbScale = 1.f;
+    float const after = rig.model.orb(OrbType::Yellow, GameMode::Cube, false).vy;
+    auto const& chk = rig.predictor.lastOrbCheck();
+    std::printf("    learned yellow orb vy %.2f -> %.2f (game: %.2f); last error %+.2f\n", before, after, sim::World::kYellowOrb * 1.2f, chk.vyError);
+    CHECK(after > before + 0.5f);
+    bool msg = false;
+    for (auto const& m : agent.status().orbLog) msg = msg || m.find("differs from actual movement") != std::string::npos;
+    CHECK(msg);
+}
+
+TEST(orb_strategy_transfers_to_another_level) {
+    // Strategies learned while the planner used orbs (activate the orb N
+    // steps after reaching it) are reused on another level with the same
+    // pit-and-orb layout elsewhere: without prediction, the first attempt
+    // gets across with the library and not without it.
+    Knowledge k;
+    PredictionRig rig;
+    prepareRig(rig, {OrbType::Yellow});
+    for (float at : {16.f, 24.f, 20.f}) {
+        sim::Level A = orbPitLevel(("orb-train-" + std::to_string(static_cast<int>(at))).c_str(), at);
+        A.spike(at - 7.f);
+        A.finish(A.length / 30.f);
+        LevelMemory mem = freshLevel(A);
+        Agent agent(isolatedConfig());
+        agent.attach(&mem, &k.patterns, &k.strategies);
+        agent.setPredictor(&rig.predictor);
+        for (int i = 0; i < 3; ++i) runAttempt(agent, A, &rig);
+    }
+    sim::Level B = orbPitLevel("orb-eval", 31.f);
+    B.spike(24.f);
+    B.finish(B.length / 30.f);
+    Knowledge kb = k;
+    auto withLib = playLevel(kb, B, 1, false, true, true, 9);
+    Knowledge none;
+    auto without = playLevel(none, B, 1, false, true, true, 9);
+    uint32_t orbRecords = 0;
+    for (auto const& [key, recs] : k.strategies.situations)
+        for (auto const& r : recs) orbRecords += r.primitive == Primitive::OrbActivate ? r.successes : 0;
+    float const pitEnd = (31.f + 7.f) * 30.f / B.length;
+    std::printf("    %u orb-strategy successes recorded in training; on another level, first attempt %.0f%% with the library, %.0f%% without "
+                "(the pit ends at %.0f%%)\n",
+                orbRecords, withLib.attempts[0].progress * 100.f, without.attempts[0].progress * 100.f, pitEnd * 100.f);
+    CHECK(orbRecords > 0);
+    CHECK(withLib.attempts[0].progress > pitEnd);
+    CHECK(withLib.attempts[0].progress > without.attempts[0].progress);
+}
+
+TEST(orb_overlay_shows_the_selected_interaction) {
+    // When the executed action activates the orb, the selected path is the
+    // post-activation path and the skipped outcome is drawn apart; when it
+    // does not, the overlay does not show the orb effect as selected.
+    PredictionRig rig;
+    prepareRig(rig, {OrbType::Yellow});
+    sim::Level L = orbPitLevel("pit-overlay", 14.f);
+    LevelMemory mem = freshLevel(L);
+    PatternMemory pat;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    sim::World w(L);
+    agent.beginAttempt(rig.observe(w), false);
+    rig.held = false;
+    int selectedFrames = 0, skippedFrames = 0, inconsistent = 0, confirmedAsDrawn = 0;
+    int32_t drawnActivationTick = -1;
+    OverlayGeometry og;
+    for (int t = 0; t < 3000 && !w.dead() && !w.complete(); ++t) {
+        Observation o = rig.observe(w);
+        rig.predictor.observe(o, rig.held);
+        for (auto const& e : o.orbEvents)
+            if (e.kind == OrbEvent::Kind::Activated && drawnActivationTick >= 0 && std::abs(o.tick - drawnActivationTick) <= 1) ++confirmedAsDrawn;
+        bool hold = agent.act(o);
+        if (buildDecisionOverlay(rig.predictor, agent.status().safety, o.tick, false, o.obstacles, og, &agent.plans().plan()) && og.hasOrb &&
+            agent.status().safety.tick == o.tick && agent.status().safety.proposedSource != DecisionSource::Plan) {
+            PredictedPath const& ex = rig.predictor.executedPath();
+            bool const exActivates = ex.activates(rig.predictor.lastAdvice().orb.id);
+            if (og.orbSelected != exActivates) ++inconsistent;
+            bool other = false;
+            for (auto const& s : og.segments)
+                other = other || s.style == (og.orbSelected ? OverlayGeometry::Style::OrbSkipped : OverlayGeometry::Style::OrbActivated);
+            if (og.orbSelected) {
+                ++selectedFrames;
+                int const i = ex.orbActivations > 1 && ex.orbId[1] == rig.predictor.lastAdvice().orb.id ? 1 : 0;
+                drawnActivationTick = o.tick + 1 + ex.orbStep[i];
+                if (!other) ++inconsistent;
+            } else {
+                ++skippedFrames;
+            }
+            // the main path drawn is the executed one
+            if (!og.segments.empty() && ex.points.size() > 1) {
+                bool found = false;
+                for (auto const& s : og.segments) found = found || (s.x0 == ex.points[0].x && s.y0 == ex.points[0].y);
+                if (!found) ++inconsistent;
+            }
+        }
+        rig.held = hold;
+        w.step(hold);
+    }
+    std::printf("    %s; %d decisions drawn with the orb activation selected, %d with it skipped, %d inconsistencies; activation happened "
+                "where drawn: %s\n",
+                w.complete() ? "completed" : "died", selectedFrames, skippedFrames, inconsistent, confirmedAsDrawn ? "yes" : "no");
+    CHECK(selectedFrames > 0 && skippedFrames > 0);
+    CHECK(inconsistent == 0);
+    CHECK(confirmedAsDrawn > 0);
 }
 
 TEST(upside_down_cube_contact_is_not_a_ceiling) {

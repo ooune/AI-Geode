@@ -54,6 +54,13 @@ SimStart Predictor::startFrom(Observation const& obs, bool holding) const {
     s.tick = obs.tick;
     s.bounds = m_bounds;
     s.events = obs.events;
+    s.orbs = obs.orbs;
+    if (obs.dashing && m_dashActive) {
+        s.dashing = true;
+        s.dashType = m_dashType;
+        s.dashRotation = m_dashRotation;
+        s.dashLeft = std::max(0, m_dashMaxSteps - (obs.tick - m_dashStartTick));
+    }
     if (obs.mode == GameMode::Robot && m_robotAlive)
         s.robotBoostLeft = std::max(0, m_model.params(obs.mode, obs.mini).boostSteps - m_robotSince);
     // With input latency L, the next L steps still run with buttons that were
@@ -125,6 +132,23 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
     int const steps = holds.empty() ? (s.horizon > 0 ? s.horizon : m_horizon) : static_cast<int>(holds.size());
     uint32_t eventsDone = 0; // bit per event (the first 32)
     size_t const nEvents = std::min<size_t>(s.events.size(), 32);
+    // orbs: used / overlapped (bit per orb, the first 64)
+    size_t const nOrbs = std::min<size_t>(s.orbs.size(), 64);
+    uint64_t orbUsed = 0, orbOver = 0;
+    for (size_t k = 0; k < nOrbs; ++k) {
+        if (s.orbs[k].used) orbUsed |= uint64_t(1) << k;
+        // already inside at the start: not an entry
+        Orb const& ob = s.orbs[k];
+        if (ob.l <= s.x + P.halfSize && ob.r >= s.x - P.halfSize && ob.b <= s.y + P.halfSize && ob.t >= s.y - P.halfSize) orbOver |= uint64_t(1) << k;
+    }
+    int const heldRule = m_model.heldEntryActivates();
+    bool dashing = s.dashing;
+    OrbPhysics dashP = dashing ? m_model.orb(s.dashType, s.mode, s.mini) : OrbPhysics{};
+    float dashDy = dashing ? vx * dashP.dashDx * std::tan(-s.dashRotation * 3.14159265f / 180.f) * dashP.dashSlope : 0.f;
+    int32_t dashLeft = s.dashLeft;
+    int32_t orbPressUntil = -1;
+    out.orbActivations = 0;
+    out.dashEndStep = -1;
     Bounds const& B = s.bounds;
     float const floorC = B.floor + h;  // player centre when resting on the floor
     float const ceilC = B.ceil - h;    // ... against the ceiling
@@ -200,7 +224,11 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
     int32_t thirdPress = -1;    // ... of the third (set at the landing after the second jump)
     int jumps = 0;              // take-offs so far
     bool jumped = false;
-    for (int step = 0; step < steps; ++step) {
+    // After an orb activation the path is followed until it lands (or 200
+    // steps), whatever the horizon: an orb is only useful if what comes
+    // after it is viable, and a horizon ending in mid-air would hide that.
+    int stepLimit = steps;
+    for (int step = 0; step < stepLimit; ++step) {
         bool hold;
         int const ps = step - lag; // plan step
         if (!holds.empty()) {
@@ -226,13 +254,14 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
                 effects = 0;
                 nextPress = plan.repeatEvery > 0 ? ps + plan.repeatEvery : -1;
             }
+            if (plan.orbPressAt >= 0 && ps == plan.orbPressAt) orbPressUntil = ps + std::max(2, plan.orbHoldFor);
             if (pressActive) {
                 int32_t heldFor = ps - pressStart;
                 if (plan.holdFor > 0 && heldFor >= plan.holdFor) pressActive = false;
                 else if (plan.holdFor == 0 && tapRelease && heldFor >= 2) pressActive = false;
                 else if (plan.holdFor == 0 && !tapRelease && effects >= target && heldFor >= 2) pressActive = false;
             }
-            hold = pressActive;
+            hold = pressActive || ps < orbPressUntil;
         }
         bool const edge = hold && !prevHold;
         prevHold = hold;
@@ -249,7 +278,75 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
         bool teleported = false;
         bool stop = false;
 
-        switch (P.press) {
+        // ---- orbs and dashes ----
+        bool orbFired = false;
+        if (dashing && (!hold || dashLeft <= 0)) {
+            // the dash ends (released, or its time is up): normal physics again
+            dashing = false;
+            vyN = dashP.dashEndVy;
+            out.dashEndStep = step;
+        }
+        if (!dashing) {
+            for (size_t k = 0; k < nOrbs; ++k) {
+                Orb const& ob = s.orbs[k];
+                uint64_t const bit = uint64_t(1) << k;
+                if (ob.l > x + h) break;
+                bool const over = ob.r >= x - h && ob.t >= y - h && ob.b <= y + h;
+                bool const entering = over && !(orbOver & bit);
+                if (over) orbOver |= bit;
+                else orbOver &= ~bit;
+                if (!over || (orbUsed & bit)) continue;
+                bool trigger = edge && ps >= 0;
+                if (!trigger && hold && entering) {
+                    // held from before reaching the orb: whether that activates
+                    // it is learned from the game; until then it is uncertain
+                    if (heldRule == 1) trigger = true;
+                    else if (heldRule < 0 && out.uncertainFrom < 0) out.uncertainFrom = step;
+                }
+                if (!trigger) continue;
+                orbUsed |= bit;
+                if (!orbSimulated(ob.type)) {
+                    if (out.uncertainFrom < 0) out.uncertainFrom = step;
+                    stop = true;
+                    break;
+                }
+                OrbPhysics const op = m_model.orb(ob.type, s.mode, s.mini);
+                if (!op.known) out.unverifiedPhysics = true;
+                if (out.eventStep < 0 && !op.known) out.eventStep = step;
+                if (out.orbActivations < 2) {
+                    int const i = out.orbActivations;
+                    out.orbStep[i] = step;
+                    out.orbX[i] = x;
+                    out.orbY[i] = y;
+                    out.orbType[i] = ob.type;
+                    out.orbId[i] = ob.id;
+                }
+                ++out.orbActivations;
+                orbFired = true;
+                if (holds.empty()) stepLimit = std::max(stepLimit, std::min(step + 200, 600));
+                effect = true;
+                onGround = false;
+                if (op.flips) {
+                    g = -g;
+                    vyN = -vyN;
+                }
+                if (op.dash) {
+                    dashing = true;
+                    dashP = op;
+                    dashDy = vx * op.dashDx * std::tan(-ob.rotation * 3.14159265f / 180.f) * op.dashSlope;
+                    dashLeft = ob.maxDuration > 0.f ? static_cast<int32_t>(std::lround(ob.maxDuration * kTicksPerSecond)) : (1 << 20);
+                } else {
+                    vyN = op.vy;
+                }
+                break;
+            }
+        }
+        if (stop) {
+            out.steps = step;
+            break;
+        }
+
+        if (!orbFired && !dashing) switch (P.press) {
             case PressAction::JumpOnGround:
                 if (onGround && hold) {
                     vyN = P.impulse;
@@ -335,10 +432,16 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
         }
         if (effect) ++effects;
         if (!effect) ++sinceTakeoff;
-        if (P.press != PressAction::SetVelocity) vyN = std::clamp(vyN, -P.maxDown, P.maxUp);
+        if (P.press != PressAction::SetVelocity && !dashing) vyN = std::clamp(vyN, -P.maxDown, P.maxUp);
         vy = vyN * g;
+        if (dashing) {
+            // a straight line in the orb direction, gravity off
+            vy = dashDy / P.yScale;
+            --dashLeft;
+            onGround = false;
+        }
         if (!teleported) y += vy * P.yScale;
-        x += vx;
+        x += dashing ? vx * dashP.dashDx : vx;
 
         // Portals reached this step: speed and gravity changes are simulated
         // (an unverified model makes the rest of the path uncertain).
@@ -481,6 +584,8 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
             out.landY = y;
             out.landStep = step;
         }
+        // landed after an orb: the extension only needs to see a little more
+        if (wasAir && onGround && out.orbActivations > 0 && stepLimit > steps) stepLimit = std::max(steps, std::min(stepLimit, step + 30));
         if (wasAir && onGround && out.landings < PredictedPath::kMaxLandings) {
             out.landingX[out.landings] = x;
             out.landingStep[out.landings] = step;
@@ -584,7 +689,10 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     bool const danger = m_advice.outcome(ex) != Certainty::Safe || m_advice.keepForSafe(ex) < 16;
     if (allowReuse && m_advice.valid && obs.tick > m_adviceTick && holding == m_adviceHolding && obs.mode == m_computedMode && !imminent &&
         !danger && holding == m_executedPress && !offPredictedPath(obs)) {
-        if (groundOnly(obs.mode) && !holding && !obs.onGround && obs.tick <= m_reuseUntilTick && !m_advice.bestPresses) reuse = true;
+        // (not with an orb ahead: in the air, a press can activate it)
+        bool orbAhead = false;
+        for (auto const& o : obs.orbs) orbAhead = orbAhead || (!o.used && o.r > obs.x - 15.f);
+        if (groundOnly(obs.mode) && !holding && !obs.onGround && obs.tick <= m_reuseUntilTick && !m_advice.bestPresses && !orbAhead) reuse = true;
         if ((continuousControl(obs.mode) || tapControl(obs.mode)) && obs.tick - m_computedTick < 2) reuse = true;
     }
     if (reuse) {
@@ -723,7 +831,7 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     // candidate, and only chosen if they score best.
     auto samePlan = [](Plan const& a, Plan const& b) {
         return a.pressAt == b.pressAt && a.holdFor == b.holdFor && a.repeatEvery == b.repeatEvery && a.rejump == b.rejump &&
-               a.secondAt == b.secondAt && a.thirdAt == b.thirdAt;
+               a.secondAt == b.secondAt && a.thirdAt == b.thirdAt && a.orbPressAt == b.orbPressAt && a.orbHoldFor == b.orbHoldFor;
     };
     for (int i = 0; i < nSeeds; ++i) {
         Plan const& p = seeds[static_cast<size_t>(i)];
@@ -900,6 +1008,107 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
         if (improved && (m_press.plan.secondAt >= 0 || m_release.plan.secondAt >= 0)) m_advice.stage = SearchStage::TwoJump;
     }
 
+    // ---- orbs ahead: activating each one is a candidate action ----
+    // For the nearest orbs, the paths of the best plans so far (and of not
+    // pressing at all) show when the hitbox overlaps the orb; a press at the
+    // start, the middle and the end of that window (for a dash orb with
+    // several hold durations) is simulated through everything that follows.
+    m_orbOn = PredictedPath{};
+    m_orbOff = PredictedPath{};
+    if (!s.orbs.empty()) {
+        float const reach = s.x + static_cast<float>(m_horizon) * m_model.vxPerTick(s.speedClass) + kNear;
+        float const ph = m_model.params(s.mode, s.mini).halfSize;
+        int handled = 0;
+        for (size_t k = 0; k < s.orbs.size() && handled < 2; ++k) {
+            Orb const& ob = s.orbs[k];
+            if (ob.used || ob.r < s.x - ph || ob.l > reach) continue;
+            ++handled;
+            bool const first = handled == 1;
+            auto& O = m_advice.orb;
+            if (first) {
+                O.present = true;
+                O.type = ob.type;
+                O.id = ob.id;
+                O.l = ob.l;
+                O.b = ob.b;
+                O.r = ob.r;
+                O.t = ob.t;
+                O.simulated = orbSimulated(ob.type);
+                O.known = O.simulated && m_model.orb(ob.type, s.mode, s.mini).known;
+                O.overlappingNow = ob.l <= s.x + ph && ob.r >= s.x - ph && ob.b <= s.y + ph && ob.t >= s.y - ph;
+            }
+            if (!orbSimulated(ob.type)) continue;
+            // The jump before the orb decides where (and whether) the orb is
+            // reached: the orb press is tried after several jump timings, not
+            // only after the plan that is best without the orb.
+            Plan bases[16];
+            int nb = 0;
+            bases[nb++] = Plan{-1, 0, 0, false};
+            bases[nb++] = m_press.plan;
+            if (m_release.plan.pressAt >= 0) bases[nb++] = m_release.plan;
+            if (groundOnly(s.mode) && s.onGround) {
+                for (int k : kCoarseDelays) {
+                    if (nb >= 16 || k >= m_horizon || k > neverHit) break;
+                    if (m_release.plan.pressAt == k) continue;
+                    Plan p = shapes[0];
+                    p.pressAt = k;
+                    bases[nb++] = p;
+                }
+            }
+            for (int bi = 0; bi < nb; ++bi) {
+                Plan const base = bases[bi];
+                if (base.orbPressAt >= 0) continue;
+                simulate(s, span, base, m_orbTmp);
+                ++m_advice.simulations;
+                ++m_totalSims;
+                int32_t w0 = -1, w1 = -1;
+                for (size_t i = 0; i < m_orbTmp.points.size(); ++i) {
+                    PathPoint const& pt = m_orbTmp.points[i];
+                    bool const over = ob.l <= pt.x + ph && ob.r >= pt.x - ph && ob.b <= pt.y + ph && ob.t >= pt.y - ph;
+                    if (over && w0 < 0) w0 = static_cast<int32_t>(i);
+                    if (over) w1 = static_cast<int32_t>(i);
+                    if (!over && w0 >= 0) break;
+                }
+                if (w0 < 0) continue;
+                if (first && (O.windowFrom < 0 || w0 < O.windowFrom)) {
+                    O.windowFrom = w0;
+                    O.windowTo = w1;
+                }
+                // (the point after step i is reached by the input of step i+1)
+                int32_t const ks[3] = {w0 + 1, (w0 + w1) / 2 + 1, w1};
+                static constexpr int32_t kDashHolds[] = {8, 16, 28, 44, 64, 96, 140};
+                for (int ki = 0; ki < 3; ++ki) {
+                    int32_t const kstep = std::max<int32_t>(0, ks[ki] - 1);
+                    if (ki > 0 && kstep == std::max<int32_t>(0, ks[ki - 1] - 1)) continue;
+                    int const nh = isDashOrb(ob.type) ? 7 : 1;
+                    for (int hi = 0; hi < nh; ++hi) {
+                        Plan p = base;
+                        p.orbPressAt = kstep;
+                        p.orbHoldFor = isDashOrb(ob.type) ? kDashHolds[hi] : 0;
+                        int const branch = (p.pressAt == 0 || kstep == 0) ? 1 : 0;
+                        PredictedPath& best = branch ? m_press : m_release;
+                        bool& have = branch ? havePress : haveRelease;
+                        int const simsBefore = m_advice.simulations;
+                        evaluate(s, span, p, m_tmp, best, have, branch);
+                        if (m_advice.simulations == simsBefore) continue;
+                        PredictedPath const& r = samePlan(best.plan, p) ? best : m_tmp;
+                        if (!first || !r.activates(ob.id)) continue;
+                        ++O.candidates;
+                        float const sc = score(r);
+                        if (sc > O.activateScore) {
+                            O.activateScore = sc;
+                            O.activate = r.outcome;
+                            O.activateTTC = r.outcome == Certainty::Collision ? r.collisionStep : -1;
+                            O.activateHitsAbove = r.outcome == Certainty::Collision && r.hit.b > r.collisionY;
+                            O.activatePlan = p;
+                            m_orbOn = r;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // The strategic sequence plan last: chosen only if strictly better.
     if (hasLate && late.pressAt >= 0 && late.pressAt < m_horizon && late.pressAt <= neverHit) {
         int const branch = late.pressAt == 0 ? 1 : 0;
@@ -954,6 +1163,23 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
                                     (b.plan.secondAt < 0) == (p.secondAt < 0) && b.plan.rejump == p.rejump;
         }
         if (m_advice.fromStrategy) m_advice.fromSeed = true;
+        if (m_advice.orb.present) {
+            auto& O = m_advice.orb;
+            O.chosenActivates = b.activates(O.id);
+            // what happens without it: the best plan if it does not use the
+            // orb, otherwise the better of the two branches that do not
+            PredictedPath const* skip = nullptr;
+            for (PredictedPath const* c : {&b, static_cast<PredictedPath const*>(&m_release), static_cast<PredictedPath const*>(&m_press)})
+                if (!c->activates(O.id) && (!skip || score(*c) > score(*skip))) skip = c;
+            if (!skip) {
+                simulate(s, span, Plan{-1, 0, 0, false}, m_orbTmp);
+                skip = &m_orbTmp;
+            }
+            m_orbOff = *skip;
+            O.skip = m_orbOff.outcome;
+            O.skipTTC = m_orbOff.outcome == Certainty::Collision ? m_orbOff.collisionStep : -1;
+            O.skipScore = score(m_orbOff);
+        }
         m_advice.fromLateSeed = m_advice.lateSeeded && std::abs(b.plan.pressAt - late.pressAt) <= res && (b.plan.pressAt == 0) == (late.pressAt == 0) &&
                                 (b.plan.secondAt < 0) == (late.secondAt < 0) && (b.plan.thirdAt < 0) == (late.thirdAt < 0);
     }
@@ -1108,6 +1334,65 @@ void Predictor::observe(Observation const& obs, bool heldDuringStep) {
     } else {
         m_robotAlive = false;
     }
+    // ---- orbs: what the game reported, and dashes in progress ----
+    for (auto const& e : obs.orbEvents) {
+        m_lastOrbTick = obs.tick;
+        if (e.kind == OrbEvent::Kind::Activated) {
+            OrbPhysics const known = m_model.orb(e.type, e.mode, e.mini);
+            m_orbCheck.tick = obs.tick;
+            m_orbCheck.type = e.type;
+            m_orbCheck.wasKnown = known.known;
+            m_orbCheck.vyError = m_model.observeOrb(e);
+            m_orbCheck.dash = isDashOrb(e.type);
+            ++m_orbCheck.activations;
+            if (!e.newPress) m_model.observeHeldEntry(true);
+        } else if (e.kind == OrbEvent::Kind::DashStarted) {
+            m_dashActive = true;
+            m_dashType = e.type;
+            m_dashStartTick = obs.tick;
+            m_dashRotation = 0.f;
+            m_dashMaxSteps = 1 << 20;
+            for (auto const& o : obs.orbs) {
+                if (o.id != e.id) continue;
+                m_dashRotation = o.rotation;
+                if (o.maxDuration > 0.f) m_dashMaxSteps = static_cast<int32_t>(std::lround(o.maxDuration * kTicksPerSecond));
+            }
+        } else if (e.kind == OrbEvent::Kind::DashStopped) {
+            if (m_dashActive)
+                m_model.observeDashEnd(m_dashType, e.mode, e.mini, e.flippedAfter ? -e.vyAfter : e.vyAfter, !heldDuringStep);
+            m_dashActive = false;
+        }
+    }
+    if (m_dashActive && !obs.dashing && obs.orbEvents.empty()) m_dashActive = false;
+    // every step of a dash counts as an orb step (no mode calibration, no
+    // accuracy windows over it: the dash is not mode physics)
+    if (m_dashActive || obs.dashing) m_lastOrbTick = obs.tick;
+    if (m_dashActive && obs.dashing && last && gap == 1 && last->tick >= m_dashStartTick) {
+        float const dx = obs.x - last->x, dy = obs.y - last->y;
+        // compare with the model before learning from it
+        OrbPhysics const op = m_model.orb(m_dashType, obs.mode, obs.mini);
+        float const vxs = m_model.vxPerTick(obs.speedClass());
+        float const pdy = vxs * op.dashDx * std::tan(-m_dashRotation * 3.14159265f / 180.f) * op.dashSlope;
+        m_orbCheck.dashError = std::hypot(dx - vxs * op.dashDx, dy - pdy);
+        m_model.observeDashStep(m_dashType, obs.mode, obs.mini, dx, dy, m_dashRotation, obs.speedClass());
+    }
+    // holding the button into an orb without activating it
+    {
+        std::vector<int32_t> now;
+        float const ph = m_model.params(obs.mode, obs.mini).halfSize;
+        for (auto const& o : obs.orbs) {
+            if (!(o.l <= obs.x + ph && o.r >= obs.x - ph && o.b <= obs.y + ph && o.t >= obs.y - ph)) continue;
+            now.push_back(o.id);
+            bool const entered = std::find(m_overOrbs.begin(), m_overOrbs.end(), o.id) == m_overOrbs.end();
+            bool const heldBefore = last && last->held;
+            if (!entered || !heldDuringStep || !heldBefore || o.used || !orbSimulated(o.type)) continue;
+            bool fired = false;
+            for (auto const& e : obs.orbEvents) fired = fired || e.id == o.id;
+            if (!fired) m_model.observeHeldEntry(false);
+        }
+        m_overOrbs = std::move(now);
+    }
+
     int32_t boostLeft = obs.mode == GameMode::Robot && m_robotAlive
                             ? std::max(0, m_model.params(obs.mode, obs.mini).boostSteps - m_robotSince) : 0;
     Rec r{obs.x, obs.y, obs.vy, obs.onGround, obs.upsideDown, obs.mini, heldDuringStep, obs.dead, obs.mode, obs.speedClass(), obs.tick,
@@ -1133,7 +1418,9 @@ void Predictor::observe(Observation const& obs, bool heldDuringStep) {
             prev.mode = p.mode;
             prev.tick = p.tick;
             prev.playerSpeed = p.playerSpeed;
-            m_model.observeStep(prev, obs, effHeld, effBefore);
+            // (steps with an orb activation or a dash are not normal movement)
+            bool const orbStep = !obs.orbEvents.empty() || obs.dashing || m_dashActive;
+            if (!orbStep) m_model.observeStep(prev, obs, effHeld, effBefore);
 
             // one-step prediction error (diagnostics)
             if (p.mode == obs.mode && p.mini == obs.mini && !p.dead && !obs.dead) {
@@ -1165,7 +1452,9 @@ void Predictor::observe(Observation const& obs, bool heldDuringStep) {
     // latency (0, 1, 2 steps); the one that matches the real game best is
     // used for planning.
     m_sinceResim += std::max(1, gap);
-    if (m_sinceResim >= 16 && m_histCount > 2) {
+    // (windows with an orb activation or a dash are not re-simulated: the
+    // accuracy measurement is for the mode physics)
+    if (m_sinceResim >= 16 && m_histCount > 2 && obs.tick - m_lastOrbTick > kResimSteps + kLags + 2) {
         auto at = [&](size_t back) -> Rec const& { return m_hist[(m_histHead + kHistory - 1 - back) % kHistory]; };
         // the newest record at least kResimSteps steps back, with kLags more steps of history before it
         size_t B = 0;

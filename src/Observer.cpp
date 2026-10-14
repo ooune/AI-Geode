@@ -105,17 +105,17 @@ std::optional<std::pair<aigd::MapKind, uint8_t>> classifyForMap(GameObject* obj)
         case GameObjectType::GravityPad:
         case GameObjectType::RedJumpPad:
         case GameObjectType::SpiderPad: return std::pair{K::Pad, uint8_t(0)};
-        case GameObjectType::YellowJumpRing:
-        case GameObjectType::PinkJumpRing:
-        case GameObjectType::GravityRing:
-        case GameObjectType::GreenRing:
-        case GameObjectType::DropRing:
-        case GameObjectType::RedJumpRing:
-        case GameObjectType::CustomRing:
-        case GameObjectType::DashRing:
-        case GameObjectType::GravityDashRing:
-        case GameObjectType::SpiderOrb:
-        case GameObjectType::TeleportOrb: return std::pair{K::Orb, uint8_t(0)};
+        case GameObjectType::YellowJumpRing: return std::pair{K::Orb, static_cast<uint8_t>(aigd::OrbType::Yellow)};
+        case GameObjectType::PinkJumpRing: return std::pair{K::Orb, static_cast<uint8_t>(aigd::OrbType::Pink)};
+        case GameObjectType::RedJumpRing: return std::pair{K::Orb, static_cast<uint8_t>(aigd::OrbType::Red)};
+        case GameObjectType::GravityRing: return std::pair{K::Orb, static_cast<uint8_t>(aigd::OrbType::Blue)};
+        case GameObjectType::GreenRing: return std::pair{K::Orb, static_cast<uint8_t>(aigd::OrbType::Green)};
+        case GameObjectType::DropRing: return std::pair{K::Orb, static_cast<uint8_t>(aigd::OrbType::Black)};
+        case GameObjectType::DashRing: return std::pair{K::Orb, static_cast<uint8_t>(aigd::OrbType::Dash)};
+        case GameObjectType::GravityDashRing: return std::pair{K::Orb, static_cast<uint8_t>(aigd::OrbType::GravityDash)};
+        case GameObjectType::SpiderOrb: return std::pair{K::Orb, static_cast<uint8_t>(aigd::OrbType::Spider)};
+        case GameObjectType::TeleportOrb: return std::pair{K::Orb, static_cast<uint8_t>(aigd::OrbType::Teleport)};
+        case GameObjectType::CustomRing: return std::pair{K::Orb, static_cast<uint8_t>(aigd::OrbType::Custom)};
         case GameObjectType::NormalGravityPortal: return std::pair{K::GravityPortal, uint8_t(0)};
         case GameObjectType::InverseGravityPortal: return std::pair{K::GravityPortal, uint8_t(1)};
         case GameObjectType::GravityTogglePortal: return std::pair{K::GravityPortal, uint8_t(2)};
@@ -230,6 +230,14 @@ void Observer::buildMap(PlayLayer* layer, aigd::LevelMap& map, float floorSurfac
             for (int g = 0; g < obj->m_groupCount && g < 10; ++g)
                 if (moved.count((*obj->m_groups)[static_cast<size_t>(g)])) m.dynamic = true;
         }
+        if (m.kind == aigd::MapKind::Orb) {
+            m.rotation = obj->getRotation();
+            m.uniqueId = obj->m_uniqueID;
+            if (auto* dash = typeinfo_cast<DashRingObject*>(obj)) {
+                m.dashSpeed = dash->m_dashSpeed;
+                m.maxDuration = dash->m_maxDuration;
+            }
+        }
         m.source = static_cast<uint32_t>(m_mapSources.size());
         m_mapSources.push_back(obj);
         objs.push_back(m);
@@ -296,6 +304,7 @@ aigd::Observation Observer::observe(PlayLayer* layer, int32_t tick) {
     o.dead = p->m_isDead;
     o.playerSpeed = p->m_playerSpeed;
     o.levelLength = std::max(1.f, layer->m_levelLength);
+    o.dashing = p->m_isDashing;
 
     if (m_items.empty()) return o;
 

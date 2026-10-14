@@ -10,6 +10,7 @@
 #include <Geode/modify/AppDelegate.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PlayerObject.hpp>
 
 using namespace geode::prelude;
 
@@ -139,6 +140,36 @@ class $modify(AIPlayLayer, PlayLayer) {
             f->uiTimer = 0.f;
             f->panel->refresh();
         }
+    }
+};
+
+// Orb activations and dashes, as the game performs them: what the AI learns
+// orb effects from and how it confirms a planned activation. Only state is
+// read here; nothing about the game's behaviour is changed.
+class $modify(AIPlayerObject, PlayerObject) {
+    void ringJump(RingObject* ring, bool skipCheck) {
+        double const vyBefore = m_yVelocity;
+        bool const flippedBefore = m_isUpsideDown;
+        bool const dashingBefore = m_isDashing;
+        bool const touchedBefore = ring && m_touchedRings.count(ring->m_uniqueID) > 0;
+        PlayerObject::ringJump(ring, skipCheck);
+        if (!ring) return;
+        bool const touchedAfter = m_touchedRings.count(ring->m_uniqueID) > 0;
+        bool const activated = (!touchedBefore && touchedAfter) || m_yVelocity != vyBefore || m_isUpsideDown != flippedBefore ||
+                               m_isDashing != dashingBefore;
+        if (activated) AIController::get().onOrbActivated(this, ring, vyBefore, m_yVelocity, flippedBefore, m_isUpsideDown);
+    }
+
+    void startDashing(DashRingObject* ring) {
+        PlayerObject::startDashing(ring);
+        AIController::get().onDashStarted(this, ring, m_dashAngle);
+    }
+
+    void stopDashing() {
+        bool const was = m_isDashing;
+        double const vyBefore = m_yVelocity;
+        PlayerObject::stopDashing();
+        if (was) AIController::get().onDashStopped(this, vyBefore, m_yVelocity);
     }
 };
 

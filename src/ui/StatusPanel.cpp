@@ -164,6 +164,11 @@ void StatusPanel::refresh() {
                                     st.strategicPlans, st.strategicOverrides, st.strategicInvalidated, st.strategicMatched, st.strategicSeeded);
             if (!st.strategicEvent.empty()) text += "\nRe-planned: " + st.strategicEvent;
         }
+        if (!st.orbChoice.empty()) text += "\nOrb: " + st.orbChoice;
+        if (!st.orbEvent.empty()) text += "\nOrb event: " + st.orbEvent;
+        if (st.orbsSeen > 0)
+            text += fmt::format("\nOrbs this attempt: {} met, {} activations planned, {} confirmed by the game, {} not confirmed, {} skipped",
+                                st.orbsSeen, st.orbActivationsPlanned, st.orbActivationsConfirmed, st.orbActivationsMissed, st.orbSkips);
         if (!st.situation.empty()) text += "\nAhead: " + st.situation;
         if (!st.transferEvent.empty()) text += "\nTransfer: " + st.transferEvent;
         {

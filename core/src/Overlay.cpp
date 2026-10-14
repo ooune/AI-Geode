@@ -1,6 +1,7 @@
 #include <aigd/Overlay.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 
 namespace aigd {
@@ -13,6 +14,9 @@ void OverlayGeometry::clear() {
     stepsToCollision = -1;
     outcome = Certainty::Safe;
     label.clear();
+    hasOrb = false;
+    orbSelected = false;
+    orbLabel.clear();
 }
 
 namespace {
@@ -76,8 +80,48 @@ void buildOverlay(PredictedPath const& main, PredictedPath const* alternative, s
     out.label = buf;
 }
 
+void addOrbLayer(Predictor const& predictor, OverlayGeometry& out, int stride) {
+    auto const& O = predictor.lastAdvice().orb;
+    if (!O.present) return;
+    out.hasOrb = true;
+    out.boxes.push_back({O.l, O.b, O.r, O.t, OverlayGeometry::Style::OrbBox});
+    PredictedPath const& executed = predictor.executedPath();
+    bool const selected = predictor.hasExecuted() && executed.activates(O.id);
+    out.orbSelected = selected;
+    PredictedPath const& on = selected ? executed : predictor.orbActivatedPath();
+    PredictedPath const& off = selected ? predictor.orbSkippedPath() : executed;
+    // the outcome that is not selected, in its own style
+    if (selected) addPath(off, OverlayGeometry::Style::OrbSkipped, stride, out);
+    else if (on.points.size() >= 2) addPath(on, OverlayGeometry::Style::OrbActivated, stride, out);
+    if (on.activates(O.id)) {
+        int const i = on.orbActivations > 1 && on.orbId[1] == O.id ? 1 : 0;
+        out.dots.push_back({on.orbX[i], on.orbY[i], OverlayGeometry::Style::OrbPoint});
+        if (!selected) {
+            if (on.collisionStep >= 0) out.dots.push_back({on.collisionX, on.collisionY, OverlayGeometry::Style::Collision});
+            else if (on.landed) out.dots.push_back({on.landX, on.landY, OverlayGeometry::Style::Landing});
+        }
+    }
+    auto outcome = [](Certainty c, int32_t ttc) {
+        char buf[48];
+        if (c == Certainty::Collision) std::snprintf(buf, sizeof(buf), "collision in %d", ttc + 1);
+        else std::snprintf(buf, sizeof(buf), "%s", c == Certainty::Safe ? "safe" : "uncertain");
+        return std::string(buf);
+    };
+    std::string name = orbTypeName(O.type);
+    for (auto& ch : name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    char buf[220];
+    if (!O.simulated) std::snprintf(buf, sizeof(buf), "%s: effect not simulated - %s", name.c_str(), selected ? "ACTIVATING" : "not activating");
+    else
+        std::snprintf(buf, sizeof(buf), "%s: activate -> %s%s | skip -> %s | selected: %s", name.c_str(),
+                      O.candidates ? outcome(O.activate, O.activateTTC).c_str() : "not reachable",
+                      O.known ? "" : " (not calibrated)", outcome(O.skip, O.skipTTC).c_str(), selected ? "ACTIVATE" : "SKIP");
+    out.orbLabel = buf;
+    out.orbLabelX = 0.5f * (O.l + O.r);
+    out.orbLabelY = O.t + 30.f;
+}
+
 bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decision, int32_t nowTick, bool showAlternative,
-                          std::span<Obstacle const> obstacles, OverlayGeometry& out, LivePlan const* plan) {
+                          std::span<Obstacle const> obstacles, OverlayGeometry& out, LivePlan const* plan, bool showOrbs) {
     out.clear();
     if (plan && plan->active && decision.proposedSource == DecisionSource::Plan && decision.tick == nowTick) {
         // Following the live plan: draw what is left of it, from now on.
@@ -102,6 +146,7 @@ bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decisi
                       steered ? (out.selectedPress ? "HOLD" : "RELEASE") : (out.selectedPress ? "PRESS" : "RELEASE"),
                       plan->outcome == Certainty::Safe ? "safe" : "risky", out.predictionAge);
         out.label = buf;
+        if (showOrbs) addOrbLayer(predictor, out);
         return true;
     }
     auto const& adv = predictor.lastAdvice();
@@ -144,6 +189,7 @@ bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decisi
     if (decision.verdict == SafetyVerdict::NoSafeOption) n += std::snprintf(buf + n, sizeof(buf) - n, " - NO SAFE OPTION");
     if (out.stale) std::snprintf(buf + n, sizeof(buf) - n, " - prediction %d step(s) old", out.predictionAge);
     out.label = buf;
+    if (showOrbs) addOrbLayer(predictor, out);
     return true;
 }
 

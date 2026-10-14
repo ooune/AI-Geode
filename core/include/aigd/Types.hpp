@@ -64,6 +64,52 @@ struct PhysicsEvent {
     bool verified = false;
 };
 
+// Orbs (rings): what the button does while the player's hitbox overlaps one.
+enum class OrbType : uint8_t {
+    Yellow = 0,   // jump
+    Pink,         // small jump
+    Red,          // big jump
+    Blue,         // gravity ring: flips gravity
+    Green,        // flips gravity and jumps
+    Black,        // drop ring: pushes towards the ground
+    Dash,         // green dash orb: moves in a straight line while held
+    GravityDash,  // pink dash orb: dash with gravity flipped
+    Spider,       // spider orb: teleports (not simulated)
+    Teleport,     // teleport orb (not simulated)
+    Custom,       // toggle / custom ring (not simulated)
+    Count
+};
+char const* orbTypeName(OrbType t);
+inline bool isDashOrb(OrbType t) { return t == OrbType::Dash || t == OrbType::GravityDash; }
+// Orbs whose effect the predictor can simulate (once calibrated).
+inline bool orbSimulated(OrbType t) { return t <= OrbType::GravityDash; }
+
+// An orb near the player: the game's activation rectangle and what it does.
+struct Orb {
+    float l = 0.f, b = 0.f, r = 0.f, t = 0.f;
+    OrbType type = OrbType::Yellow;
+    float rotation = 0.f;      // object rotation in degrees (cocos: clockwise); the dash direction
+    float dashSpeed = 1.f;     // dash orbs: the orb's speed setting
+    float maxDuration = 0.f;   // dash orbs: seconds (0 = no limit)
+    bool used = false;         // already activated in this attempt
+    int32_t id = 0;            // the game's unique id
+};
+
+// An orb activation the game reported (hooked in game, the simulator in tests).
+struct OrbEvent {
+    enum class Kind : uint8_t { Activated, DashStarted, DashStopped };
+    Kind kind = Kind::Activated;
+    OrbType type = OrbType::Yellow;
+    int32_t id = 0;
+    GameMode mode = GameMode::Cube;
+    bool mini = false;
+    float x = 0.f, y = 0.f;
+    float vyBefore = 0.f, vyAfter = 0.f;   // raw vertical velocity
+    bool flippedBefore = false, flippedAfter = false;
+    bool newPress = false;     // the button went down in this step (vs. held from before)
+    float dashAngle = 0.f;     // the game's dash angle after the start (degrees)
+};
+
 // Everything the agent may know about the current physics step. Filled by the
 // Geode observer from real game state (or by the simulator in tests).
 struct Observation {
@@ -88,6 +134,11 @@ struct Observation {
     std::span<PhysicsEvent const> events;
     // Changes whenever a moving/toggled object of the level changed (0 = no level map).
     uint64_t geometryVersion = 0;
+    // Orbs around the player (same window), sorted by l, and the orb
+    // activations the game reported since the previous observation.
+    std::span<Orb const> orbs;
+    std::span<OrbEvent const> orbEvents;
+    bool dashing = false;      // a dash orb's dash is in progress
     // Playing-area floor/ceiling surfaces reported by the game for corridor
     // modes (ship, UFO, ...). Only a hint: confirmed by actual contact.
     bool hasBoundsHint = false;

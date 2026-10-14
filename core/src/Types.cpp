@@ -45,6 +45,23 @@ float Observation::progress() const {
     return std::clamp(x / levelLength, 0.f, 1.f);
 }
 
+char const* orbTypeName(OrbType t) {
+    switch (t) {
+        case OrbType::Yellow: return "yellow orb";
+        case OrbType::Pink: return "pink orb";
+        case OrbType::Red: return "red orb";
+        case OrbType::Blue: return "blue orb";
+        case OrbType::Green: return "green orb";
+        case OrbType::Black: return "black orb";
+        case OrbType::Dash: return "dash orb";
+        case OrbType::GravityDash: return "gravity dash orb";
+        case OrbType::Spider: return "spider orb";
+        case OrbType::Teleport: return "teleport orb";
+        case OrbType::Custom: return "custom orb";
+        default: return "orb";
+    }
+}
+
 char const* failureKindName(FailureKind kind) {
     switch (kind) {
         case FailureKind::None: return "none";

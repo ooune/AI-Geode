@@ -27,7 +27,7 @@ using aigd::GameMode;
 using aigd::KillerKind;
 using aigd::Observation;
 
-enum class ObjKind { Spike, Block, ModePortal, GravityPortal, SpeedPortal };
+enum class ObjKind { Spike, Block, ModePortal, GravityPortal, SpeedPortal, Orb };
 
 struct Obj {
     ObjKind kind;
@@ -37,6 +37,9 @@ struct Obj {
     int speed = 1;                  // speed portals: the new speed class
     int32_t moveAt = -1;            // moves by moveDy (vertically) at this tick (-1 never): a triggered obstacle
     float moveDy = 0.f;
+    aigd::OrbType orbType = aigd::OrbType::Yellow; // orbs
+    float rotation = 0.f;           // dash orbs: direction (degrees, clockwise like cocos)
+    float maxDuration = 0.f;        // dash orbs: seconds (0 = until released)
 };
 
 struct Level {
@@ -59,6 +62,19 @@ struct Level {
     void speedPortal(float bx, int speedClass) {
         Obj o{ObjKind::SpeedPortal, bx * 30.f, 0.f, 30.f, 600.f};
         o.speed = speedClass;
+        objs.push_back(o);
+    }
+    // an orb (1 block, its activation area) / a dash orb pointing at `rotation`
+    void orb(float bx, float by, aigd::OrbType t) {
+        Obj o{ObjKind::Orb, bx * 30.f, by * 30.f, 30.f, 30.f};
+        o.orbType = t;
+        objs.push_back(o);
+    }
+    void dashOrb(float bx, float by, float rotation, float maxDuration = 0.f, bool gravity = false) {
+        Obj o{ObjKind::Orb, bx * 30.f, by * 30.f, 30.f, 30.f};
+        o.orbType = gravity ? aigd::OrbType::GravityDash : aigd::OrbType::Dash;
+        o.rotation = rotation;
+        o.maxDuration = maxDuration;
         objs.push_back(o);
     }
     // a block that moves vertically by dyBlocks at the given tick
@@ -104,6 +120,8 @@ public:
     static inline int s_inputDelay = 0;        // steps between the button being sent and acting
     static inline float s_noise = 0.f;         // random vertical jitter per airborne step (unpredictable)
     static inline float s_hazardInflate = 0.f; // hazards are reported this much bigger than they kill
+    static inline bool s_orbsDisabled = false;   // orbs never activate (an activation the AI expects does not happen)
+    static inline float s_orbScale = 1.f;        // orb velocities scaled (the game differs from what was learned)
 
     static ModeSpec spec(GameMode m) {
         ModeSpec s = baseSpec(m);
@@ -149,6 +167,11 @@ public:
         m_portalsPassed = 0;
         m_speedPassed = 0;
         m_speedClass = m_startSpeed;
+        m_orbUsed.assign(m_level.objs.size(), 0);
+        m_orbInside.assign(m_level.objs.size(), 0);
+        m_events.clear();
+        m_dashing = false;
+        m_dashLeft = 0;
         for (auto const& o : m_level.objs) {
             if (o.x > m_x + kHalf) break;
             if (o.kind == ObjKind::ModePortal && o.x + o.w * 0.5f <= m_x) m_mode = o.mode;
@@ -184,7 +207,7 @@ public:
             if (o.x > x1) break;
             if (o.x + o.w < x0) continue;
             if (o.hidden) continue;
-            if (o.kind == ObjKind::GravityPortal || o.kind == ObjKind::SpeedPortal) continue; // physics events
+            if (o.kind == ObjKind::GravityPortal || o.kind == ObjKind::SpeedPortal || o.kind == ObjKind::Orb) continue; // events / orbs
             aigd::Obstacle ob;
             float const oy = yOf(o);
             if (o.kind == ObjKind::Spike) {
@@ -214,6 +237,36 @@ public:
                 out.push_back({o.x, o.y, o.x + o.w, o.y + o.h, aigd::PhysicsEvent::Kind::Speed, static_cast<uint8_t>(o.speed), true});
         }
     }
+
+    // Orbs in [x0, x1] as the observer reports them (used = already activated).
+    void collectOrbs(float x0, float x1, std::vector<aigd::Orb>& out) const {
+        out.clear();
+        for (size_t i = 0; i < m_level.objs.size(); ++i) {
+            auto const& o = m_level.objs[i];
+            if (o.x > x1) break;
+            if (o.kind != ObjKind::Orb || o.x + o.w < x0) continue;
+            aigd::Orb b;
+            b.l = o.x;
+            b.b = o.y;
+            b.r = o.x + o.w;
+            b.t = o.y + o.h;
+            b.type = o.orbType;
+            b.rotation = o.rotation;
+            b.maxDuration = o.maxDuration;
+            b.used = m_orbUsed.size() > i && m_orbUsed[i];
+            b.id = static_cast<int32_t>(i);
+            out.push_back(b);
+        }
+    }
+    // Orb activations / dash starts and stops of the last step (what the
+    // game's hooks report in game).
+    std::vector<aigd::OrbEvent> const& orbEvents() const { return m_events; }
+    bool dashing() const { return m_dashing; }
+
+    // The simulator's orb effects (its own constants: the predictor learns
+    // them from the events, as it must in game).
+    static constexpr float kYellowOrb = 11.2f, kPinkOrb = 7.9f, kRedOrb = 14.6f, kBlueOrb = -3.3f, kGreenOrb = 11.f, kBlackOrb = -17.6f;
+    static constexpr float kDashEndVy = 2.f;
 
     Observation observe() const {
         Observation o;
@@ -266,7 +319,83 @@ public:
         float sg = m_upsideDown ? -1.f : 1.f;
         float vyN = m_vy * sg;
         bool teleported = false;
-        switch (m_mode) {
+
+        // ---- orbs: a new press inside one, or holding when entering it ----
+        m_events.clear();
+        bool orbFired = false;
+        auto event = [&](aigd::OrbEvent::Kind k, aigd::OrbType t, int32_t id, float vyBefore, bool flippedBefore) {
+            aigd::OrbEvent e;
+            e.kind = k;
+            e.type = t;
+            e.id = id;
+            e.mode = m_mode;
+            e.x = m_x;
+            e.y = m_y;
+            e.vyBefore = vyBefore;
+            e.flippedBefore = flippedBefore;
+            e.newPress = edge;
+            return e;
+        };
+        if (m_dashing && (!hold || m_dashLeft <= 0)) {
+            m_dashing = false;
+            aigd::OrbEvent e = event(aigd::OrbEvent::Kind::DashStopped, m_dashType, m_dashId, m_vy, m_upsideDown);
+            vyN = kDashEndVy;
+            e.vyAfter = vyN * sg;
+            e.flippedAfter = m_upsideDown;
+            m_events.push_back(e);
+        }
+        if (!m_dashing) {
+            Rect const player{m_x - half, m_y - half, m_x + half, m_y + half};
+            for (size_t i = 0; i < m_level.objs.size(); ++i) {
+                auto const& o = m_level.objs[i];
+                if (o.x > m_x + 60.f) break;
+                if (o.kind != ObjKind::Orb) continue;
+                bool const over = player.overlaps(Rect{o.x, o.y, o.x + o.w, o.y + o.h});
+                bool const entering = over && !m_orbInside[i];
+                m_orbInside[i] = over ? 1 : 0;
+                if (!over || m_orbUsed[i] || !(edge || (hold && entering)) || s_orbsDisabled) continue;
+                m_orbUsed[i] = 1;
+                aigd::OrbEvent e = event(aigd::OrbEvent::Kind::Activated, o.orbType, static_cast<int32_t>(i), m_vy, m_upsideDown);
+                bool const flips = o.orbType == aigd::OrbType::Blue || o.orbType == aigd::OrbType::Green || o.orbType == aigd::OrbType::GravityDash;
+                if (flips) {
+                    m_upsideDown = !m_upsideDown;
+                    sg = -sg;
+                    vyN = -vyN;
+                }
+                switch (o.orbType) {
+                    case aigd::OrbType::Yellow: vyN = kYellowOrb; break;
+                    case aigd::OrbType::Pink: vyN = kPinkOrb; break;
+                    case aigd::OrbType::Red: vyN = kRedOrb; break;
+                    case aigd::OrbType::Blue: vyN = kBlueOrb; break;
+                    case aigd::OrbType::Green: vyN = kGreenOrb; break;
+                    case aigd::OrbType::Black: vyN = kBlackOrb; break;
+                    case aigd::OrbType::Dash:
+                    case aigd::OrbType::GravityDash: {
+                        m_dashing = true;
+                        m_dashType = o.orbType;
+                        m_dashId = static_cast<int32_t>(i);
+                        m_dashDy = vx * std::tan(-o.rotation * 3.14159265f / 180.f);
+                        m_dashLeft = o.maxDuration > 0.f ? static_cast<int>(std::lround(o.maxDuration * 240.f)) : (1 << 20);
+                        break;
+                    }
+                    default: break;
+                }
+                if (!m_dashing) vyN *= s_orbScale;
+                m_onGround = false;
+                orbFired = true;
+                e.vyAfter = vyN * sg;
+                e.flippedAfter = m_upsideDown;
+                m_events.push_back(e);
+                if (m_dashing) {
+                    aigd::OrbEvent d = e;
+                    d.kind = aigd::OrbEvent::Kind::DashStarted;
+                    m_events.push_back(d);
+                }
+                break;
+            }
+        }
+
+        if (!orbFired && !m_dashing) switch (m_mode) {
             case GameMode::Cube:
                 if (m_onGround && hold) {
                     vyN = S.impulse;
@@ -346,8 +475,12 @@ public:
             default:
                 break;
         }
-        if (m_mode != GameMode::Wave) vyN = std::clamp(vyN, -S.maxDown, S.maxUp);
+        if (m_mode != GameMode::Wave && !m_dashing) vyN = std::clamp(vyN, -S.maxDown, S.maxUp);
         m_vy = vyN * sg;
+        if (m_dashing) {
+            m_vy = m_dashDy * kVyScale; // a straight line, gravity off
+            --m_dashLeft;
+        }
         m_x += vx;
         if (!teleported) m_y += m_vy / kVyScale;
         if (s_noise > 0.f && !m_onGround) {
@@ -397,6 +530,7 @@ public:
                 }
                 continue;
             }
+            if (o.kind == ObjKind::Orb) continue; // orbs are not solid (handled before the move)
             float const oy = yOf(o);
             if (o.kind == ObjKind::Spike) {
                 if (player.overlaps(spikeHitboxAt(o, oy))) {
@@ -448,6 +582,13 @@ private:
     int m_speedClass;
     int m_startSpeed = 1;
     int m_speedPassed = 0;
+    std::vector<uint8_t> m_orbUsed, m_orbInside;
+    std::vector<aigd::OrbEvent> m_events;
+    bool m_dashing = false;
+    aigd::OrbType m_dashType = aigd::OrbType::Dash;
+    int32_t m_dashId = 0;
+    float m_dashDy = 0.f;
+    int m_dashLeft = 0;
     float m_x = 0, m_y = 0, m_vy = 0;
     GameMode m_mode = GameMode::Cube;
     bool m_onGround = true;

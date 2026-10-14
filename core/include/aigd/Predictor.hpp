@@ -33,6 +33,12 @@ struct Plan {
     bool rejump = false;      // cube/robot: keep holding through the first landing (jump again)
     int32_t secondAt = -1;    // cube/robot: a second press this many steps after the first landing (-1 none)
     int32_t thirdAt = -1;     // cube/robot: a third press this many steps after the second landing (-1 none)
+    // An orb press: the button goes down at this plan step (whatever else the
+    // plan does) and is held for orbHoldFor steps (0 = a 2-step tap). Pressed
+    // while the hitbox overlaps an orb, it activates the orb; for a dash orb
+    // the hold is how long the dash lasts.
+    int32_t orbPressAt = -1;
+    int32_t orbHoldFor = 0;
 };
 
 // How far the timing search got for one decision.
@@ -63,6 +69,14 @@ struct PredictedPath {
     int32_t landingStep[kMaxLandings] = {0, 0, 0, 0};
     int32_t eventStep = -1;        // first simulated speed/gravity change (-1 none)
     bool unverifiedPhysics = false; // went through a change whose model is not verified
+    // orbs activated along the path (up to 2)
+    int orbActivations = 0;
+    int32_t orbStep[2] = {-1, -1};
+    float orbX[2] = {0.f, 0.f}, orbY[2] = {0.f, 0.f};
+    OrbType orbType[2] = {OrbType::Yellow, OrbType::Yellow};
+    int32_t orbId[2] = {0, 0};
+    int32_t dashEndStep = -1;      // a dash along the path ended here
+    bool activates(int32_t id) const { return (orbActivations > 0 && orbId[0] == id) || (orbActivations > 1 && orbId[1] == id); }
 };
 
 // Floor / ceiling of the playing area, as surfaces (not player centres).
@@ -96,6 +110,12 @@ struct SimStart {
     std::span<PhysicsEvent const> events;
     // Simulated steps (0 = the predictor's horizon).
     int horizon = 0;
+    // Orbs ahead (sorted by left edge) and a dash already in progress.
+    std::span<Orb const> orbs;
+    bool dashing = false;
+    OrbType dashType = OrbType::Dash;
+    float dashRotation = 0.f;
+    int32_t dashLeft = 1 << 20;    // steps until the dash ends by itself
 };
 
 // Forward simulation of the player for every game mode, with hitbox collision
@@ -145,6 +165,28 @@ public:
         bool fromSeed = false;           // ... and the chosen timing is (within the resolution of) it
         bool strategySeeded = false;     // a plan from the strategy library was simulated
         bool fromStrategy = false;       // ... and the chosen plan is (within the resolution of) it
+        // The nearest orb ahead: activating it vs. not (diagnostics, overlay).
+        struct OrbChoice {
+            bool present = false;
+            OrbType type = OrbType::Yellow;
+            int32_t id = 0;
+            float l = 0.f, b = 0.f, r = 0.f, t = 0.f;
+            bool simulated = false;      // its effect can be simulated (orb type supported)
+            bool known = false;          // ... and has been calibrated from the game
+            int32_t windowFrom = -1, windowTo = -1; // steps in which the paths tried overlap it
+            bool overlappingNow = false; // activation possible this step
+            int candidates = 0;          // activation timings simulated
+            Certainty activate = Certainty::Collision;
+            int32_t activateTTC = -1;
+            bool activateHitsAbove = false; // the best activation collides with something above the player
+            float activateScore = -1e9f;
+            Plan activatePlan;
+            Certainty skip = Certainty::Collision;
+            int32_t skipTTC = -1;
+            float skipScore = -1e9f;
+            bool chosenActivates = false;
+        };
+        OrbChoice orb;
         bool lateSeeded = false;         // the strategic sequence plan was evaluated
         bool fromLateSeed = false;       // ... and it is the chosen plan
         Certainty seedOutcome = Certainty::Safe; // the best strategy plan's simulated outcome
@@ -253,6 +295,22 @@ public:
     bool executedPress() const { return m_executedPress; }
     bool hasExecuted() const { return m_executedValid; }
     PredictedPath const& pressPath() const { return m_press; }
+    // The nearest orb ahead: best path that activates it / best that does not.
+    PredictedPath const& orbActivatedPath() const { return m_orbOn; }
+    PredictedPath const& orbSkippedPath() const { return m_orbOff; }
+    // Orb learning (diagnostics): the last activation the game confirmed and
+    // how far the model was off; dash steps compared with the model.
+    struct OrbCheck {
+        int32_t tick = -1;
+        OrbType type = OrbType::Yellow;
+        float vyError = 0.f;          // actual - predicted velocity right after (normalised)
+        bool wasKnown = false;        // the model had been calibrated before
+        bool dash = false;
+        float dashError = 0.f;        // position error of the last dash step (units)
+        uint32_t activations = 0;     // confirmed by the game since load
+    };
+    OrbCheck const& lastOrbCheck() const { return m_orbCheck; }
+    bool dashActive() const { return m_dashActive; }
     PredictedPath const& releasePath() const { return m_release; }
     Advice const& lastAdvice() const { return m_advice; }
 
@@ -310,6 +368,16 @@ private:
     int m_pressedSteps = 0;      // flying: consecutive steps pinned against a bound
     float m_lastY = 0.f;
     bool m_robotAlive = false;
+    // dash in progress (from the game's dash start event)
+    bool m_dashActive = false;
+    OrbType m_dashType = OrbType::Dash;
+    float m_dashRotation = 0.f;
+    int32_t m_dashStartTick = 0;
+    int32_t m_dashMaxSteps = 1 << 20;
+    int32_t m_lastOrbTick = -1000;
+    OrbCheck m_orbCheck;
+    std::vector<int32_t> m_overOrbs;     // orbs the player overlapped at the last observation
+    PredictedPath m_orbOn, m_orbOff, m_orbTmp;
     GameMode m_boundsMode = GameMode::Count;
     float m_boundsHintBottom = 0.f, m_boundsHintTop = 0.f;
 

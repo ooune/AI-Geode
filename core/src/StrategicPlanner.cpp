@@ -32,11 +32,12 @@ char const* landingWord(float space) {
 }
 
 std::string planText(Plan const& p) {
-    if (p.pressAt < 0) return "no press";
+    if (p.pressAt < 0) return p.orbPressAt >= 0 ? fmtStr("orb press in %d%s", p.orbPressAt, p.orbHoldFor > 0 ? fmtStr(" held %d", p.orbHoldFor).c_str() : "") : "no press";
     std::string s = fmtStr("press in %d", p.pressAt);
     if (p.rejump) s += " (hold through the landing)";
     if (p.secondAt >= 0) s += fmtStr(", again %d after landing", p.secondAt);
     if (p.thirdAt >= 0) s += fmtStr(", again %d after the next landing", p.thirdAt);
+    if (p.orbPressAt >= 0) s += p.orbHoldFor > 0 ? fmtStr(", orb press in %d held %d", p.orbPressAt, p.orbHoldFor) : fmtStr(", orb press in %d", p.orbPressAt);
     return s;
 }
 } // namespace
@@ -285,6 +286,50 @@ bool StrategicPlanner::makePlan(Observation const& obs, bool holding, Predictor 
         }
     }
 
+    // ---- orbs: for the most promising first presses (and not pressing), an
+    // orb their path passes through is activated at the start, middle or end
+    // of the overlap (dash orbs: held for several durations). The result is a
+    // candidate like any other, and is expanded further below. ----
+    if (!st.orbs.empty()) {
+        std::vector<SequenceCandidate> top = level1;
+        std::sort(top.begin(), top.end(), [](SequenceCandidate const& a, SequenceCandidate const& b) { return a.score > b.score; });
+        if (top.size() > 4) top.resize(4);
+        static constexpr int32_t kDashHolds[] = {10, 22, 40, 64, 100, 140};
+        PredictedPath base;
+        for (auto const& t : top) {
+            if (outOfBudget()) break;
+            predictor.simulate(st, obstacles, t.plan, base);
+            ++sims;
+            for (auto const& ob : st.orbs) {
+                if (ob.used || !orbSimulated(ob.type) || base.activates(ob.id)) continue;
+                int32_t w0 = -1, w1 = -1;
+                for (size_t i = 0; i < base.points.size(); ++i) {
+                    PathPoint const& pt = base.points[i];
+                    bool const over = ob.l <= pt.x + h && ob.r >= pt.x - h && ob.b <= pt.y + h && ob.t >= pt.y - h;
+                    if (over && w0 < 0) w0 = static_cast<int32_t>(i);
+                    if (over) w1 = static_cast<int32_t>(i);
+                    if (!over && w0 >= 0) break;
+                }
+                if (w0 < 0) continue;
+                int32_t const ks[3] = {w0, (w0 + w1) / 2, std::max(w0, w1 - 1)};
+                for (int ki = 0; ki < 3; ++ki) {
+                    if (ki > 0 && ks[ki] == ks[ki - 1]) continue;
+                    int const nh = isDashOrb(ob.type) ? 6 : 1;
+                    for (int hi = 0; hi < nh && !outOfBudget(); ++hi) {
+                        Plan p = t.plan;
+                        p.orbPressAt = ks[ki];
+                        p.orbHoldFor = isDashOrb(ob.type) ? kDashHolds[hi] : 0;
+                        SequenceCandidate c = evaluate(p);
+                        bool const exp = expandable(c, 1);
+                        all.push_back(c);
+                        if (exp && p.pressAt >= 0) frontier.push_back({c, 1});
+                    }
+                }
+                break; // the first orb on the path
+            }
+        }
+    }
+
     // ---- depth 2 and 3: the next press, timed from the landing ----
     // (only while no safe sequence with fewer presses has been found: one more
     // press only costs)
@@ -436,12 +481,22 @@ bool StrategicPlanner::seed(Observation const& obs, Plan& out, int& horizon) con
     // nothing to propose: no press planned, or no sequence that is safe at
     // least up to its last landing (the controller's own search does better
     // without a doomed candidate)
-    if (c.pressAt < 0 || !(P.chosen.outcome == Certainty::Safe || P.chosen.openEnd)) return false;
+    if (!(P.chosen.outcome == Certainty::Safe || P.chosen.openEnd)) return false;
+    // an orb press is timed from when the plan was made (it acts where the orb is)
+    int32_t const orbRel = c.orbPressAt >= 0 && c.orbPressAt - elapsed >= 0 ? c.orbPressAt - elapsed : -1;
+    if (c.pressAt < 0) {
+        if (orbRel < 0) return false;
+        out = Plan{-1, 0, 0, false};
+        out.orbPressAt = orbRel;
+        out.orbHoldFor = c.orbHoldFor;
+        return true;
+    }
     if (m_pressesSeen == 0) {
         int32_t const rel = c.pressAt - elapsed;
         if (rel < 0) return false;
         out = c;
         out.pressAt = rel;
+        out.orbPressAt = orbRel;
         return true;
     }
     // later presses: timed from the landing after the previous press
@@ -466,6 +521,8 @@ bool StrategicPlanner::seed(Observation const& obs, Plan& out, int& horizon) con
     if (rel < 0) return false;
     out = Plan{rel, 0, 0, false};
     out.secondAt = nextIdx == 1 ? c.thirdAt : -1;
+    out.orbPressAt = orbRel;
+    out.orbHoldFor = c.orbHoldFor;
     return true;
 }
 

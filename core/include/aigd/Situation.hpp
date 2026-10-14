@@ -18,8 +18,10 @@ struct SituationElement {
         Solid,        // block on the walking path (wall, step or platform)
         HazardAbove,  // hazard above the walking path (limits the jump)
         SolidAbove,   // block above the walking path (a ceiling)
+        OrbAt,        // an orb in or just before the group (`orb` = its type)
     };
     uint8_t kind = Hazard;
+    uint8_t orb = 0;    // OrbAt: the OrbType
     int8_t start = 0;   // half-blocks from the group's first element
     int8_t width = 0;   // half-blocks
     int8_t bottom = 0;  // bottom edge above the player's feet, half-blocks (gravity-normalised)
@@ -35,7 +37,10 @@ struct Situation {
     bool upsideDown = false;
     bool grounded = false;
     int speedClass = 1;
-    bool unmodelled = false;   // an orb/pad/portal lies in or right after the group
+    bool unmodelled = false;   // a pad/portal (or an orb when orbs are not reported) lies in or right after the group
+    int orbs = 0;              // orbs in or just before the group (described as elements)
+    OrbType firstOrb = OrbType::Yellow;
+    float orbX = 0.f;          // runtime only: world x of the first orb's left edge
     int count = 0;             // elements in the group (on the path and above it)
     bool truncated = false;    // the group had more elements than are described
     SituationElement el[kMaxElements];

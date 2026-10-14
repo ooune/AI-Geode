@@ -1,5 +1,11 @@
 # AI Geode
 
+**v0.6.0:** orb activation/skip prediction, dash modelling, interaction overlays
+and reusable orb strategies are implemented. See [validation and remaining game
+checks](V060-VALIDATION.md) for evidence and limitations. Installation and loading
+are verified; orb behaviour in Geometry Dash is not yet verified. Older version
+notes below describe their respective releases.
+
 A [Geode](https://geode-sdk.org) mod for **Geometry Dash 2.2081** that plays classic levels by itself and **learns from its own deaths**. It is not a macro recorder, auto-clicker or hard-coded bot. Its decisions come from a value table it builds through trial and error, and every death changes it.
 
 - Targets: Geometry Dash **2.2081**, Geode **5.11.1**, Windows.

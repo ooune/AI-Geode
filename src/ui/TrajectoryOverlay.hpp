@@ -21,4 +21,5 @@ protected:
 
     cocos2d::CCDrawNode* m_draw = nullptr;
     cocos2d::CCLabelBMFont* m_label = nullptr;
+    cocos2d::CCLabelBMFont* m_orbLabel = nullptr;
 };

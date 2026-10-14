@@ -324,6 +324,36 @@ std::string serializePatterns(PatternMemory const& P) {
         }
     }
     out += "],";
+    // orb calibration (v0.6.0): [slot, vySum, vyN, n, flips, dashDxSum, dashDxN,
+    // dashSlopeSum, dashSlopeN, dashEndVySum, dashEndVyN, endsReleased, endsOther]
+    key(out, "orbs");
+    out += '[';
+    {
+        bool firstRow = true;
+        for (size_t i = 0; i < P.physics.orbs.size(); ++i) {
+            auto const& c = P.physics.orbs[i];
+            if (c.n == 0 && c.dashDx.n == 0 && c.dashEndVy.n == 0) continue;
+            if (!firstRow) out += ',';
+            firstRow = false;
+            out += '[';
+            bool firstNum = true;
+            for (double v : {static_cast<double>(i), c.vy.sum, static_cast<double>(c.vy.n), static_cast<double>(c.n), static_cast<double>(c.flips),
+                             c.dashDx.sum, static_cast<double>(c.dashDx.n), c.dashSlope.sum, static_cast<double>(c.dashSlope.n), c.dashEndVy.sum,
+                             static_cast<double>(c.dashEndVy.n), static_cast<double>(c.dashEndsReleased), static_cast<double>(c.dashEndsOther)}) {
+                if (!firstNum) out += ',';
+                firstNum = false;
+                appendNumber(out, v);
+            }
+            out += ']';
+        }
+    }
+    out += "],";
+    key(out, "orbHeldEntry");
+    out += '[';
+    appendNumber(out, P.physics.heldEntryActivated);
+    out += ',';
+    appendNumber(out, P.physics.heldEntryIgnored);
+    out += "],";
     key(out, "q");
     writeQTable(out, P.q);
     out += '}';
@@ -371,6 +401,29 @@ bool deserializePatterns(std::string_view text, PatternMemory& out, std::string*
             P.physics.vxSum[k] = next();
             P.physics.vxN[k] = nextU();
         }
+    }
+    for (auto const& row : d.get("orbs").items()) {
+        if (!row.isArray() || row.size() < 13) continue;
+        size_t const i = static_cast<size_t>(row.at(0).asInt(-1));
+        if (i >= P.physics.orbs.size()) continue;
+        auto& c = P.physics.orbs[i];
+        c.vy.sum = row.at(1).asNumber();
+        c.vy.n = static_cast<uint32_t>(row.at(2).asInt());
+        c.n = static_cast<uint32_t>(row.at(3).asInt());
+        c.flips = static_cast<uint32_t>(row.at(4).asInt());
+        c.dashDx.sum = row.at(5).asNumber();
+        c.dashDx.n = static_cast<uint32_t>(row.at(6).asInt());
+        c.dashSlope.sum = row.at(7).asNumber();
+        c.dashSlope.n = static_cast<uint32_t>(row.at(8).asInt());
+        c.dashEndVy.sum = row.at(9).asNumber();
+        c.dashEndVy.n = static_cast<uint32_t>(row.at(10).asInt());
+        c.dashEndsReleased = static_cast<uint32_t>(row.at(11).asInt());
+        c.dashEndsOther = static_cast<uint32_t>(row.at(12).asInt());
+    }
+    auto const& held = d.get("orbHeldEntry");
+    if (held.isArray() && held.size() >= 2) {
+        P.physics.heldEntryActivated = static_cast<uint32_t>(held.at(0).asInt());
+        P.physics.heldEntryIgnored = static_cast<uint32_t>(held.at(1).asInt());
     }
     if (!readQTable(d.get("q"), P.q, error)) return false;
     out = std::move(P);

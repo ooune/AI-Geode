@@ -228,6 +228,15 @@ struct AgentStatus {
     uint32_t strategicMatched = 0;            // ... where the controller's best plan was the strategic one
     float strategicMaxMicros = 0.f;           // most expensive sequence plan this attempt
     double strategicMicros = 0.0;             // total this attempt
+
+    // orbs (v0.6.0)
+    std::string orbEvent;                     // the last orb message, made from a real decision or game event
+    std::vector<std::string> orbLog;          // this attempt's orb messages (the last few)
+    std::string orbChoice;                    // the last comparison: activation vs. skip, and what was chosen
+    Predictor::Advice::OrbChoice orb;         // ... in numbers
+    bool orbSelected = false;                 // the executed action activates that orb
+    uint32_t orbsSeen = 0, orbActivationsPlanned = 0, orbActivationsConfirmed = 0, orbActivationsMissed = 0, orbSkips = 0,
+             orbStrategiesLearned = 0;
 };
 
 class Agent {
@@ -361,6 +370,22 @@ private:
         float seedContact = 0.f;  // steps to the group when the strategy was last simulated
         bool played = false;      // played directly (Transfer)
         bool reported = false;    // its verdict message was produced
+        int32_t orbId = 0;        // the orb the group was handled with (OrbActivate)
+        int32_t dashStart = -1;   // ... a dash orb: when the dash started
+    };
+    // What happened with each orb met in this attempt (diagnostics).
+    struct OrbNote {
+        int32_t id = 0;
+        OrbType type = OrbType::Yellow;
+        bool warnedCollision = false, selected = false, activated = false, skipReported = false;
+        std::string lastChoice;
+    };
+    struct OrbExpectation {
+        bool active = false;
+        int32_t id = 0;
+        OrbType type = OrbType::Yellow;
+        int32_t tick = 0;         // the observation that should report the activation
+        bool committed = false;   // the press that should activate it was sent
     };
 
     struct LeadCandidate {
@@ -420,6 +445,11 @@ private:
     std::vector<int32_t> m_removeTried;          // hotspots where "remove the press" was already tried
     PlanManager m_plan;                          // live plan: pending inputs + the states they expect
     StrategicPlanner m_strategic;                // whole obstacle sequences ahead
+    std::vector<OrbNote> m_orbNotes;             // orbs of this attempt
+    std::vector<std::pair<int32_t, int32_t>> m_orbEnter; // orb id -> step the player started overlapping it
+    OrbExpectation m_expectOrb;                  // the executed plan activates this orb at this step
+    uint32_t m_orbChecksSeen = 0;
+    bool m_dashWarned = false;
     bool m_expChecked = false;                   // the active experiment's state was checked at its first changed cell
     FailureReport m_lastReport;
     AgentStatus m_status;
@@ -449,6 +479,10 @@ private:
     void reportGroup(PendingGroup& g, bool trustedNow);
     void resolveGroups(float deathX, bool died, bool completed);
     void noteTransfer(std::string msg);
+    // orbs: overlap, game confirmations, model checks; true = plans are obsolete
+    bool trackOrbs(Observation const& obs);
+    void noteOrb(std::string msg);
+    OrbNote& orbNote(int32_t id, OrbType type);
 
     Observation m_lastObs;
 };

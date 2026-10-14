@@ -5,6 +5,7 @@ add_library(aigd_core STATIC
     src/Json.cpp
     src/LevelAnalysis.cpp
     src/LevelMap.cpp
+    src/OrbPhysics.cpp
     src/Overlay.cpp
     src/Physics.cpp
     src/PlanManager.cpp

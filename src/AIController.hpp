@@ -42,6 +42,7 @@ public:
         float predictionHorizon = 0.75f; // seconds
         bool strategicPlanning = true;
         bool showUnderstanding = false;
+        bool showOrbs = true;
         aigd::UnderstandingLayers layers;
     };
 
@@ -59,6 +60,11 @@ public:
     void onLevelComplete(PlayLayer* layer);
     void onPostUpdate(PlayLayer* layer, float dt);
     void onGameExit();
+    // Orbs (from the PlayerObject hooks): what the game really did.
+    bool tracksPlayer(PlayerObject* player) const;
+    void onOrbActivated(PlayerObject* player, GameObject* ring, double vyBefore, double vyAfter, bool flippedBefore, bool flippedAfter);
+    void onDashStarted(PlayerObject* player, GameObject* ring, double angle);
+    void onDashStopped(PlayerObject* player, double vyBefore, double vyAfter);
 
     // --- Input arbitration ---
     // True while the AI owns the jump button in this layer (user input is ignored).
@@ -137,6 +143,12 @@ private:
     aigd::LevelAnalysis m_analysis;
     Observer::MapStats m_mapStats;
     std::vector<aigd::PhysicsEvent> m_events;
+    std::vector<aigd::Orb> m_orbs;
+    std::vector<aigd::OrbEvent> m_orbEvents;     // reported by the hooks since the last AI step
+    std::vector<aigd::OrbEvent> m_orbEventsNow;  // ... handed to the AI in this step
+    std::vector<int32_t> m_usedOrbs;             // orbs activated in this attempt (unique ids)
+    int32_t m_lastPressTick = -1000;
+    aigd::OrbType m_dashType = aigd::OrbType::Dash;
     std::vector<aigd::UnderstandingOverlay::Mark> m_overview;
     uint64_t m_overviewVersion = 0;
     bool m_mapReady = false;

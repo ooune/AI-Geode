@@ -35,6 +35,11 @@ struct MapObject {
     bool enabled = true;    // toggled off objects are kept but ignored
     bool approximate = false; // rotated by a non-right angle: the box is the bounding box of the real hitbox
     uint32_t source = 0;    // index in the game's object list (to refresh dynamic objects)
+    // orbs (kind Orb, value = OrbType): the dash direction and settings
+    float rotation = 0.f;
+    float dashSpeed = 1.f;
+    float maxDuration = 0.f;
+    int32_t uniqueId = 0;   // the game's unique id (orb activations are reported by it)
 };
 
 // A spatial representation of the whole loaded level.
@@ -63,8 +68,10 @@ public:
     // else that is not simulated becomes an Uncertain obstacle.
     // `gravityVerified`: whether the gravity-portal model has been checked
     // against the game (see PhysicsEvent::verified).
+    // Orbs go to `orbs` when given (simulated by the predictor), otherwise they
+    // are uncertain obstacles as before.
     void collect(float x0, float x1, std::vector<Obstacle>& obstacles, std::vector<PhysicsEvent>& events,
-                 bool gravityVerified) const;
+                 bool gravityVerified, std::vector<Orb>* orbs = nullptr) const;
 
     std::vector<MapObject> const& objects() const { return m_objs; }
     std::vector<uint32_t> const& dynamicObjects() const { return m_dynamic; }

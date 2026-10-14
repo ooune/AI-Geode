@@ -41,7 +41,7 @@ uint64_t contextHash(Situation const& s) {
 }
 
 uint64_t elementHash(uint64_t h, SituationElement const& e) {
-    uint64_t v = static_cast<uint64_t>(e.kind) | (static_cast<uint64_t>(static_cast<uint8_t>(e.start)) << 8) |
+    uint64_t v = static_cast<uint64_t>(e.kind) | (static_cast<uint64_t>(e.orb) << 40) | (static_cast<uint64_t>(static_cast<uint8_t>(e.start)) << 8) |
                  (static_cast<uint64_t>(static_cast<uint8_t>(e.width)) << 16) |
                  (static_cast<uint64_t>(static_cast<uint8_t>(e.bottom)) << 24) |
                  (static_cast<uint64_t>(static_cast<uint8_t>(e.top)) << 32);
@@ -156,6 +156,20 @@ Situation describeSituation(Observation const& obs, float lookAheadSteps) {
         if (nMerged < Situation::kMaxElements + 1) merged[nMerged++] = it;
     }
     float const groupStart = path[first].l;
+    // Orbs in the group or up to 3 blocks before it (what the button can do there).
+    struct OrbItem {
+        float l, r, lo, hi;
+        uint8_t type;
+    };
+    OrbItem orbItems[4];
+    int nOrbs = 0;
+    for (auto const& o : obs.orbs) {
+        if (o.used || o.r < groupStart - 3.f * kBlock || o.l > groupEnd + kBlock || nOrbs >= 4) continue;
+        float lo = up(o.b), hi = up(o.t);
+        if (lo > hi) std::swap(lo, hi);
+        if (hi < -kBlock || lo > 6.f * kBlock) continue;
+        orbItems[nOrbs++] = {o.l, o.r, lo, hi, static_cast<uint8_t>(o.type)};
+    }
     // Things above the path over the group (and a block before and after it).
     for (int i = 0; i < nAbove && nMerged < Situation::kMaxElements + 1; ++i) {
         Item const& it = above[i];
@@ -164,12 +178,31 @@ Situation describeSituation(Observation const& obs, float lookAheadSteps) {
     }
 
     s.valid = true;
+    // orbs take precedence over things above the path (they change what the button does)
+    int const pathItems = std::min(nMerged, Situation::kMaxElements);
+    int nPathFirst = 0;
+    for (int i = 0; i < pathItems; ++i) nPathFirst += (merged[i].kind == SituationElement::Hazard || merged[i].kind == SituationElement::Solid) ? 1 : 0;
+    if (nOrbs > 0) {
+        s.orbs = nOrbs;
+        s.firstOrb = static_cast<OrbType>(orbItems[0].type);
+        s.orbX = orbItems[0].l;
+        int slot = std::min(nPathFirst, Situation::kMaxElements - 1);
+        for (int k = 0; k < nOrbs && slot < Situation::kMaxElements; ++k, ++slot) {
+            Item it{orbItems[k].l, orbItems[k].r, orbItems[k].lo, orbItems[k].hi, static_cast<uint8_t>(SituationElement::OrbAt)};
+            if (slot < nMerged) merged[slot] = it;
+            else merged[nMerged++] = it;
+        }
+    }
     s.truncated = nMerged > Situation::kMaxElements;
     s.count = std::min(nMerged, Situation::kMaxElements);
     for (int i = 0; i < s.count; ++i) {
         Item const& it = merged[i];
         SituationElement& e = s.el[i];
         e.kind = it.kind;
+        if (it.kind == SituationElement::OrbAt) {
+            for (int k = 0; k < nOrbs; ++k)
+                if (orbItems[k].l == it.l && orbItems[k].lo == it.lo) e.orb = orbItems[k].type;
+        }
         e.start = halfBlocks(it.l - groupStart);
         e.width = halfBlocks(it.r - it.l);
         e.bottom = halfBlocks(it.lo);
@@ -205,6 +238,7 @@ std::string Situation::describe() const {
         switch (el[i].kind) {
             case SituationElement::Hazard: ++hazards; break;
             case SituationElement::Solid: ++solids; break;
+            case SituationElement::OrbAt: break;
             default: ++above; break;
         }
     }
@@ -220,6 +254,7 @@ std::string Situation::describe() const {
     else d = "overhead obstacles";
     if (above > 0 && (hazards + solids) > 0) d += " under something";
     if (truncated) d += " (and more)";
+    if (orbs > 0) d += std::string(" with ") + orbTypeName(firstOrb);
     if (unmodelled) d += ", orb/pad nearby";
     static char const* const kSpace[] = {"<1 block", "1-2 blocks", "2-4 blocks", "4+ blocks"};
     std::snprintf(buf, sizeof(buf), ", landing space %s", kSpace[std::clamp(landingBand, 0, 3)]);
