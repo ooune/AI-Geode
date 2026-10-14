@@ -27,13 +27,16 @@ using aigd::GameMode;
 using aigd::KillerKind;
 using aigd::Observation;
 
-enum class ObjKind { Spike, Block, ModePortal, GravityPortal };
+enum class ObjKind { Spike, Block, ModePortal, GravityPortal, SpeedPortal };
 
 struct Obj {
     ObjKind kind;
     float x, y, w, h; // bottom-left corner and size
     GameMode mode = GameMode::Cube; // for mode portals
     bool hidden = false;            // solid in the world, but not reported to the AI (tests the unexpected)
+    int speed = 1;                  // speed portals: the new speed class
+    int32_t moveAt = -1;            // moves by moveDy (vertically) at this tick (-1 never): a triggered obstacle
+    float moveDy = 0.f;
 };
 
 struct Level {
@@ -53,6 +56,18 @@ struct Level {
     void shipPortal(float bx) { modePortal(bx, GameMode::Ship); }
     void cubePortal(float bx) { modePortal(bx, GameMode::Cube); }
     void gravityPortal(float bx) { objs.push_back({ObjKind::GravityPortal, bx * 30.f, 0.f, 30.f, 600.f}); }
+    void speedPortal(float bx, int speedClass) {
+        Obj o{ObjKind::SpeedPortal, bx * 30.f, 0.f, 30.f, 600.f};
+        o.speed = speedClass;
+        objs.push_back(o);
+    }
+    // a block that moves vertically by dyBlocks at the given tick
+    void movingBlock(float bx, float by, float bw, float bh, int32_t atTick, float dyBlocks) {
+        Obj o{ObjKind::Block, bx * 30.f, by * 30.f, bw * 30.f, bh * 30.f};
+        o.moveAt = atTick;
+        o.moveDy = dyBlocks * 30.f;
+        objs.push_back(o);
+    }
     void finish(float blocks) {
         length = blocks * 30.f;
         std::stable_sort(objs.begin(), objs.end(), [](Obj const& a, Obj const& b) { return a.x < b.x; });
@@ -109,8 +124,13 @@ public:
         }
     }
     static Rect spikeHitbox(Obj const& o) { return Rect{o.x + 10.5f, o.y + 3.f, o.x + 19.5f, o.y + 18.f}; }
+    static Rect spikeHitboxAt(Obj const& o, float y) { return Rect{o.x + 10.5f, y + 3.f, o.x + 19.5f, y + 18.f}; }
+    // where a (possibly triggered) object is now
+    float yOf(Obj const& o) const { return o.y + (o.moveAt >= 0 && m_tick >= o.moveAt ? o.moveDy : 0.f); }
+    int32_t tick() const { return m_tick; }
+    int speedClass() const { return m_speedClass; }
 
-    explicit World(Level const& level, int speedClass = 1) : m_level(level), m_speedClass(speedClass) { reset(); }
+    explicit World(Level const& level, int speedClass = 1) : m_level(level), m_speedClass(speedClass), m_startSpeed(speedClass) { reset(); }
 
     void reset(float startX = 0.f) {
         m_x = startX + kHalf;
@@ -127,12 +147,18 @@ public:
         m_pending.clear();
         m_death = DeathInfo{};
         m_portalsPassed = 0;
+        m_speedPassed = 0;
+        m_speedClass = m_startSpeed;
         for (auto const& o : m_level.objs) {
-            if (o.x + o.w * 0.5f > m_x) break;
-            if (o.kind == ObjKind::ModePortal) m_mode = o.mode;
+            if (o.x > m_x + kHalf) break;
+            if (o.kind == ObjKind::ModePortal && o.x + o.w * 0.5f <= m_x) m_mode = o.mode;
             if (o.kind == ObjKind::GravityPortal) {
                 m_upsideDown = !m_upsideDown;
                 ++m_portalsPassed;
+            }
+            if (o.kind == ObjKind::SpeedPortal) {
+                m_speedClass = o.speed;
+                ++m_speedPassed;
             }
         }
     }
@@ -148,7 +174,7 @@ public:
         m_prevHold = false;
         m_portalsPassed = 0;
         for (auto const& o : m_level.objs)
-            if (o.kind == ObjKind::GravityPortal && o.x + o.w * 0.5f <= x) ++m_portalsPassed;
+            if (o.kind == ObjKind::GravityPortal && o.x <= x + kHalf) ++m_portalsPassed;
     }
 
     // Collision shapes near x, sorted by left edge, in the form the predictor uses.
@@ -158,19 +184,35 @@ public:
             if (o.x > x1) break;
             if (o.x + o.w < x0) continue;
             if (o.hidden) continue;
+            if (o.kind == ObjKind::GravityPortal || o.kind == ObjKind::SpeedPortal) continue; // physics events
             aigd::Obstacle ob;
+            float const oy = yOf(o);
             if (o.kind == ObjKind::Spike) {
-                Rect r = spikeHitbox(o);
+                Rect r = spikeHitboxAt(o, oy);
                 float const g = s_hazardInflate;
                 ob = {r.l - g, r.b - g, r.r + g, r.t + g, aigd::Obstacle::Kind::Hazard};
             } else if (o.kind == ObjKind::Block) {
-                ob = {o.x, o.y, o.x + o.w, o.y + o.h, aigd::Obstacle::Kind::Solid};
+                ob = {o.x, oy, o.x + o.w, oy + o.h, aigd::Obstacle::Kind::Solid};
             } else {
                 ob = {o.x, o.y, o.x + o.w, o.y + o.h, aigd::Obstacle::Kind::Uncertain};
             }
             out.push_back(ob);
         }
         std::sort(out.begin(), out.end(), [](aigd::Obstacle const& a, aigd::Obstacle const& b) { return a.l < b.l; });
+    }
+
+    // Speed and gravity portals in [x0, x1], as the predictor's physics events
+    // (the simulator's own rules, so verified).
+    void collectEvents(float x0, float x1, std::vector<aigd::PhysicsEvent>& out) const {
+        out.clear();
+        for (auto const& o : m_level.objs) {
+            if (o.x > x1) break;
+            if (o.x + o.w < x0) continue;
+            if (o.kind == ObjKind::GravityPortal)
+                out.push_back({o.x, o.y, o.x + o.w, o.y + o.h, aigd::PhysicsEvent::Kind::GravityToggle, 0, true});
+            else if (o.kind == ObjKind::SpeedPortal)
+                out.push_back({o.x, o.y, o.x + o.w, o.y + o.h, aigd::PhysicsEvent::Kind::Speed, static_cast<uint8_t>(o.speed), true});
+        }
     }
 
     Observation observe() const {
@@ -332,10 +374,21 @@ public:
                 }
                 continue;
             }
+            if (o.kind == ObjKind::SpeedPortal) {
+                int passed = 0;
+                int speed = m_speedClass;
+                for (auto const& g : m_level.objs)
+                    if (g.kind == ObjKind::SpeedPortal && g.x <= m_x + half) ++passed, speed = g.speed;
+                if (passed > m_speedPassed) {
+                    m_speedPassed = passed;
+                    m_speedClass = speed;
+                }
+                continue;
+            }
             if (o.kind == ObjKind::GravityPortal) {
                 int passed = 0;
                 for (auto const& g : m_level.objs)
-                    if (g.kind == ObjKind::GravityPortal && g.x + g.w * 0.5f <= m_x) ++passed;
+                    if (g.kind == ObjKind::GravityPortal && g.x <= m_x + half) ++passed;
                 if (passed > m_portalsPassed) {
                     m_portalsPassed = passed;
                     m_upsideDown = !m_upsideDown;
@@ -344,14 +397,15 @@ public:
                 }
                 continue;
             }
+            float const oy = yOf(o);
             if (o.kind == ObjKind::Spike) {
-                if (player.overlaps(spikeHitbox(o))) {
+                if (player.overlaps(spikeHitboxAt(o, oy))) {
                     die(o, KillerKind::Hazard);
                     return;
                 }
                 continue;
             }
-            Rect blk{o.x, o.y, o.x + o.w, o.y + o.h};
+            Rect blk{o.x, oy, o.x + o.w, oy + o.h};
             if (!player.overlaps(blk)) continue;
             Rect inner{m_x - S.inner, m_y - S.inner, m_x + S.inner, m_y + S.inner};
             bool fromAbove = m_vy <= 0.f && prevBottom >= blk.t - 2.f && m_y - half < blk.t;
@@ -392,6 +446,8 @@ private:
 
     Level const& m_level;
     int m_speedClass;
+    int m_startSpeed = 1;
+    int m_speedPassed = 0;
     float m_x = 0, m_y = 0, m_vy = 0;
     GameMode m_mode = GameMode::Cube;
     bool m_onGround = true;
@@ -412,7 +468,7 @@ private:
             if (o.kind != ObjKind::Block) continue;
             if (o.x > m_x + half) break;
             if (o.x + o.w <= m_x - half) continue;
-            float surface = m_upsideDown ? o.y : o.y + o.h;
+            float surface = m_upsideDown ? yOf(o) : yOf(o) + o.h;
             float edge = m_upsideDown ? m_y + half : m_y - half;
             if (std::fabs(surface - edge) < 0.75f) return true;
         }

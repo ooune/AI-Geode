@@ -63,6 +63,7 @@ struct StrategyRecord {
 struct StrategyChoice {
     enum class Match : uint8_t { None = 0, Exact, Similar };
     Match match = Match::None;
+    bool sequence = false;        // matched with what follows the group too (the most specific key)
     bool usable = false;          // evidence is good enough to try it (always simulated / safety-checked)
     Primitive primitive = Primitive::Wait;
     float leadSteps = -1.f;       // press this many steps before contact

@@ -6,6 +6,7 @@
 #include <aigd/PlanManager.hpp>
 #include <aigd/Predictor.hpp>
 #include <aigd/Situation.hpp>
+#include <aigd/StrategicPlanner.hpp>
 #include <aigd/Strategy.hpp>
 #include <aigd/Trajectory.hpp>
 #include <aigd/Types.hpp>
@@ -216,6 +217,17 @@ struct AgentStatus {
     std::string transferEvent;                // the last transfer message, made from a real decision
     std::vector<std::string> transferLog;     // this attempt's transfer messages (the last few, most recent last)
     std::string situation;                    // the obstacle group ahead, described
+
+    // strategic planning (v0.5.0)
+    std::string strategic;                    // the current sequence plan and why
+    std::string strategicEvent;               // the last strategic invalidation
+    uint32_t strategicPlans = 0;              // sequence plans made this attempt
+    uint32_t strategicInvalidated = 0;        // ... invalidated because the real state left them
+    uint32_t strategicOverrides = 0;          // ... whose first press differs from the locally best one
+    uint32_t strategicSeeded = 0;             // controller decisions that had the plan as a candidate
+    uint32_t strategicMatched = 0;            // ... where the controller's best plan was the strategic one
+    float strategicMaxMicros = 0.f;           // most expensive sequence plan this attempt
+    double strategicMicros = 0.0;             // total this attempt
 };
 
 class Agent {
@@ -261,6 +273,8 @@ public:
     std::vector<SafetyRecord> const& safetyLog() const { return m_safetyLog; }
     // The live execution plan (separate from all learned memory).
     PlanManager const& plans() const { return m_plan; }
+    // The strategic (sequence) planner.
+    StrategicPlanner const& strategic() const { return m_strategic; }
 
     // Forget transient search state (used after memory is reset/imported).
     void resetTransient();
@@ -400,6 +414,7 @@ private:
     std::vector<SafetyRecord> m_safetyLog;
     std::vector<int32_t> m_removeTried;          // hotspots where "remove the press" was already tried
     PlanManager m_plan;                          // live plan: pending inputs + the states they expect
+    StrategicPlanner m_strategic;                // whole obstacle sequences ahead
     bool m_expChecked = false;                   // the active experiment's state was checked at its first changed cell
     FailureReport m_lastReport;
     AgentStatus m_status;

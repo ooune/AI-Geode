@@ -46,6 +46,24 @@ struct Obstacle {
     Kind kind = Kind::Hazard;
 };
 
+// A change of movement physics the player passes through (a portal), taken
+// from the level geometry. The predictor applies it when the player's hitbox
+// first overlaps the rectangle.
+struct PhysicsEvent {
+    enum class Kind : uint8_t {
+        Speed,           // value = speed class 0..4
+        GravityNormal,   // gravity down
+        GravityFlipped,  // gravity up
+        GravityToggle,   // the other gravity
+    };
+    float l = 0.f, b = 0.f, r = 0.f, t = 0.f;
+    Kind kind = Kind::Speed;
+    uint8_t value = 0;
+    // The predictor's model of this change has been checked against the game.
+    // Paths through an unverified change are never reported as safe.
+    bool verified = false;
+};
+
 // Everything the agent may know about the current physics step. Filled by the
 // Geode observer from real game state (or by the simulator in tests).
 struct Observation {
@@ -66,6 +84,10 @@ struct Observation {
     // Collision shapes around the player, sorted by left edge. Points into a
     // buffer owned by whoever filled the observation; valid for this step only.
     std::span<Obstacle const> obstacles;
+    // Speed and gravity portals around the player (same window), sorted by l.
+    std::span<PhysicsEvent const> events;
+    // Changes whenever a moving/toggled object of the level changed (0 = no level map).
+    uint64_t geometryVersion = 0;
     // Playing-area floor/ceiling surfaces reported by the game for corridor
     // modes (ship, UFO, ...). Only a hint: confirmed by actual contact.
     bool hasBoundsHint = false;

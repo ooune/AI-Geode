@@ -32,6 +32,7 @@ struct Plan {
     int32_t repeatEvery = 0;  // press again this many steps after each press started (0 = once)
     bool rejump = false;      // cube/robot: keep holding through the first landing (jump again)
     int32_t secondAt = -1;    // cube/robot: a second press this many steps after the first landing (-1 none)
+    int32_t thirdAt = -1;     // cube/robot: a third press this many steps after the second landing (-1 none)
 };
 
 // How far the timing search got for one decision.
@@ -55,6 +56,13 @@ struct PredictedPath {
     float clearance = 1e9f;        // smallest gap to a hazard (or the side of a block) along the path
     int32_t steps = 0;
     int presses = 0;               // new presses the path makes (inputs it costs)
+    // Every landing (up to 4): where, and in which simulated step.
+    static constexpr int kMaxLandings = 4;
+    int landings = 0;
+    float landingX[kMaxLandings] = {0.f, 0.f, 0.f, 0.f};
+    int32_t landingStep[kMaxLandings] = {0, 0, 0, 0};
+    int32_t eventStep = -1;        // first simulated speed/gravity change (-1 none)
+    bool unverifiedPhysics = false; // went through a change whose model is not verified
 };
 
 // Floor / ceiling of the playing area, as surfaces (not player centres).
@@ -84,6 +92,10 @@ struct SimStart {
     // Accuracy measurement: only the movement matters, hazards never end the
     // path and blocks never kill (no margins involved).
     bool measureOnly = false;
+    // Speed / gravity changes ahead (portals), sorted by left edge.
+    std::span<PhysicsEvent const> events;
+    // Simulated steps (0 = the predictor's horizon).
+    int horizon = 0;
 };
 
 // Forward simulation of the player for every game mode, with hitbox collision
@@ -133,6 +145,8 @@ public:
         bool fromSeed = false;           // ... and the chosen timing is (within the resolution of) it
         bool strategySeeded = false;     // a plan from the strategy library was simulated
         bool fromStrategy = false;       // ... and the chosen plan is (within the resolution of) it
+        bool lateSeeded = false;         // the strategic sequence plan was evaluated
+        bool fromLateSeed = false;       // ... and it is the chosen plan
         Certainty seedOutcome = Certainty::Safe; // the best strategy plan's simulated outcome
         int32_t seedCollisionStep = -1;
         float seedScore = 0.f;
@@ -157,6 +171,9 @@ public:
     SimStart startFrom(Observation const& obs, bool holding) const;
 
     void setHorizon(int steps) { m_horizon = std::max(30, std::min(steps, 480)); }
+    // A longer look-ahead for the next advise() only (cube/robot), e.g. to
+    // cover a whole obstacle sequence the strategic planner is working on.
+    void extendHorizonOnce(int steps) { m_extendOnce = std::max(0, std::min(steps, 480)); }
     // Most simulations per decision (bounded work per game update). Near an
     // imminent hazard a smaller share is used, to find a viable action fast.
     void setBudget(int sims) { m_budget = std::max(16, sims); }
@@ -171,6 +188,12 @@ public:
     static constexpr int kMaxSeeds = 4;
     void addSeed(Plan const& p) {
         if (m_nSeeds < kMaxSeeds) m_seeds[static_cast<size_t>(m_nSeeds++)] = p;
+    }
+    // A candidate evaluated after the search's own (so it only wins when it
+    // is strictly better, never on a tie): the strategic sequence plan.
+    void addLateSeed(Plan const& p) {
+        m_lateSeed = p;
+        m_hasLateSeed = true;
     }
     int horizon() const { return m_horizon; }
     bool trusted(GameMode mode, bool mini) const;
@@ -273,6 +296,9 @@ private:
     int m_budget = 200;
     int m_budgetNow = 200;
     int32_t m_hint = -1;
+    int m_extendOnce = 0;
+    Plan m_lateSeed;
+    bool m_hasLateSeed = false;
     std::array<Plan, kMaxSeeds> m_seeds{};
     int m_nSeeds = 0;
     float m_caution = 1.f;

@@ -53,6 +53,7 @@ SimStart Predictor::startFrom(Observation const& obs, bool holding) const {
     s.speedClass = obs.speedClass();
     s.tick = obs.tick;
     s.bounds = m_bounds;
+    s.events = obs.events;
     if (obs.mode == GameMode::Robot && m_robotAlive)
         s.robotBoostLeft = std::max(0, m_model.params(obs.mode, obs.mini).boostSteps - m_robotSince);
     // With input latency L, the next L steps still run with buttons that were
@@ -118,10 +119,12 @@ float Predictor::margin(int step, GameMode mode, bool mini) const {
 void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles, Plan const& plan, PredictedPath& out,
                          std::span<uint8_t const> holds) const {
     ModePhysics const& P = m_model.params(s.mode, s.mini);
-    float const vx = m_model.vxPerTick(s.speedClass);
+    float vx = m_model.vxPerTick(s.speedClass);
     float const h = P.halfSize;
     float const in = P.innerHalf;
-    int const steps = holds.empty() ? m_horizon : static_cast<int>(holds.size());
+    int const steps = holds.empty() ? (s.horizon > 0 ? s.horizon : m_horizon) : static_cast<int>(holds.size());
+    uint32_t eventsDone = 0; // bit per event (the first 32)
+    size_t const nEvents = std::min<size_t>(s.events.size(), 32);
     Bounds const& B = s.bounds;
     float const floorC = B.floor + h;  // player centre when resting on the floor
     float const ceilC = B.ceil - h;    // ... against the ceiling
@@ -137,6 +140,9 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
     out.landed = false;
     out.clearance = 1e9f;
     out.steps = 0;
+    out.landings = 0;
+    out.eventStep = -1;
+    out.unverifiedPhysics = false;
 
     float maxW = 0.f;
     for (auto const& o : obstacles) maxW = std::max(maxW, o.r - o.l);
@@ -191,6 +197,8 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
     out.presses = 0;
     out.landStep = -1;
     int32_t secondPress = -1;   // plan step of the second press (set at the first landing)
+    int32_t thirdPress = -1;    // ... of the third (set at the landing after the second jump)
+    int jumps = 0;              // take-offs so far
     bool jumped = false;
     for (int step = 0; step < steps; ++step) {
         bool hold;
@@ -205,6 +213,12 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
                 pressStart = ps;
                 effects = 0;
                 secondPress = -2;
+            }
+            if (thirdPress >= 0 && ps == thirdPress) {
+                pressActive = true;
+                pressStart = ps;
+                effects = 0;
+                thirdPress = -2;
             }
             if (nextPress >= 0 && ps == nextPress) {
                 pressActive = true;
@@ -326,6 +340,29 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
         if (!teleported) y += vy * P.yScale;
         x += vx;
 
+        // Portals reached this step: speed and gravity changes are simulated
+        // (an unverified model makes the rest of the path uncertain).
+        for (size_t e = 0; e < nEvents; ++e) {
+            PhysicsEvent const& ev = s.events[e];
+            if (eventsDone & (1u << e)) continue;
+            if (ev.l > x + h) break;
+            if (ev.r < x - h || ev.t < y - h || ev.b > y + h) continue;
+            eventsDone |= 1u << e;
+            if (out.eventStep < 0) out.eventStep = step;
+            if (!ev.verified) out.unverifiedPhysics = true;
+            if (ev.kind == PhysicsEvent::Kind::Speed) {
+                vx = m_model.vxPerTick(std::clamp<int>(ev.value, 0, 4));
+            } else {
+                float const ng = ev.kind == PhysicsEvent::Kind::GravityNormal    ? 1.f
+                                 : ev.kind == PhysicsEvent::Kind::GravityFlipped ? -1.f
+                                                                                 : -g;
+                if (ng != g) {
+                    g = ng;
+                    onGround = false;
+                }
+            }
+        }
+
         bool supported = false;
         // playing-area bounds (GD's ground / ceiling)
         if (B.hasFloor && y <= floorC) {
@@ -434,21 +471,32 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
             }
             if (!sup) onGround = false;
         }
-        if (effect) jumped = true;
+        if (effect) {
+            jumped = true;
+            ++jumps;
+        }
         if (wasAir && onGround && !out.landed) {
             out.landed = true;
             out.landX = x;
             out.landY = y;
             out.landStep = step;
         }
+        if (wasAir && onGround && out.landings < PredictedPath::kMaxLandings) {
+            out.landingX[out.landings] = x;
+            out.landingStep[out.landings] = step;
+            ++out.landings;
+        }
         if (wasAir && onGround && jumped && plan.secondAt >= 0 && secondPress == -1 && holds.empty() && ps >= 0)
             secondPress = ps + 1 + plan.secondAt;
+        if (wasAir && onGround && jumps >= 2 && plan.thirdAt >= 0 && secondPress == -2 && thirdPress == -1 && holds.empty() && ps >= 0)
+            thirdPress = ps + 1 + plan.thirdAt;
         out.ground.back() = onGround ? 1 : 0; // after walking off an edge
     }
 
     if (definite) out.outcome = Certainty::Collision;
-    else if (potential || out.uncertainFrom >= 0) out.outcome = Certainty::Uncertain;
+    else if (potential || out.uncertainFrom >= 0 || out.unverifiedPhysics) out.outcome = Certainty::Uncertain;
     else out.outcome = Certainty::Safe;
+    if (out.unverifiedPhysics && out.outcome == Certainty::Uncertain && out.uncertainFrom < 0) out.uncertainFrom = out.eventStep;
 }
 
 float Predictor::score(PredictedPath const& p) const {
@@ -517,9 +565,14 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     // The same state again in the same tick: nothing can have changed.
     // (A new learned-timing hint always gets a fresh search.)
     int const nSeeds = m_nSeeds;
+    int const extend = m_extendOnce;
+    m_extendOnce = 0;
+    bool const hasLate = m_hasLateSeed;
+    Plan const late = m_lateSeed;
+    m_hasLateSeed = false;
     std::array<Plan, kMaxSeeds> const seeds = m_seeds;
     m_nSeeds = 0;
-    if (sameState(obs, holding) && (allowReuse || m_computedTick == obs.tick) && m_hint < 0 && nSeeds == 0) return m_advice;
+    if (sameState(obs, holding) && (allowReuse || m_computedTick == obs.tick) && m_hint < 0 && nSeeds == 0 && extend == 0 && !hasLate) return m_advice;
     // Reuse the last plan where re-planning cannot change anything (or every
     // other step for continuously controlled modes) - but never while a
     // collision is near, and never once the player is not where the executed
@@ -572,6 +625,7 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
 
     SimStart s = startFrom(obs, holding);
     int const savedHorizon = m_horizon;
+    if (extend > m_horizon && (s.mode == GameMode::Cube || s.mode == GameMode::Robot)) m_horizon = extend;
     // flying modes: a shorter look-ahead (they re-plan every couple of steps anyway)
     if (continuousControl(s.mode) || tapControl(s.mode)) m_horizon = std::min(m_horizon, 120);
 
@@ -669,7 +723,7 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     // candidate, and only chosen if they score best.
     auto samePlan = [](Plan const& a, Plan const& b) {
         return a.pressAt == b.pressAt && a.holdFor == b.holdFor && a.repeatEvery == b.repeatEvery && a.rejump == b.rejump &&
-               a.secondAt == b.secondAt;
+               a.secondAt == b.secondAt && a.thirdAt == b.thirdAt;
     };
     for (int i = 0; i < nSeeds; ++i) {
         Plan const& p = seeds[static_cast<size_t>(i)];
@@ -846,6 +900,15 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
         if (improved && (m_press.plan.secondAt >= 0 || m_release.plan.secondAt >= 0)) m_advice.stage = SearchStage::TwoJump;
     }
 
+    // The strategic sequence plan last: chosen only if strictly better.
+    if (hasLate && late.pressAt >= 0 && late.pressAt < m_horizon && late.pressAt <= neverHit) {
+        int const branch = late.pressAt == 0 ? 1 : 0;
+        PredictedPath& best = branch ? m_press : m_release;
+        bool& have = branch ? havePress : haveRelease;
+        evaluate(s, span, late, m_tmp, best, have, branch);
+        m_advice.lateSeeded = true;
+    }
+
     m_advice.press = m_press.outcome;
     m_advice.release = m_release.outcome;
     m_advice.pressTTC = m_press.outcome == Certainty::Collision ? m_press.collisionStep : -1;
@@ -891,6 +954,8 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
                                     (b.plan.secondAt < 0) == (p.secondAt < 0) && b.plan.rejump == p.rejump;
         }
         if (m_advice.fromStrategy) m_advice.fromSeed = true;
+        m_advice.fromLateSeed = m_advice.lateSeeded && std::abs(b.plan.pressAt - late.pressAt) <= res && (b.plan.pressAt == 0) == (late.pressAt == 0) &&
+                                (b.plan.secondAt < 0) == (late.secondAt < 0) && (b.plan.thirdAt < 0) == (late.thirdAt < 0);
     }
 
     if (groundOnly(s.mode) && !s.onGround && !holding && !m_bestPresses && m_release.landed) {

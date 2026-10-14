@@ -93,12 +93,16 @@ struct PredictionRig {
     PhysicsModel model;
     Predictor predictor{model};
     std::vector<Obstacle> obstacles;
+    std::vector<PhysicsEvent> events;
     bool held = false;
+    float ahead = 480.f; // how far ahead obstacles are reported (the game observer's window)
 
     Observation observe(sim::World const& world) {
         Observation o = world.observe();
-        world.collectObstacles(o.x - 90.f, o.x + 480.f, obstacles);
+        world.collectObstacles(o.x - 90.f, o.x + ahead, obstacles);
+        world.collectEvents(o.x - 90.f, o.x + ahead, events);
         o.obstacles = obstacles;
+        o.events = events;
         return o;
     }
 };
@@ -932,16 +936,41 @@ TEST(prediction_gravity_changes) {
     PredictionRig rig;
     warmUp(rig);
     rig.predictor.setHorizon(400);
-    // A gravity portal ahead is not simulated: the path must not be called safe.
+    // A gravity portal ahead is simulated (v0.5.0): the flip happens where the
+    // simulator flips, and the player lands on the ceiling where it lands.
+    // With an unverified gravity model (as in game) the path is never safe.
     {
         sim::Level level;
         level.name = "portal";
         level.gravityPortal(6);
-        level.spike(12);
+        level.block(4, 5, 30, 1); // ceiling y 150..180
         level.finish(40);
-        PredictedPath p = predict(rig, level, Plan{-1, false});
-        CHECK(p.outcome == Certainty::Uncertain);
-        CHECK(p.uncertainFrom > 0);
+        sim::World w(level);
+        Observation o = rig.observe(w);
+        PredictedPath p;
+        rig.predictor.simulate(rig.predictor.startFrom(o, false), o.obstacles, Plan{-1, false}, p);
+        float landX = 0.f, landY = 0.f;
+        for (int t = 0; t < 400 && !w.dead(); ++t) {
+            w.step(false);
+            if (w.observe().onGround && w.observe().upsideDown) {
+                landX = w.observe().x;
+                landY = w.observe().y;
+                break;
+            }
+        }
+        std::printf("    gravity portal: change at step %d; predicted landing on the ceiling x=%.2f y=%.2f, simulator x=%.2f y=%.2f\n",
+                    p.eventStep, p.landX, p.landY, landX, landY);
+        CHECK(p.eventStep > 0);
+        CHECK(p.landed && std::fabs(p.landX - landX) < 1.5f && std::fabs(p.landY - landY) < 0.5f);
+        CHECK(p.outcome != Certainty::Collision);
+        std::vector<PhysicsEvent> unverified(o.events.begin(), o.events.end());
+        for (auto& e : unverified) e.verified = false;
+        SimStart st = rig.predictor.startFrom(o, false);
+        st.events = unverified;
+        PredictedPath q;
+        rig.predictor.simulate(st, o.obstacles, Plan{-1, false}, q);
+        CHECK(q.outcome == Certainty::Uncertain);
+        CHECK(q.uncertainFrom == q.eventStep && q.uncertainFrom > 0);
     }
     // Upside down (after a portal): "falls" up onto the underside of a ceiling.
     {
@@ -2786,7 +2815,12 @@ PlanRun runPlanned(Agent& agent, sim::Level const& level, PredictionRig& rig, in
             }
         }
         r.maxSims = std::max(r.maxSims, rig.predictor.lastAdvice().simulations);
-        if (hold && !prevHold) ++r.presses;
+        if (hold && !prevHold) {
+            ++r.presses;
+            if (std::getenv("AIGD_PLAN_TRACE"))
+                std::printf("      press at x=%.1f (%s, by %s) | strategic: %s\n", o.x, o.onGround ? "ground" : "air",
+                            decisionSourceName(rec.proposedSource), agent.status().strategic.c_str());
+        }
         prevHold = hold;
         rig.held = hold;
         w.step(hold);
@@ -2818,7 +2852,7 @@ TEST(plan_early_landing_cancels_the_obsolete_plan) {
     sim::Level level;
     level.name = "early-landing";
     level.spike(10.f);
-    level.hiddenBlock(11.6f, 0.f, 1.4f, 1.f); // the unexpected landing spot
+    level.hiddenBlock(11.0f, 0.f, 2.0f, 1.f); // the unexpected landing spot (wide enough for any jump timing to land on)
     level.spike(15.f);
     level.finish(26.f);
     LevelMemory mem = freshLevel(level);
@@ -2864,8 +2898,8 @@ TEST(plan_valid_plan_is_followed_without_new_searches) {
     agent.setPredictor(&rig.predictor);
     uint64_t sims0 = rig.predictor.totalSimulations();
     auto r = runPlanned(agent, level, rig);
-    std::printf("    spikes: %s, %d decisions followed a valid plan, %u plans made, %u invalidated, %.1f simulations per step\n",
-                r.completed ? "completed" : "DIED", r.followed, agent.plans().adopted, agent.plans().invalidated,
+    std::printf("    spikes: %s, %d presses, %d decisions followed a valid plan, %u plans made, %u invalidated, %.1f simulations per step\n",
+                r.completed ? "completed" : "DIED", r.presses, r.followed, agent.plans().adopted, agent.plans().invalidated,
                 double(rig.predictor.totalSimulations() - sims0) / 2100.0);
     CHECK(r.completed);
     CHECK(r.followed > 0);
@@ -3537,6 +3571,616 @@ TEST(transfer_cost_per_step_is_small) {
     }
     std::printf("    %.1f us per decision without the library, %.1f with it\n", us[0], us[1]);
     CHECK(us[1] < us[0] * 1.5 + 5.0);
+}
+
+// ---------------------------------------------------------------------------
+// Full-level perception and strategic planning (v0.5.0)
+
+namespace {
+// The level map the game side builds, from the simulator's level: the
+// collision rectangles of every object the AI is shown (hidden ones are not).
+LevelMap simMap(sim::Level const& L) {
+    std::vector<MapObject> objs;
+    for (uint32_t i = 0; i < L.objs.size(); ++i) {
+        auto const& o = L.objs[i];
+        if (o.hidden) continue;
+        MapObject m;
+        switch (o.kind) {
+            case sim::ObjKind::Spike: {
+                auto r = sim::World::spikeHitbox(o);
+                m = {r.l, r.b, r.r, r.t, MapKind::Hazard};
+                break;
+            }
+            case sim::ObjKind::Block: m = {o.x, o.y, o.x + o.w, o.y + o.h, MapKind::Solid}; break;
+            case sim::ObjKind::ModePortal: m = {o.x, o.y, o.x + o.w, o.y + o.h, MapKind::ModePortal, static_cast<uint8_t>(o.mode)}; break;
+            case sim::ObjKind::GravityPortal: m = {o.x, o.y, o.x + o.w, o.y + o.h, MapKind::GravityPortal, 2}; break;
+            case sim::ObjKind::SpeedPortal: m = {o.x, o.y, o.x + o.w, o.y + o.h, MapKind::SpeedPortal, static_cast<uint8_t>(o.speed)}; break;
+        }
+        m.dynamic = o.moveAt >= 0;
+        m.source = i;
+        objs.push_back(m);
+    }
+    LevelMap map;
+    map.build(std::move(objs), L.length, 0.f);
+    return map;
+}
+
+// What the game observer does every step: refresh the moving objects near the
+// player, then report obstacles and portals from the map.
+struct MapObserver {
+    LevelMap& map;
+    sim::Level const& level;
+    std::vector<Obstacle> obstacles;
+    std::vector<PhysicsEvent> events;
+    float ahead = 900.f;
+    bool refresh = true;
+
+    Observation observe(sim::World const& w) {
+        if (refresh) {
+            for (uint32_t i : map.dynamicObjects()) {
+                MapObject const& m = map.at(i);
+                auto const& o = level.objs[m.source];
+                float const y = w.yOf(o);
+                if (o.kind == sim::ObjKind::Block) map.updateObject(i, o.x, y, o.x + o.w, y + o.h, true);
+            }
+        }
+        Observation o = w.observe();
+        map.collect(o.x - 90.f, o.x + ahead, obstacles, events, true);
+        o.obstacles = obstacles;
+        o.events = events;
+        o.geometryVersion = map.version();
+        return o;
+    }
+};
+
+struct MapRun {
+    bool completed = false;
+    float progress = 0.f;
+    int presses = 0;
+    std::vector<float> pressX;
+    float deathX = -1.f;
+};
+
+// One attempt with observations from the level map (as in game).
+MapRun runWithMap(Agent& agent, sim::Level const& level, LevelMap& map, PredictionRig& rig, bool refresh = true,
+                  std::function<void(Observation const&, Agent const&)> const& onStep = {}) {
+    MapRun r;
+    MapObserver mo{map, level};
+    mo.refresh = refresh;
+    sim::World w(level);
+    rig.held = false;
+    agent.beginAttempt(mo.observe(w), false);
+    bool prev = false;
+    for (int t = 0; t < 40000; ++t) {
+        Observation o = mo.observe(w);
+        rig.predictor.observe(o, rig.held);
+        bool hold = agent.act(o);
+        if (onStep) onStep(o, agent);
+        if (hold && !prev) {
+            ++r.presses;
+            r.pressX.push_back(o.x);
+        }
+        prev = hold;
+        rig.held = hold;
+        w.step(hold);
+        if (w.dead()) {
+            r.deathX = w.x();
+            r.progress = w.observe().progress();
+            agent.onDeath(w.observe(), w.death());
+            return r;
+        }
+        if (w.complete()) {
+            r.completed = true;
+            r.progress = 1.f;
+            agent.onComplete(w.observe());
+            return r;
+        }
+    }
+    agent.abortAttempt(nullptr);
+    return r;
+}
+
+// Dense obstacle sequences: patterns 2-4 blocks apart (several presses with
+// little landing room between them), now and then a longer run.
+sim::Level sequenceLevel(uint32_t seed) {
+    for (uint32_t k = 0; k < 60; ++k) {
+        std::mt19937 rng((seed + k * 7919u) * 2246822519u + 7u);
+        sim::Level L;
+        L.name = "seq-" + std::to_string(seed);
+        float x = 14.f;
+        for (int i = 0; i < 14; ++i) {
+            static constexpr sim::Pattern kPick[] = {sim::Pattern::Spike1, sim::Pattern::Spike2, sim::Pattern::Spike3, sim::Pattern::Block1,
+                                                     sim::Pattern::BlockSpike, sim::Pattern::Spike1, sim::Pattern::Spike2};
+            x += sim::placePattern(L, kPick[rng() % 7], x);
+            x += (rng() % 5 == 0) ? 8.f : 2.f + static_cast<float>(rng() % 3); // mostly 2-4 blocks of landing room
+        }
+        L.finish(x + 8.f);
+        if (cubeLevelSolvable(L)) return L;
+    }
+    return sim::levelSpikes();
+}
+
+LearnerConfig plannerOnly(bool strategic) {
+    LearnerConfig cfg = isolatedConfig();
+    cfg.useStrategicPlanning = strategic;
+    return cfg;
+}
+} // namespace
+
+TEST(level_map_extracts_the_whole_level) {
+    sim::Level L = sim::generatedLevel(301, 12);
+    L.speedPortal(L.length / 30.f - 6.f, 2);
+    L.gravityPortal(L.length / 30.f - 4.f);
+    L.modePortal(L.length / 30.f - 2.f, GameMode::Ship);
+    L.finish(L.length / 30.f + 4.f);
+    LevelMap map = simMap(L);
+    size_t spikes = 0, blocks = 0;
+    for (auto const& o : L.objs) {
+        spikes += o.kind == sim::ObjKind::Spike;
+        blocks += o.kind == sim::ObjKind::Block;
+    }
+    CHECK(map.size() == L.objs.size());
+    CHECK(map.count(MapKind::Hazard) == spikes && map.count(MapKind::Solid) == blocks);
+    CHECK(map.count(MapKind::SpeedPortal) == 1 && map.count(MapKind::GravityPortal) == 1 && map.count(MapKind::ModePortal) == 1);
+    // From the start, everything beyond the old observation window is known too.
+    sim::World w(L);
+    float const x = w.observe().x;
+    std::vector<uint32_t> far;
+    map.query(x + 480.f, L.length, far);
+    float lastObj = 0.f;
+    for (auto const& o : L.objs) lastObj = std::max(lastObj, o.x);
+    float lastFound = 0.f;
+    for (uint32_t i : far) lastFound = std::max(lastFound, map.at(i).l);
+    std::vector<Obstacle> obs;
+    std::vector<PhysicsEvent> ev;
+    map.collect(0.f, L.length, obs, ev, true);
+    std::printf("    %zu objects indexed in %.3f ms; %zu beyond the 480-unit window at the start; last object at x=%.0f found: %s; "
+                "%zu obstacles + %zu physics events over the whole level\n",
+                map.size(), map.buildMillis(), far.size(), lastObj, std::fabs(lastFound - lastObj) < 31.f ? "yes" : "no", obs.size(), ev.size());
+    CHECK(!far.empty());
+    CHECK(std::fabs(lastFound - lastObj) < 31.f);
+    CHECK(ev.size() == 2);
+    CHECK(obs.size() == spikes + blocks + 1); // the mode portal is an uncertain obstacle
+    // Window queries agree with a brute-force scan everywhere.
+    int mismatches = 0;
+    for (float q = 0.f; q < L.length; q += 37.f) {
+        map.query(q, q + 200.f, far);
+        size_t brute = 0;
+        for (auto const& o : map.objects()) brute += (o.r >= q && o.l <= q + 200.f) ? 1 : 0;
+        mismatches += far.size() != brute ? 1 : 0;
+    }
+    CHECK(mismatches == 0);
+}
+
+TEST(level_analysis_finds_sequences_and_physics_changes) {
+    // The example from the specification, then a speed and a gravity change.
+    sim::Level L;
+    L.name = "analysis";
+    L.spike(12);                    // a spike
+    L.block(16, 0, 2, 1);           // a short landing platform
+    L.spike(21); L.spike(22);       // two closely spaced spikes
+    L.spike(26); L.spike(27); L.spike(28); // a pit of spikes
+    L.block(32, 2, 4, 1); L.spike(33);     // a low ceiling over a spike
+    L.speedPortal(40, 2);
+    L.spike(48);
+    L.gravityPortal(56);
+    L.block(56, 6, 20, 1);          // the ceiling to walk on upside down
+    L.finish(80);
+    LevelMap map = simMap(L);
+    LevelAnalysis A = analyzeLevel(map, AnalysisStart{});
+    std::printf("    %s\n", A.summary().c_str());
+    for (size_t i = 0; i < A.groups.size(); ++i) {
+        auto const& g = A.groups[i];
+        std::printf("      group %zu: x %.0f-%.0f, %s, gap before %.0f, landing space %.0f, headroom %s, difficulty %.1f\n", i, g.startX, g.endX,
+                    g.sit.describe().c_str(), g.gapBefore, g.landingSpace,
+                    g.headroom > 1e8f ? "open" : std::to_string(static_cast<int>(g.headroom)).c_str(), g.difficulty);
+    }
+    CHECK(A.valid);
+    CHECK(A.groups.size() >= 6);
+    CHECK(A.changes.size() == 2);
+    CHECK(A.sections.size() == 3);
+    CHECK(A.sections[1].speedClass == 2);
+    CHECK(A.sections[2].gravity == 1 && !A.sections[2].analysedGroups);
+    // the five obstacles of the example are found in order, with their spacing
+    CHECK(A.groups.size() >= 5 && A.groups[0].hazards == 1 && A.groups[1].solids == 1 && A.groups[2].hazards == 2 && A.groups[3].hazards == 3);
+    CHECK(std::fabs(A.groups[0].landingSpace - (480.f - 379.5f)) < 1.f);
+    // the low ceiling is seen over the spike under it
+    bool lowCeiling = false;
+    for (auto const& g : A.groups) lowCeiling = lowCeiling || (g.headroom < 2.5f * kBlock && g.above > 0);
+    CHECK(lowCeiling);
+    CHECK(!A.difficult.empty());
+}
+
+TEST(strategic_planner_handles_sequences_the_local_planner_does_not) {
+    // Dense obstacle sequences, first attempt, no learning: the controller
+    // alone (it judges each first press over its own 180-step look-ahead)
+    // vs. with the strategic planner (whole sequences, up to three presses).
+    // Levels not used while the planner was written: seeds 400-439.
+    int const n = std::getenv("AIGD_SEQ_FULL") ? 40 : 16;
+    int completed[2] = {0, 0};
+    double progress[2] = {0, 0};
+    uint32_t overrides = 0, plans = 0;
+    double maxUs = 0, totalUs = 0;
+    std::vector<int> onlyStrategic, onlyLocal;
+    for (int i = 0; i < n; ++i) {
+        sim::Level L = sequenceLevel(400u + static_cast<uint32_t>(i));
+        for (int s = 0; s < 2; ++s) {
+            PredictionRig rig;
+            warmUp(rig);
+            LevelMap map = simMap(L);
+            LevelMemory mem = freshLevel(L);
+            PatternMemory pat;
+            Agent agent(plannerOnly(s == 1));
+            agent.attach(&mem, &pat);
+            agent.setPredictor(&rig.predictor);
+            std::vector<std::string> trace;
+            bool const tracing = std::getenv("AIGD_SEQ_TRACE") != nullptr;
+            bool prevHold = false;
+            MapRun r = runWithMap(agent, L, map, rig, true, [&](Observation const& o, Agent const& a) {
+                if (!tracing) return;
+                bool const hold = a.holding();
+                if (hold != prevHold || a.status().safety.verdict == SafetyVerdict::NoSafeOption) {
+                    char buf[400];
+                    std::snprintf(buf, sizeof(buf), "        t=%d x=%.1f y=%.1f %s -> %s by %s | %s | strategic: %s", o.tick, o.x, o.y,
+                                  o.onGround ? "ground" : "air", hold ? "PRESS" : "release", decisionSourceName(a.status().source),
+                                  a.status().safety.reason.c_str(), a.status().strategic.c_str());
+                    trace.push_back(buf);
+                    if (trace.size() > 12) trace.erase(trace.begin());
+                }
+                prevHold = hold;
+            });
+            completed[s] += r.completed ? 1 : 0;
+            progress[s] += r.progress;
+            if (tracing && !r.completed) {
+                std::printf("      level %d, %s: died at x=%.1f\n", i, s ? "strategic" : "controller alone", r.deathX);
+                for (auto const& line : trace) std::printf("%s\n", line.c_str());
+            }
+            if (s == 1) {
+                overrides += agent.status().strategicOverrides;
+                plans += agent.status().strategicPlans;
+                maxUs = std::max(maxUs, static_cast<double>(agent.status().strategicMaxMicros));
+                totalUs += agent.status().strategicMicros;
+            }
+        }
+    }
+    std::printf("    %d dense sequence levels, first attempt: controller alone %d completed (%.1f%% mean progress), with strategic planning "
+                "%d completed (%.1f%%)\n",
+                n, completed[0], 100.0 * progress[0] / n, completed[1], 100.0 * progress[1] / n);
+    std::printf("    %u sequence plans (%u chose a different first press than the locally best one); %.0f us per plan on average, %.0f us at most\n",
+                plans, overrides, plans ? totalUs / plans : 0.0, maxUs);
+    CHECK(completed[1] >= completed[0]);
+    CHECK(progress[1] >= progress[0] - 1e-6);
+}
+
+TEST(planner_takes_no_unnecessary_jump) {
+    // One spike, then hanging spikes over the landing area: a second press
+    // would jump into them. The plan has exactly one press; walking under
+    // hazards needs none.
+    sim::Level L;
+    L.name = "under";
+    L.spike(12);
+    for (float b = 16; b < 22; b += 1.f) L.spike(b, 2.f);
+    L.finish(32);
+    PredictionRig rig;
+    warmUp(rig);
+    LevelMap map = simMap(L);
+    LevelMemory mem = freshLevel(L);
+    PatternMemory pat;
+    Agent agent(plannerOnly(true));
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    int planPresses = -1;
+    MapRun r = runWithMap(agent, L, map, rig, true, [&](Observation const&, Agent const& a) {
+        if (planPresses < 0 && a.strategic().active()) {
+            Plan const& p = a.strategic().plan().chosen.plan;
+            planPresses = (p.pressAt >= 0) + (p.secondAt >= 0) + (p.thirdAt >= 0);
+        }
+    });
+    std::printf("    spike + hanging spikes: %s, %d press(es); the first sequence plan has %d press(es)\n", r.completed ? "completed" : "DIED",
+                r.presses, planPresses);
+    CHECK(r.completed);
+    CHECK(r.presses == 1);
+    CHECK(planPresses == 1);
+
+    sim::Level O;
+    O.name = "overhead";
+    for (float b = 10; b < 20; b += 1.f) O.spike(b, 2.f);
+    O.finish(28);
+    LevelMap map2 = simMap(O);
+    LevelMemory mem2 = freshLevel(O);
+    Agent agent2(plannerOnly(true));
+    agent2.attach(&mem2, &pat);
+    agent2.setPredictor(&rig.predictor);
+    MapRun r2 = runWithMap(agent2, O, map2, rig);
+    std::printf("    hanging spikes only: %s, %d press(es)\n", r2.completed ? "completed" : "DIED", r2.presses);
+    CHECK(r2.completed && r2.presses == 0);
+}
+
+TEST(physics_transition_changes_the_plan) {
+    // A speed portal (1x -> 3x) in front of a sequence: the plan is made with
+    // the faster speed from the portal on, and the real path follows it.
+    auto make = [](bool portal) {
+        sim::Level L;
+        L.name = portal ? "speed" : "nospeed";
+        if (portal) L.speedPortal(16, 3);
+        L.spike(21);
+        L.spike(26); L.spike(27);
+        L.finish(50);
+        return L;
+    };
+    int firstPress[2] = {-1, -1};
+    float maxErr = 0.f;
+    bool done[2] = {false, false};
+    for (int portal = 0; portal < 2; ++portal) {
+        sim::Level L = make(portal == 1);
+        PredictionRig rig;
+        warmUp(rig);
+        LevelMap map = simMap(L);
+        LevelMemory mem = freshLevel(L);
+        PatternMemory pat;
+        Agent agent(plannerOnly(true));
+        agent.attach(&mem, &pat);
+        agent.setPredictor(&rig.predictor);
+        StrategicPlan before;
+        float const portalX = 16.f * 30.f;
+        MapRun r = runWithMap(agent, L, map, rig, true, [&](Observation const& o, Agent const& a) {
+            if (!before.valid && a.strategic().active() && o.x < portalX - 30.f) before = a.strategic().plan();
+            // after the portal: compare the real position with the plan made before it
+            if (before.valid && o.x > portalX + 40.f) {
+                int32_t const idx = o.tick - before.madeTick - 1;
+                if (idx >= 0 && idx < static_cast<int32_t>(before.path.points.size()) && o.x < before.groupStart[0])
+                    maxErr = std::max(maxErr, std::fabs(before.path.points[static_cast<size_t>(idx)].x - o.x));
+            }
+        });
+        done[portal] = r.completed;
+        firstPress[portal] = before.valid ? before.chosen.plan.pressAt : -2;
+        if (portal == 1)
+            std::printf("    with the 3x portal: plan made %.0f units before it, first press in %d steps (without the portal: %d); "
+                        "largest position error after the portal %.2f units; %s\n",
+                        portalX - before.madeX, firstPress[1], firstPress[0], maxErr, r.completed ? "completed" : "DIED");
+    }
+    CHECK(done[0] && done[1]);
+    CHECK(firstPress[1] >= 0 && firstPress[0] >= 0 && firstPress[1] != firstPress[0]);
+    CHECK(maxErr < 1.0f);
+}
+
+TEST(dynamic_obstacle_updates_the_map_and_the_plan) {
+    // A block hangs above the path and drops onto it at step 120 (a triggered
+    // obstacle). The map refreshes it, the strategic plan is re-made, and the
+    // AI jumps over it. Without the refresh (stale geometry) it runs into it.
+    sim::Level L;
+    L.name = "drop";
+    L.spike(10);
+    L.movingBlock(22, 3, 1, 1, 120, -3.f);
+    L.spike(30);
+    L.finish(40);
+    MapRun runs[2];
+    std::string reason;
+    uint64_t v0 = 0, v1 = 0;
+    for (int refresh = 1; refresh >= 0; --refresh) {
+        PredictionRig rig;
+        warmUp(rig);
+        LevelMap map = simMap(L);
+        LevelMemory mem = freshLevel(L);
+        PatternMemory pat;
+        Agent agent(plannerOnly(true));
+        agent.attach(&mem, &pat);
+        agent.setPredictor(&rig.predictor);
+        if (refresh) v0 = map.version();
+        runs[refresh] = runWithMap(agent, L, map, rig, refresh == 1, [&](Observation const&, Agent const& a) {
+            if (refresh && reason.empty() && a.strategic().lastInvalidation.find("geometry") != std::string::npos)
+                reason = a.strategic().lastInvalidation;
+        });
+        if (refresh) {
+            v1 = map.version();
+            std::vector<uint32_t> hits;
+            map.query(22 * 30.f, 23 * 30.f, hits);
+            bool onPath = false;
+            for (uint32_t i : hits) onPath = onPath || (map.at(i).kind == MapKind::Solid && map.at(i).b < 1.f);
+            CHECK(onPath);
+        }
+    }
+    std::printf("    refreshed map: %s (%d presses), version %llu -> %llu, plan: \"%s\" | stale map: %s at x=%.0f\n",
+                runs[1].completed ? "completed" : "DIED", runs[1].presses, static_cast<unsigned long long>(v0), static_cast<unsigned long long>(v1),
+                reason.c_str(), runs[0].completed ? "completed" : "DIED", runs[0].deathX);
+    CHECK(runs[1].completed);
+    CHECK(v1 > v0);
+    CHECK(!reason.empty());
+    CHECK(!runs[0].completed);
+}
+
+TEST(strategic_plan_is_replanned_when_the_state_diverges) {
+    // A block the AI cannot see makes it land early: the sequence plan is
+    // invalidated from the real state and re-made; the controller's live plan
+    // is cancelled as before.
+    sim::Level L;
+    L.name = "early";
+    L.spike(10.f);
+    L.hiddenBlock(11.0f, 0.f, 2.0f, 1.f);
+    L.spike(15.f);
+    L.finish(26.f);
+    PredictionRig rig;
+    warmUp(rig);
+    LevelMap map = simMap(L);
+    LevelMemory mem = freshLevel(L);
+    PatternMemory pat;
+    Agent agent(plannerOnly(true));
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    std::string reason;
+    MapRun r = runWithMap(agent, L, map, rig, true, [&](Observation const&, Agent const& a) {
+        if (reason.empty() && a.strategic().lastInvalidation.find("left the strategic plan") != std::string::npos) reason = a.strategic().lastInvalidation;
+    });
+    std::printf("    %s; strategic: %u plans, %u invalidated: \"%s\"; live plans invalidated: %u\n", r.completed ? "completed" : "DIED",
+                agent.status().strategicPlans, agent.status().strategicInvalidated, reason.c_str(), agent.plans().invalidated);
+    CHECK(r.completed);
+    CHECK(!reason.empty());
+    CHECK(agent.plans().invalidated >= 1);
+}
+
+TEST(sequence_strategy_transfers_to_another_level) {
+    // A spike followed closely by a double spike: the library learns the
+    // timing for the spike *with what follows it* (sequence key). On another
+    // level with the same sequence elsewhere, that timing is retrieved for it.
+    auto withSequence = [](char const* name, float at, float filler) {
+        sim::Level L;
+        L.name = name;
+        L.spike(filler);
+        L.spike(at);
+        L.spike(at + 4.f); L.spike(at + 5.f);
+        L.block(at + 12.f);
+        L.finish(at + 22.f);
+        return L;
+    };
+    Knowledge k;
+    sim::Level A = withSequence("seq-a", 30.f, 14.f);
+    playLevel(k, A, 300, false, true, true, 5);
+    sim::Level B = withSequence("seq-b", 45.f, 20.f);
+    // what the library offers for the first spike of the sequence on B
+    sim::World w(B);
+    PredictionRig rig;
+    Observation o = rig.observe(w);
+    while (o.x < 41.f * 30.f) {
+        w.step(false);
+        o = rig.observe(w);
+        if (w.dead()) break;
+    }
+    Situation s = describeSituation(o);
+    StrategyChoice c = k.strategies.choose(s, "sim-seq-b");
+    TransferMetrics t;
+    Knowledge kb = k;
+    auto r = playLevel(kb, B, 1, false, true, true, 5, &t);
+    Knowledge none;
+    auto r0 = playLevel(none, B, 1, false, true, true, 5);
+    std::printf("    on another level: %s (%s match, lead %.0f steps, worked %u times); first attempt %.0f%% with the library, %.0f%% without\n",
+                s.describe().c_str(), c.sequence ? "sequence" : c.match == StrategyChoice::Match::Exact ? "exact" : "no", c.leadSteps, c.successes,
+                r.attempts.empty() ? 0.f : r.attempts[0].progress * 100.f, r0.attempts.empty() ? 0.f : r0.attempts[0].progress * 100.f);
+    CHECK(s.valid && s.sequence != 0);
+    CHECK(c.usable && c.sequence);
+    CHECK(!r.attempts.empty() && !r0.attempts.empty() && r.attempts[0].progress >= r0.attempts[0].progress);
+}
+
+TEST(level_analysis_and_planning_cost) {
+    // Analysis of levels of different sizes (once per level) and the cost of
+    // planning while playing (per sequence plan, and per controller step).
+    for (int n : {1000, 10000, 50000}) {
+        std::mt19937 rng(42);
+        std::vector<MapObject> objs;
+        float x = 300.f;
+        for (int i = 0; i < n; ++i) {
+            bool const spike = rng() % 3 == 0;
+            float const y = (rng() % 4 == 0) ? 30.f * static_cast<float>(rng() % 6) : 0.f;
+            objs.push_back(spike ? MapObject{x + 10.5f, y + 3.f, x + 19.5f, y + 18.f, MapKind::Hazard}
+                                 : MapObject{x, y, x + 30.f, y + 30.f, MapKind::Solid});
+            x += (rng() % 3 == 0) ? 30.f : 0.f;
+            if (rng() % 9 == 0) x += 90.f;
+        }
+        LevelMap map;
+        map.build(objs, x + 300.f, 0.f);
+        LevelAnalysis A = analyzeLevel(map, AnalysisStart{});
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<uint32_t> hits;
+        int q = 0;
+        for (float p = 0.f; p < x; p += 13.f, ++q) map.query(p - 90.f, p + 900.f, hits);
+        double const usQuery = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / std::max(1, q);
+        std::printf("    %6d objects: index %.2f ms, whole-level analysis %.2f ms (%zu groups), window query %.1f us\n", n, map.buildMillis(), A.millis,
+                    A.groups.size(), usQuery);
+        CHECK(map.buildMillis() < 500.0);
+        CHECK(A.millis < 2000.0);
+        CHECK(usQuery < 200.0);
+    }
+    // per step, with and without strategic planning, on dense sequences
+    double us[2] = {0, 0};
+    long steps[2] = {0, 0};
+    for (int s = 0; s < 2; ++s) {
+        for (uint32_t i = 0; i < 4; ++i) {
+            sim::Level L = sequenceLevel(500u + i);
+            PredictionRig rig;
+            warmUp(rig);
+            LevelMap map = simMap(L);
+            LevelMemory mem = freshLevel(L);
+            PatternMemory pat;
+            Agent agent(plannerOnly(s == 1));
+            agent.attach(&mem, &pat);
+            agent.setPredictor(&rig.predictor);
+            auto t0 = std::chrono::steady_clock::now();
+            long n = 0;
+            runWithMap(agent, L, map, rig, true, [&](Observation const&, Agent const&) { ++n; });
+            us[s] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            steps[s] += n;
+        }
+    }
+    std::printf("    per physics step (simulator, prediction and agent included): %.1f us without strategic planning, %.1f us with it\n",
+                us[0] / std::max(1L, steps[0]), us[1] / std::max(1L, steps[1]));
+    CHECK(us[1] / std::max(1L, steps[1]) < 3.0 * us[0] / std::max(1L, steps[0]) + 50.0);
+}
+
+TEST(understanding_overlay_shows_the_executed_plan) {
+    // The overlay draws the strategic plan's own predicted path; when the
+    // controller executes that plan, the press happens where the overlay
+    // says, and objects / inferred groups / predictions are told apart.
+    sim::Level L = sequenceLevel(600);
+    PredictionRig rig;
+    warmUp(rig);
+    LevelMap map = simMap(L);
+    LevelAnalysis A = analyzeLevel(map, AnalysisStart{});
+    LevelMemory mem = freshLevel(L);
+    PatternMemory pat;
+    Agent agent(plannerOnly(true));
+    agent.attach(&mem, &pat);
+    agent.setPredictor(&rig.predictor);
+    int checked = 0, matched = 0, pathMismatch = 0;
+    UnderstandingOverlay ov;
+    UnderstandingLayers layers;
+    layers.alternatives = true;
+    StrategicPlan current;
+    bool prevHold = false;
+    int styles[3] = {0, 0, 0};
+    MapRun r = runWithMap(agent, L, map, rig, true, [&](Observation const& o, Agent const& a) {
+        if (!a.strategic().active()) return;
+        StrategicPlan const& p = a.strategic().plan();
+        if (p.madeTick == o.tick) {
+            current = p;
+            buildUnderstandingOverlay(&map, &A, &p, o.x, o.y, o.x - 90.f, o.x + 600.f, layers, ov);
+            // the drawn path is the plan's path
+            size_t k = 0;
+            for (auto const& s : ov.segments) {
+                if (s.style != UnderstandingOverlay::Style::PlannedPath) continue;
+                size_t const idx = std::min(k * 4, p.path.points.size() - 1);
+                if (std::fabs(s.x0 - p.path.points[idx].x) > 1e-3f || std::fabs(s.y0 - p.path.points[idx].y) > 1e-3f) ++pathMismatch;
+                ++k;
+            }
+            for (auto const& b : ov.boxes) {
+                using S = UnderstandingOverlay::Style;
+                if (b.style == S::Hazard || b.style == S::Solid) {
+                    ++styles[0];
+                    CHECK(b.filled);
+                }
+                if (b.style == S::Group || b.style == S::TightGroup || b.style == S::Sequence) {
+                    ++styles[1];
+                    CHECK(!b.filled);
+                }
+            }
+            for (auto const& s : ov.segments) styles[2] += s.style == UnderstandingOverlay::Style::PlannedPath;
+        }
+        bool const hold = a.holding();
+        if (hold && !prevHold && current.valid && !current.pressX.empty() && a.status().source != DecisionSource::Shield) {
+            ++checked;
+            if (std::fabs(current.pressX[0] - o.x) < 4.f || (current.pressX.size() > 1 && std::fabs(current.pressX[1] - o.x) < 4.f) ||
+                (current.pressX.size() > 2 && std::fabs(current.pressX[2] - o.x) < 4.f))
+                ++matched;
+        }
+        prevHold = hold;
+    });
+    std::vector<UnderstandingOverlay::Mark> overview;
+    buildLevelOverview(map, A, overview);
+    std::printf("    %s; overlay: %d extracted boxes, %d inferred outlines, %d predicted segments; %d of %d presses at a planned press "
+                "position; overview strip %zu marks\n",
+                r.completed ? "completed" : "DIED", styles[0], styles[1], styles[2], matched, checked, overview.size());
+    CHECK(pathMismatch == 0);
+    CHECK(styles[0] > 0 && styles[1] > 0 && styles[2] > 0);
+    CHECK(checked > 0 && matched * 2 >= checked);
+    CHECK(!overview.empty());
 }
 
 TEST(upside_down_cube_contact_is_not_a_ceiling) {

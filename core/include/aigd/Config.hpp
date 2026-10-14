@@ -45,7 +45,10 @@ struct LearnerConfig {
     int maxExperimentsPerHotspot = 10;
 
     // --- Trajectory prediction ---
-    bool usePrediction = true;        // plan with the physics model and block predicted collisions
+    bool usePrediction = true;
+    // Plan whole obstacle sequences ahead (cube/robot) and give the plan to
+    // the controller's search as a candidate (v0.5.0).
+    bool useStrategicPlanning = true;        // plan with the physics model and block predicted collisions
     float imaginedScale = 0.5f;       // weight of "imagined" deaths learned from predictions
     // Safety layer (all in physics steps, i.e. time, so they hold at any speed):
     int safetySlackSteps = 3;         // change the input while at least this many steps remain to do so

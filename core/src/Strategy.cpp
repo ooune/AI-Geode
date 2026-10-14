@@ -114,6 +114,7 @@ void StrategyLibrary::recordInto(uint64_t key, int speed, Primitive p, float lea
 void StrategyLibrary::record(Situation const& s, Primitive p, float leadSteps, float secondSteps, bool success, std::string const& level) {
     if (!s.valid) return;
     ++clock;
+    if (s.sequence) recordInto(s.sequence, s.speedClass, p, leadSteps, secondSteps, success, level);
     recordInto(s.fine, s.speedClass, p, leadSteps, secondSteps, success, level);
     recordInto(s.coarse, s.speedClass, p, leadSteps, secondSteps, success, level);
     if (std::find(levels.begin(), levels.end(), level) == levels.end() && levels.size() < 256) levels.push_back(level);
@@ -173,6 +174,14 @@ bool StrategyLibrary::best(uint64_t key, int speed, std::string const& level, St
 StrategyChoice StrategyLibrary::choose(Situation const& s, std::string const& level) const {
     StrategyChoice c;
     if (!s.valid) return c;
+    if (s.sequence) {
+        StrategyChoice seq;
+        if (best(s.sequence, s.speedClass, level, seq) && seq.usable) {
+            seq.match = StrategyChoice::Match::Exact;
+            seq.sequence = true;
+            return seq;
+        }
+    }
     StrategyChoice exact;
     if (best(s.fine, s.speedClass, level, exact)) {
         exact.match = StrategyChoice::Match::Exact;

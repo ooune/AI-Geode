@@ -183,6 +183,18 @@ Situation describeSituation(Observation const& obs, float lookAheadSteps) {
     s.unmodelled = firstUnmodelled < groupEnd + 2.f * kBlock;
     s.fine = fineKey(s, s.landingBand);
     s.coarse = coarseKey(s);
+    {
+        uint64_t q = fnv(s.fine, 0x53u); // 'S'
+        if (next < nPath) {
+            Item const& n = path[next];
+            int const w = static_cast<int>(std::lround((n.r - n.l) / kHalfBlock));
+            q = fnv(q, static_cast<uint64_t>(n.kind) | (static_cast<uint64_t>(static_cast<uint8_t>(halfBlocks(n.hi))) << 8) |
+                           (static_cast<uint64_t>(w <= 2 ? 0 : w <= 4 ? 1 : 2) << 16));
+        } else {
+            q = fnv(q, 0xFFu);
+        }
+        s.sequence = (q & (kKeyMask >> 2)) | (uint64_t(1) << 51); // never equal to a fine or coarse key
+    }
     return s;
 }
 

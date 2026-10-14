@@ -259,6 +259,16 @@ void Agent::beginAttempt(Observation const& first, bool fromCheckpoint) {
     m_status.transfer = {};
     m_status.transferLog.clear();
     m_groups.clear();
+    m_strategic.reset();
+    m_strategic.plansMade = 0;
+    m_strategic.invalidations = 0;
+    m_strategic.overrides = 0;
+    m_strategic.totalMicros = 0.0;
+    m_strategic.maxMicros = 0.f;
+    m_status.strategic.clear();
+    m_status.strategicEvent.clear();
+    m_status.strategicSeeded = 0;
+    m_status.strategicMatched = 0;
     if (m_cfg.learningEnabled && m_pendingExp.active && m_pendingExp.toCell >= xCell(first.x, m_cfg.cellSize)) {
         m_activeExp = std::move(m_pendingExp);
     }
@@ -297,6 +307,25 @@ bool Agent::act(Observation const& obs) {
     // Obstacle groups ahead (cross-level strategies): resolved when passed,
     // and a new one is described and looked up when it comes into view.
     trackGroups(obs);
+
+    // Strategic plan for the obstacle sequence ahead: checked against the
+    // real state on every observation and re-made when the state leaves it.
+    // Only with a trusted model (its paths are only as good as the model).
+    if (m_predictor && m_cfg.usePrediction && m_cfg.useStrategicPlanning && m_predictor->trusted(obs.mode, obs.mini)) {
+        m_strategic.update(obs, m_curAction == 1, *m_predictor, obs.obstacles, obs.events, m_strategies, m_level->key);
+    } else if (m_strategic.active()) {
+        m_strategic.invalidate("no trusted prediction");
+    }
+    m_status.strategicPlans = m_strategic.plansMade;
+    m_status.strategicInvalidated = m_strategic.invalidations;
+    m_status.strategicOverrides = m_strategic.overrides;
+    m_status.strategicMicros = m_strategic.totalMicros;
+    m_status.strategicMaxMicros = m_strategic.maxMicros;
+    if (!m_strategic.lastInvalidation.empty()) m_status.strategicEvent = m_strategic.lastInvalidation;
+    if (m_strategic.active()) {
+        auto const& sp = m_strategic.plan();
+        m_status.strategic = sp.description + ": " + sp.reason;
+    }
 
     bool holdingNow = m_curAction == 1;
     uint64_t key = encodeLevelKey(obs, holdingNow, m_cfg.cellSize);
@@ -372,6 +401,7 @@ bool Agent::act(Observation const& obs) {
 
     // Trajectory prediction for both actions, used to vet alternatives and to
     // find the deciding decision afterwards.
+    bool adoptStrategic = false; // the controller refined the strategic plan (see below)
     Predictor::Advice const* adv = nullptr;
     if (following) {
         a = plannedHold;
@@ -406,7 +436,27 @@ bool Agent::act(Observation const& obs) {
             m_predictor->addSeed(p);
             g->seedContact = contact;
         }
+        // The strategic plan for the whole sequence is one more candidate for
+        // the search, which also looks as far ahead as the sequence goes, so
+        // a first press is judged by what it does to the later obstacles.
+        Plan strategicSeed;
+        int strategicHorizon = 0;
+        adoptStrategic = false;
+        bool const strategicSeeded = m_strategic.useful() && m_strategic.seed(obs, strategicSeed, strategicHorizon);
+        if (m_strategic.useful()) {
+            if (strategicSeeded) m_predictor->addLateSeed(strategicSeed);
+            int const remaining = std::max(strategicHorizon, m_strategic.plan().effectiveHorizon - (obs.tick - m_strategic.plan().madeTick));
+            m_predictor->extendHorizonOnce(remaining);
+        }
         adv = &m_predictor->advise(obs, holdingNow, !m_danger && !offPath);
+        if (strategicSeeded && adv->computedTick == obs.tick && !adv->reused) {
+            ++m_status.strategicSeeded;
+            if (adv->fromLateSeed) ++m_status.strategicMatched;
+            // The controller's own search (same look-ahead) found a better
+            // input sequence: the strategic plan follows what is executed
+            // (below) instead of being invalidated as soon as the two diverge.
+            else if (adv->trusted && adv->bestScore >= m_predictor->scoreOf(m_strategic.plan().path)) adoptStrategic = true;
+        }
         if (g && adv->strategySeeded && adv->computedTick == obs.tick && !adv->reused) {
             g->seeded = true;
             g->simChose = adv->fromStrategy;
@@ -785,6 +835,7 @@ bool Agent::act(Observation const& obs) {
         size_t const first = static_cast<size_t>(m_predictor->inputLatency());
         bool const matches = mine.holds.size() > first && mine.holds[first] == static_cast<uint8_t>(a);
         if (adv && trusted && adv->computedTick == obs.tick && matches) {
+            if (adoptStrategic) m_strategic.adoptController(obs, mine);
             bool const byPrediction = src == DecisionSource::Planner || src == DecisionSource::Shield || src == DecisionSource::Economy;
             m_plan.adopt(mine, obs, obs.tick, adv->fromSeed ? PlanSource::Learned : PlanSource::Search, *adv, byPrediction);
         } else if (m_plan.active()) {

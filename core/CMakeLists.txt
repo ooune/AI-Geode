@@ -3,12 +3,15 @@ add_library(aigd_core STATIC
     src/Agent.cpp
     src/FailureAnalyzer.cpp
     src/Json.cpp
+    src/LevelAnalysis.cpp
+    src/LevelMap.cpp
     src/Overlay.cpp
     src/Physics.cpp
     src/PlanManager.cpp
     src/Predictor.cpp
     src/Situation.cpp
     src/StepClock.cpp
+    src/StrategicPlanner.cpp
     src/Strategy.cpp
     src/StrategyStorage.cpp
     src/Storage.cpp

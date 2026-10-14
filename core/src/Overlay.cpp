@@ -147,4 +147,147 @@ bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decisi
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Level understanding
+
+void UnderstandingOverlay::clear() {
+    boxes.clear();
+    segments.clear();
+    dots.clear();
+    warnings.clear();
+}
+
+void buildLevelOverview(LevelMap const& map, LevelAnalysis const& analysis, std::vector<UnderstandingOverlay::Mark>& out, size_t maxMarks) {
+    using S = UnderstandingOverlay::Style;
+    out.clear();
+    float const len = std::max(1.f, map.length());
+    // objects: merged into runs so that a long level stays a few hundred marks
+    float runL = -1.f, runR = -1.f;
+    S runStyle = S::Hazard;
+    auto flush = [&]() {
+        if (runL >= 0.f && out.size() < maxMarks) out.push_back({runL / len, runR / len, runStyle, 0});
+        runL = runR = -1.f;
+    };
+    float const join = len / 600.f; // ~600 pixels of resolution
+    for (auto const& o : map.objects()) {
+        S st;
+        switch (o.kind) {
+            case MapKind::Hazard: st = S::Hazard; break;
+            case MapKind::Solid: st = S::Solid; break;
+            default: continue; // portals go to their own row
+        }
+        if (o.dynamic) st = S::Dynamic;
+        if (runL >= 0.f && st == runStyle && o.l <= runR + join) {
+            runR = std::max(runR, o.r);
+            continue;
+        }
+        flush();
+        runL = o.l;
+        runR = o.r;
+        runStyle = st;
+    }
+    flush();
+    for (auto const& g : analysis.groups) {
+        if (out.size() >= maxMarks) break;
+        bool const tight = g.landingSpace < 2.f * kBlock;
+        out.push_back({g.startX / len, g.endX / len, tight ? S::TightGroup : S::Group, 1});
+    }
+    for (auto const& c : analysis.changes) {
+        if (out.size() >= maxMarks) break;
+        out.push_back({c.x / len, c.x / len, S::Portal, 2});
+    }
+}
+
+void buildUnderstandingOverlay(LevelMap const* map, LevelAnalysis const* analysis, StrategicPlan const* plan, float playerX, float playerY,
+                               float x0, float x1, UnderstandingLayers const& layers, UnderstandingOverlay& out, int stride) {
+    using S = UnderstandingOverlay::Style;
+    out.clear();
+    if (map && map->length() > 1.f) out.playerFraction = std::clamp(playerX / map->length(), 0.f, 1.f);
+    out.dots.push_back({playerX, playerY, S::Player});
+    if (map && (layers.objects || layers.uncertain)) {
+        thread_local std::vector<uint32_t> hits;
+        map->query(x0, x1, hits);
+        int notSimulated = 0, moving = 0, approximate = 0;
+        for (uint32_t i : hits) {
+            MapObject const& o = map->at(i);
+            S st;
+            bool uncertain = false;
+            switch (o.kind) {
+                case MapKind::Hazard: st = S::Hazard; break;
+                case MapKind::Solid: st = S::Solid; break;
+                case MapKind::SpeedPortal:
+                case MapKind::GravityPortal: st = S::Portal; break;
+                default: st = S::NotSimulated; uncertain = true; ++notSimulated; break;
+            }
+            if (o.dynamic) {
+                st = S::Dynamic;
+                uncertain = true;
+                ++moving;
+            } else if (o.approximate) {
+                st = S::Approximate;
+                uncertain = true;
+                ++approximate;
+            }
+            if (uncertain ? layers.uncertain : layers.objects) out.boxes.push_back({o.l, o.b, o.r, o.t, st, !uncertain});
+        }
+        if (layers.uncertain) {
+            char buf[160];
+            if (notSimulated) {
+                std::snprintf(buf, sizeof(buf), "%d object(s) ahead are not simulated (orbs, pads, mode portals...)", notSimulated);
+                out.warnings.push_back(buf);
+            }
+            if (moving) {
+                std::snprintf(buf, sizeof(buf), "%d object(s) ahead move or are toggled by triggers (refreshed while near)", moving);
+                out.warnings.push_back(buf);
+            }
+            if (approximate) {
+                std::snprintf(buf, sizeof(buf), "%d rotated hitbox(es) ahead are approximated by their bounding box", approximate);
+                out.warnings.push_back(buf);
+            }
+        }
+    }
+    if (analysis && layers.groups) {
+        for (size_t i = analysis->groupAt(x0); i < analysis->groups.size(); ++i) {
+            ObstacleGroup const& g = analysis->groups[i];
+            if (g.startX > x1) break;
+            float top = g.surface + 2.f * kBlock;
+            bool const tight = g.landingSpace < 2.f * kBlock;
+            out.boxes.push_back({g.startX, g.surface, g.endX, top, tight ? S::TightGroup : S::Group, false});
+            if (layers.landing && g.landingSpace > 0.f)
+                out.segments.push_back({g.endX, g.surface, g.endX + std::min(g.landingSpace, 8.f * kBlock), g.surface, S::LandingZone});
+        }
+    }
+    if (plan && plan->valid) {
+        if (layers.groups) {
+            for (int g = 0; g < plan->groups; ++g)
+                out.boxes.push_back({plan->groupStart[g], plan->madeY - 20.f, plan->groupEnd[g], plan->madeY + 70.f, S::Sequence, false});
+        }
+        if (layers.plan) {
+            auto const& pts = plan->path.points;
+            size_t const st = static_cast<size_t>(std::max(1, stride));
+            if (pts.size() >= 2) {
+                size_t prev = 0;
+                for (size_t i = st; i < pts.size(); i += st) {
+                    out.segments.push_back({pts[prev].x, pts[prev].y, pts[i].x, pts[i].y, S::PlannedPath});
+                    prev = i;
+                }
+                if (prev != pts.size() - 1) out.segments.push_back({pts[prev].x, pts[prev].y, pts.back().x, pts.back().y, S::PlannedPath});
+            }
+            for (size_t i = 0, k = 0; i < plan->path.holds.size() && i < pts.size(); ++i) {
+                bool const edge = plan->path.holds[i] && (i == 0 || !plan->path.holds[i - 1]);
+                if (edge && k++ < 6) out.dots.push_back({pts[i].x, pts[i].y, S::Press});
+            }
+        }
+        if (layers.landing) {
+            for (float lx : plan->landingX) out.dots.push_back({lx, plan->madeY, S::Target});
+        }
+        if (layers.alternatives) {
+            // where the other evaluated first presses would start (not their paths)
+            float const vx = unitsPerSecond(plan->speedClass) / static_cast<float>(kTicksPerSecond);
+            for (auto const& a : plan->alternatives)
+                if (a.plan.pressAt >= 0)
+                    out.dots.push_back({plan->madeX + static_cast<float>(a.plan.pressAt + 1) * vx, plan->madeY, S::AlternativePath});
+        }
+    }
+}
 } // namespace aigd

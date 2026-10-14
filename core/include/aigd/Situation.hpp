@@ -48,6 +48,10 @@ struct Situation {
 
     uint64_t fine = 0;         // the whole layout + landing space (exact match)
     uint64_t coarse = 0;       // the first element + number of elements (similar situation)
+    // The layout plus what follows it (the next group's first element): the
+    // same group followed by something else may need another timing, because
+    // where the jump lands decides how the next one can be taken.
+    uint64_t sequence = 0;
 
     // e.g. "double spike, landing space 3 blocks"
     std::string describe() const;
