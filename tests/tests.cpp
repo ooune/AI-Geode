@@ -1404,6 +1404,82 @@ TEST(all_modes_planner_alone_clears_course) {
     }
 }
 
+TEST(mode_followup_inputs_and_cache_invalidation) {
+    for (GameMode mode : {GameMode::Ship, GameMode::Wave, GameMode::Ufo, GameMode::Swing, GameMode::Ball, GameMode::Spider}) {
+        PredictionRig rig;
+        warmUpMode(rig, mode);
+        SimStart start;
+        start.mode = mode;
+        start.y = 90.f;
+        start.horizon = 48;
+        start.bounds.hasFloor = false;
+        Plan plan{0, 2, 0, false};
+        plan.followAt = 16;
+        plan.followHold = 2;
+        PredictedPath path;
+        rig.predictor.simulate(start, {}, plan, path);
+        CHECK(path.holds.size() == 48);
+        CHECK(path.holds[0] && !path.holds[2] && !path.holds[15] && path.holds[16] && !path.holds[18]);
+        CHECK(path.presses == 2);
+    }
+    PredictionRig rig;
+    warmUpMode(rig, GameMode::Ship);
+    auto course = sim::modeCourse(GameMode::Ship);
+    sim::World world(course);
+    Observation o = rig.observe(world);
+    o.mode = GameMode::Ship;
+    o.tick = 200;
+    rig.predictor.advise(o, false);
+    auto sims = rig.predictor.totalSimulations();
+    o.geometryVersion++;
+    CHECK(!rig.predictor.advise(o, false).reused);
+    CHECK(rig.predictor.totalSimulations() > sims);
+    sims = rig.predictor.totalSimulations();
+    o.playerSpeed = 1.6f;
+    CHECK(!rig.predictor.advise(o, false).reused);
+    CHECK(rig.predictor.totalSimulations() > sims);
+    sims = rig.predictor.totalSimulations();
+    o.mini = true;
+    CHECK(!rig.predictor.advise(o, false).reused);
+    CHECK(rig.predictor.totalSimulations() > sims);
+}
+
+TEST(mode_lookahead_comparison_on_shifted_courses) {
+    for (GameMode mode : {GameMode::Ship, GameMode::Wave, GameMode::Ufo, GameMode::Swing, GameMode::Ball, GameMode::Spider, GameMode::Robot}) {
+        int completed[2]{};
+        double progress[2]{}, cost[2]{};
+        int decisions[2]{};
+        for (int seed = 0; seed < 3; ++seed) {
+            auto level = sim::modeCourse(mode);
+            for (auto& obj : level.objs)
+                if ((obj.kind == sim::ObjKind::Spike || obj.kind == sim::ObjKind::Block) && obj.w < 100.f)
+                    obj.x = 240.f + (obj.x - 240.f) * (1.f - 0.2f * seed);
+            for (int enhanced = 0; enhanced < 2; ++enhanced) {
+                PredictionRig rig;
+                warmUpMode(rig, mode);
+                rig.predictor.setModeLookahead(enhanced != 0);
+                sim::World world(level);
+                for (int tick = 0; tick < 7000 && !world.dead() && !world.complete(); ++tick) {
+                    auto o = rig.observe(world);
+                    rig.predictor.observe(o, rig.held);
+                    auto const& adv = rig.predictor.advise(o, rig.held);
+                    bool hold = adv.valid ? adv.bestPresses : (world.mode() == GameMode::Ship && o.y < 90.f);
+                    if (adv.valid) { cost[enhanced] += adv.micros; ++decisions[enhanced]; }
+                    rig.predictor.noteExecuted(hold);
+                    rig.held = hold;
+                    world.step(hold);
+                }
+                completed[enhanced] += world.complete();
+                progress[enhanced] += world.observe().progress() * 100.f;
+            }
+        }
+        std::printf("    %s: baseline %d/3 %.1f%%; enhanced %d/3 %.1f%%; search %.1f -> %.1f us/decision\n",
+            gameModeName(mode), completed[0], progress[0]/3, completed[1], progress[1]/3,
+            cost[0]/std::max(1, decisions[0]), cost[1]/std::max(1, decisions[1]));
+        CHECK(completed[1] >= completed[0]);
+    }
+}
+
 TEST(all_modes_collision_predictions_are_never_falsely_safe) {
     // From many states on each course, the outcome of the planner's own best
     // plan is compared with what really happens when that plan is executed

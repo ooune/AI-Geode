@@ -39,6 +39,9 @@ struct Plan {
     // the hold is how long the dash lasts.
     int32_t orbPressAt = -1;
     int32_t orbHoldFor = 0;
+    // Independently timed second input for flying, flip and teleport modes.
+    int32_t followAt = -1;
+    int32_t followHold = 0;
 };
 
 // How far the timing search got for one decision.
@@ -218,6 +221,7 @@ public:
     void extendHorizonOnce(int steps) { m_extendOnce = std::max(0, std::min(steps, 480)); }
     // Most simulations per decision (bounded work per game update). Near an
     // imminent hazard a smaller share is used, to find a viable action fast.
+    void setModeLookahead(bool enabled) { m_modeLookahead = enabled; }
     void setBudget(int sims) { m_budget = std::max(16, sims); }
     int budget() const { return m_budget; }
     // A press delay (steps from now) that worked before in a comparable
@@ -352,7 +356,11 @@ private:
     PhysicsModel& m_model;
     int m_horizon = 180;
     int m_budget = 200;
+    bool m_modeLookahead = true;
     int m_budgetNow = 200;
+    int m_stateSpeed = -1;
+    bool m_stateMini = false;
+    uint64_t m_stateGeometry = 0;
     int32_t m_hint = -1;
     int m_extendOnce = 0;
     Plan m_lateSeed;

@@ -1,0 +1,459 @@
+[1/3] Building CXX object core\CMakeFiles\aigd_core.dir\src\Predictor.cpp.obj
+[2/3] Linking CXX static library core\aigd_core.lib
+[3/3] Linking CXX executable aigd_tests.exe
+[ RUN  ] json_roundtrip
+[  OK  ] json_roundtrip (0 ms)
+[ RUN  ] json_rejects_garbage
+[  OK  ] json_rejects_garbage (0 ms)
+[ RUN  ] state_keys
+[  OK  ] state_keys (0 ms)
+[ RUN  ] failure_analysis
+[  OK  ] failure_analysis (0 ms)
+[ RUN  ] q_update_penalises_death_and_respects_learning_toggle
+[  OK  ] q_update_penalises_death_and_respects_learning_toggle (7 ms)
+[ RUN  ] storage_roundtrip_and_recovery
+[  OK  ] storage_roundtrip_and_recovery (17 ms)
+[ RUN  ] sim_cube_levels_are_solvable
+[  OK  ] sim_cube_levels_are_solvable (150 ms)
+[ RUN  ] agent_changes_strategy_after_failure
+[  OK  ] agent_changes_strategy_after_failure (1 ms)
+[ RUN  ] agent_learns_basics
+    basics   completed after 3 attempts (best 100.0%)
+[  OK  ] agent_learns_basics (4 ms)
+[ RUN  ] agent_learns_spikes
+    spikes   completed after 14 attempts (best 100.0%)
+[  OK  ] agent_learns_spikes (18 ms)
+[ RUN  ] agent_learns_blocks
+    blocks   completed after 16 attempts (best 100.0%)
+[  OK  ] agent_learns_blocks (21 ms)
+[ RUN  ] agent_learns_ship
+    ship     completed after 32 attempts (best 100.0%)
+[  OK  ] agent_learns_ship (41 ms)
+[ RUN  ] agent_does_not_regress
+    basics   0 regressions in 3 attempts; 20/20 completions after first success
+    spikes   2 regressions in 14 attempts; 20/20 completions after first success
+    blocks   0 regressions in 16 attempts; 20/20 completions after first success
+    ship     0 regressions in 32 attempts; 20/20 completions after first success
+[  OK  ] agent_does_not_regress (295 ms)
+[ RUN  ] learned_policy_survives_save_and_reload
+[  OK  ] learned_policy_survives_save_and_reload (108 ms)
+[ RUN  ] learning_disabled_repeats_identically
+[  OK  ] learning_disabled_repeats_identically (0 ms)
+[ RUN  ] pattern_knowledge_transfers_between_levels
+    basics: 1 attempts with transferred patterns, 3 from scratch
+[  OK  ] pattern_knowledge_transfers_between_levels (25 ms)
+[ RUN  ] per_tick_cost_is_small
+    0.90 us per tick (observe+decide, sim included), 0.607 ms end-of-attempt update over 1184 decisions, 3.24 ms to serialise 1761 Q entries (125446 bytes)
+[  OK  ] per_tick_cost_is_small (24 ms)
+[ RUN  ] physics_calibration_learns_the_game
+    learned: Cube g=0.2200 hold=-0.2200 impulse=10.780 flip=0.00 k=0.2326 cap=15.0 floor=15.0 (n 1568/16, 0 flips, 0 tp), vx=1.2983, drift 0.0000/step
+[  OK  ] physics_calibration_learns_the_game (5 ms)
+[ RUN  ] prediction_standing_still_before_spike
+    predicted collision at step 125 (x=177.3), simulator died at step 124 (x=176.0)
+[  OK  ] prediction_standing_still_before_spike (6 ms)
+[ RUN  ] prediction_jump_timings_single_spike
+    111 timings: 106 agree, 5 uncertain, 0 false-safe, 0 false-collision
+[  OK  ] prediction_jump_timings_single_spike (15 ms)
+[ RUN  ] prediction_jump_timings_consecutive_spikes
+    91 timings (9 survivable): 85 agree, 6 uncertain, 0 false-safe, 0 false-collision
+[  OK  ] prediction_jump_timings_consecutive_spikes (19 ms)
+[ RUN  ] prediction_landing_positions
+    flat: predicted landing x=156.51 y=15.00, simulator x=157.81 y=15.00
+    block top: predicted landing x=225.32 y=45.00, simulator x=225.32 y=45.00 (press at 75)
+[  OK  ] prediction_landing_positions (8 ms)
+[ RUN  ] prediction_different_speeds
+    speed 0: vx=1.046, predicted hit step 269, simulator 269
+    speed 2: vx=1.614, predicted hit step 175, simulator 174
+    speed 4: vx=2.400, predicted hit step 118, simulator 117
+[  OK  ] prediction_different_speeds (69 ms)
+[ RUN  ] prediction_gravity_changes
+    gravity portal: change at step 115; predicted landing on the ceiling x=253.88 y=135.00, simulator x=253.88 y=135.00
+    upside down: predicted landing x=114.53 y=105.00, simulator x=114.53 y=105.00
+[  OK  ] prediction_gravity_changes (5 ms)
+[ RUN  ] prediction_overlay_matches_simulation
+[  OK  ] prediction_overlay_matches_simulation (5 ms)
+[ RUN  ] planner_alone_clears_cube_levels
+    basics  planner only: COMPLETED at 100.0%, first press at step 213; 216.5 us per physics step on average (14.8 simulations per step, 2104 evaluated steps)
+    spikes  planner only: COMPLETED at 100.0%, first press at step 213; 219.4 us per physics step on average (14.9 simulations per step, 2039 evaluated steps)
+    blocks  planner only: COMPLETED at 100.0%, first press at step 168; 289.0 us per physics step on average (15.2 simulations per step, 1674 evaluated steps)
+[  OK  ] planner_alone_clears_cube_levels (1677 ms)
+[ RUN  ] prediction_makes_learning_faster
+    basics  attempts to complete: 3 with prediction (0 collisions avoided), 3 without
+    spikes  attempts to complete: 3 with prediction (3 collisions avoided), 14 without
+    blocks  attempts to complete: 3 with prediction (5 collisions avoided), 16 without
+    ship    attempts to complete: 5 with prediction (31 collisions avoided), 32 without
+[  OK  ] prediction_makes_learning_faster (2382 ms)
+[ RUN  ] prediction_learning_survives_reload_and_stays_consistent
+[  OK  ] prediction_learning_survives_reload_and_stays_consistent (13796 ms)
+[ RUN  ] misprediction_makes_predictor_cautious
+[  OK  ] misprediction_makes_predictor_cautious (6 ms)
+[ RUN  ] prediction_is_not_trusted_before_calibration
+[  OK  ] prediction_is_not_trusted_before_calibration (1 ms)
+[ RUN  ] all_modes_calibrate_to_the_game
+    Cube   Cube g=0.2200 hold=-0.2200 impulse=10.780 flip=0.00 k=0.2326 cap=15.0 floor=15.0 (n 3924/41, 0 flips, 0 tp)
+    Ship   Ship up=0.160 down=-0.200 caps +7.5/-7.5 k=0.2326 (n 2848/2669)
+    Ball   Ball g=0.1400 hold=-0.1400 impulse=10.964 flip=-1.50 k=0.2326 cap=11.0 floor=15.0 (n 3445/0, 52 flips, 0 tp)
+    UFO    UFO g=0.1200 hold=-0.1200 impulse=6.200 flip=0.00 k=0.2326 cap=10.0 floor=15.0 (n 5637/169, 0 flips, 0 tp)
+    Wave   Wave slope=1.100 (n 5836)
+    Robot  Robot g=0.2200 hold=-0.0600 impulse=7.440 flip=0.00 k=0.2326 cap=15.0 floor=15.0 (n 4196/53, 0 flips, 0 tp)
+    Spider Spider g=0.2200 hold=-0.2200 impulse=10.964 flip=0.00 k=0.2326 cap=15.0 floor=15.0 (n 0/0, 0 flips, 89 tp)
+    Swing  Swing g=0.1200 hold=-0.1200 impulse=10.964 flip=-0.80 k=0.2326 cap=8.5 floor=15.0 (n 5091/0, 90 flips, 0 tp)
+[  OK  ] all_modes_calibrate_to_the_game (132 ms)
+[ RUN  ] all_modes_predict_32_steps_ahead
+    Cube   103 samples: mean error 0.00, max 0.00 units after 32 steps (resim drift 0.0000/step)
+    Ship   103 samples: mean error 0.00, max 0.00 units after 32 steps (resim drift 0.0000/step)
+    Ball   103 samples: mean error 0.00, max 0.00 units after 32 steps (resim drift 0.0000/step)
+    UFO    103 samples: mean error 0.00, max 0.00 units after 32 steps (resim drift 0.0000/step)
+    Wave   103 samples: mean error 0.00, max 0.00 units after 32 steps (resim drift 0.0000/step)
+    Robot  103 samples: mean error 0.00, max 0.00 units after 32 steps (resim drift 0.0000/step)
+    Spider 103 samples: mean error 0.00, max 0.00 units after 32 steps (resim drift 0.0000/step)
+    Swing  103 samples: mean error 0.00, max 0.00 units after 32 steps (resim drift 0.0000/step)
+[  OK  ] all_modes_predict_32_steps_ahead (231 ms)
+[ RUN  ] all_modes_planner_alone_clears_course
+    Cube   planner only: COMPLETED at 100.0%, 202.8 us and 13.3 simulations per step
+    Ship   planner only: COMPLETED at 100.0%, 467.4 us and 22.3 simulations per step
+    Ball   planner only: COMPLETED at 100.0%, 359.5 us and 18.4 simulations per step
+    UFO    planner only: COMPLETED at 100.0%, 440.5 us and 22.3 simulations per step
+    Wave   planner only: COMPLETED at 100.0%, 426.8 us and 22.1 simulations per step
+    Robot  planner only: COMPLETED at 100.0%, 432.8 us and 29.9 simulations per step
+    Spider planner only: COMPLETED at 100.0%, 458.8 us and 26.4 simulations per step
+    Swing  planner only: COMPLETED at 100.0%, 407.1 us and 19.7 simulations per step
+[  OK  ] all_modes_planner_alone_clears_course (6803 ms)
+[ RUN  ] mode_followup_inputs_and_cache_invalidation
+[  OK  ] mode_followup_inputs_and_cache_invalidation (124 ms)
+[ RUN  ] mode_lookahead_comparison_on_shifted_courses
+    Ship: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 291.9 -> 459.8 us/decision
+    Wave: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 279.5 -> 439.2 us/decision
+    UFO: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 269.2 -> 455.0 us/decision
+    Swing: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 274.1 -> 429.5 us/decision
+    Ball: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 406.6 -> 401.1 us/decision
+    Spider: baseline 2/3 78.1%; enhanced 3/3 100.0%; search 463.9 -> 474.0 us/decision
+    Robot: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 653.2 -> 629.7 us/decision
+[  OK  ] mode_lookahead_comparison_on_shifted_courses (33967 ms)
+[ RUN  ] all_modes_collision_predictions_are_never_falsely_safe
+    Cube   20 plans checked: 13 predicted collisions (13 confirmed), 0 falsely safe
+    Ship   126 plans checked: 2 predicted collisions (2 confirmed), 0 falsely safe
+    Ball   68 plans checked: 16 predicted collisions (16 confirmed), 0 falsely safe
+    UFO    90 plans checked: 5 predicted collisions (5 confirmed), 0 falsely safe
+    Wave   30 plans checked: 4 predicted collisions (4 confirmed), 0 falsely safe
+    Robot  18 plans checked: 12 predicted collisions (12 confirmed), 0 falsely safe
+    Spider 26 plans checked: 4 predicted collisions (4 confirmed), 0 falsely safe
+    Swing  40 plans checked: 4 predicted collisions (4 confirmed), 0 falsely safe
+[  OK  ] all_modes_collision_predictions_are_never_falsely_safe (318 ms)
+[ RUN  ] all_modes_overlay_and_agent_hook_work
+    Cube   learning with prediction: completed after 1 attempts (0 collisions avoided)
+    Ship   learning with prediction: completed after 1 attempts (0 collisions avoided)
+    Ball   learning with prediction: completed after 1 attempts (8 collisions avoided)
+    UFO    learning with prediction: completed after 1 attempts (3 collisions avoided)
+    Wave   learning with prediction: completed after 1 attempts (0 collisions avoided)
+    Robot  learning with prediction: completed after 1 attempts (0 collisions avoided)
+    Spider learning with prediction: completed after 1 attempts (10 collisions avoided)
+    Swing  learning with prediction: completed after 1 attempts (10 collisions avoided)
+[  OK  ] all_modes_overlay_and_agent_hook_work (1476 ms)
+[ RUN  ] repeated_failure_is_detected_and_the_alternative_tested
+    decision: avoiding repeated failure | Repeated failure detected: waiting failed 2 times here. Testing jumping here (earlier).
+[  OK  ] repeated_failure_is_detected_and_the_alternative_tested (0 ms)
+[ RUN  ] repeated_failure_alternative_is_vetted_by_prediction
+    press now: collision, wait: safe
+    decision: learned | Repeated failure detected: waiting failed 2 times here, but jumping here (earlier) is predicted to collide; the cause is probably earlier.
+[  OK  ] repeated_failure_alternative_is_vetted_by_prediction (6 ms)
+[ RUN  ] failure_memory_is_contextual
+[  OK  ] failure_memory_is_contextual (0 ms)
+[ RUN  ] failure_memory_breaks_a_mistake_values_alone_repeat
+    without failure memory: best x 356, 79 of 79 attempts died at exactly the same spot
+    with failure memory:    best x 3301; 14 repeated failures detected, 14 alternatives tried, 2 helped, 0 deaths on an already known mistake
+[  OK  ] failure_memory_breaks_a_mistake_values_alone_repeat (26 ms)
+[ RUN  ] credit_assignment_blames_one_decision_and_keeps_uncertainty
+    114 states: 1 blamed, 62 passed, 51 without evidence | Blamed waiting at 10.8% (failure analysis; failed 1 times here)
+[  OK  ] credit_assignment_blames_one_decision_and_keeps_uncertainty (5 ms)
+[ RUN  ] failure_memory_survives_save_and_reload
+[  OK  ] failure_memory_survives_save_and_reload (145 ms)
+[ RUN  ] memory_is_bounded
+[  OK  ] memory_is_bounded (0 ms)
+[ RUN  ] prior_reaches_unseen_states_but_never_overrides_own_experience
+[  OK  ] prior_reaches_unseen_states_but_never_overrides_own_experience (0 ms)
+[ RUN  ] physics_change_is_detected_and_corrected
+    gravity before -0.2200, after the change -0.2860 (truth -0.2860); 1 estimate(s) replaced; 32-step error 0.04
+    basics under changed physics: completed after 1 attempts (0 mispredicted deaths)
+[  OK  ] physics_change_is_detected_and_corrected (144 ms)
+[ RUN  ] experiments_replay_only_in_the_same_state
+    experiment span: 65 reference decisions (same state), 4 tested, 23 decided normally
+[  OK  ] experiments_replay_only_in_the_same_state (1 ms)
+[ RUN  ] newer_evidence_overrides_the_best_run
+    best-run press at x=310: q -2.57/8.27, passes 0/13, fails 0/0, streak 0/0
+    with new evidence against it: not pressed (alternative tested)
+[  OK  ] newer_evidence_overrides_the_best_run (26 ms)
+[ RUN  ] learning_metrics_regression
+    level   pred  attempts   regr  repeat  detected    tried  helped vetoed  known  blamed
+    basics  no           3      0       0         0        0       0      0      0    2/2  
+    basics  no           3      0       0         0        0       0      0      0    2/2  
+    basics  no           3      0       0         0        0       0      0      0    2/2  
+    basics  yes          1      0       0         0        0       0      0      0    0/0  
+    basics  yes          1      0       0         0        0       0      0      0    0/0  
+    basics  yes          1      0       0         0        0       0      0      0    0/0  
+    spikes  no          14      2       0         0        0       0      0      0   13/13 
+    spikes  no          14      2       0         0        0       0      0      0   13/13 
+    spikes  no          14      2       0         0        0       0      0      0   13/13 
+    spikes  yes          1      0       0         0        0       0      0      0    0/0  
+    spikes  yes          1      0       0         0        0       0      0      0    0/0  
+    spikes  yes          1      0       0         0        0       0      0      0    0/0  
+    blocks  no          16      0       0         0        0       0      0      0   15/15 
+    blocks  no          15      0       0         0        0       0      0      0   14/14 
+    blocks  no          12      0       0         0        0       0      0      0   11/11 
+    blocks  yes          1      0       0         0        0       0      0      0    0/0  
+    blocks  yes          1      0       0         0        0       0      0      0    0/0  
+    blocks  yes          1      0       0         0        0       0      0      0    0/0  
+    ship    no          30      0       0         3        3       0      0      0   28/29 
+    ship    no          32      0       0         3        3       0      0      0   30/31 
+    ship    no          32      0       0         3        3       0      0      0   30/31 
+    ship    yes          3      0       0         0        0       0      0      0    2/2  
+    ship    yes          3      0       0         0        0       0      0      0    2/2  
+    ship    yes          3      0       0         0        0       0      0      0    2/2  
+    (repeat = deaths on a decision already known to fail there; known = known-good overrides used)
+[  OK  ] learning_metrics_regression (5631 ms)
+[ RUN  ] control_A_cube_waiting_into_a_spike_jumps_instead
+    cube, policy 'never jump': completed at x=721; input overridden on 2 ticks (first at tick 297, 0 after the danger), 0 overlay / 0 record mismatches
+[  OK  ] control_A_cube_waiting_into_a_spike_jumps_instead (81 ms)
+[ RUN  ] control_A2_cube_jumping_into_a_spike_waits_instead
+    cube, policy 'always jump': completed at x=420; input overridden on 213 ticks (first at tick 0, 0 after the danger), 0 overlay / 0 record mismatches
+[  OK  ] control_A2_cube_jumping_into_a_spike_waits_instead (20 ms)
+[ RUN  ] control_B_ship_holding_into_ceiling_spikes_releases_in_time
+    ship, policy 'hold' toward ceiling spikes: completed at x=1200; input overridden on 100 ticks (first at tick 455, 0 after the danger), 0 overlay / 0 record mismatches
+[  OK  ] control_B_ship_holding_into_ceiling_spikes_releases_in_time (567 ms)
+[ RUN  ] control_C_ship_flying_low_into_a_wall_climbs
+    ship, policy 'release' toward a wall: completed at x=1200; input overridden on 61 ticks (first at tick 465, 0 after the danger), 0 overlay / 0 record mismatches
+[  OK  ] control_C_ship_flying_low_into_a_wall_climbs (413 ms)
+[ RUN  ] control_C2_ship_through_a_gap
+    ship, alternating policy through a gap: completed at x=1351; input overridden on 62 ticks (first at tick 120, 0 after the danger), 0 overlay / 0 record mismatches
+[  OK  ] control_C2_ship_through_a_gap (500 ms)
+[ RUN  ] control_D_stale_prediction_cannot_authorise_the_old_action
+    far: wait possible for 160 steps | near, same tick: 18 steps; path starts at x=201.3 (state x=200.0)
+[  OK  ] control_D_stale_prediction_cannot_authorise_the_old_action (8 ms)
+[ RUN  ] control_E_no_viable_alternative_is_reported_honestly
+    press collision (hit 6), release collision (hit 6) | NO SAFE OPTION | No safe option: release collides in 7, press in 7 steps; executing release (collides later)
+    overlay: RELEASE - UNSAFE, hit in 7 - NO SAFE OPTION
+[  OK  ] control_E_no_viable_alternative_is_reported_honestly (6 ms)
+[ RUN  ] control_cost_per_step_with_safety_layer
+    Cube   completed: 41 us and 1.7 simulations per physics step (2069 steps; 1.0% of a core at 1x, 4% at 4x)
+    Ship   completed: 84 us and 4.5 simulations per physics step (2069 steps; 2.0% of a core at 1x, 8% at 4x)
+    Wave   completed: 78 us and 4.3 simulations per physics step (2069 steps; 1.9% of a core at 1x, 7% at 4x)
+    Spider completed: 49 us and 3.3 simulations per physics step (2069 steps; 1.2% of a core at 1x, 5% at 4x)
+[  OK  ] control_cost_per_step_with_safety_layer (591 ms)
+[ RUN  ] control_H_learning_still_works_with_the_safety_layer
+    ship    with prediction: completed after 3 attempts, 1449 states with evidence
+    blocks  with prediction: completed after 1 attempts, 989 states with evidence
+[  OK  ] control_H_learning_still_works_with_the_safety_layer (1345 ms)
+[ RUN  ] decision_A_no_unnecessary_jump_by_the_planner
+    planner over flat blocks: completed, 0 presses
+[  OK  ] decision_A_no_unnecessary_jump_by_the_planner (136 ms)
+[ RUN  ] decision_B_policy_jump_dropped_when_not_needed
+    policy 'always jump' over flat blocks: completed, 0 presses executed, 149 proposed presses dropped | No jump needed: nothing ahead within the prediction horizon; learned proposed a jump
+[  OK  ] decision_B_policy_jump_dropped_when_not_needed (148 ms)
+[ RUN  ] decision_C_jumps_when_needed_and_only_then
+    policy 'always jump' on spikes: completed, 9 presses executed (9 spike groups), 206 proposed presses dropped
+    planner on spikes: completed, 9 presses
+[  OK  ] decision_C_jumps_when_needed_and_only_then (561 ms)
+[ RUN  ] decision_D_learning_removes_a_harmful_jump
+    hanging spikes: completed after 4 attempts; 'remove the press' experiment used
+[  OK  ] decision_D_learning_removes_a_harmful_jump (22 ms)
+[ RUN  ] decision_E_unreliable_model_is_detected_and_not_obeyed
+    jittery game: drift 0.211/step, trusted no; 191 decisions trusted, 139 untrusted | Prediction not used: not trusted: the model drifts 0.211 units/step from the real game (limit 0.15)
+    overlay: RELEASE - UNSAFE, hit in 3 - prediction not trusted, not used
+[  OK  ] decision_E_unreliable_model_is_detected_and_not_obeyed (204 ms)
+[ RUN  ] decision_F_hitbox_mismatch_does_not_destroy_trust
+    walking 1 unit under spikes the model sees 2 units bigger: alive, drift 0.000 -> 0.000/step, trusted yes
+[  OK  ] decision_F_hitbox_mismatch_does_not_destroy_trust (14 ms)
+[ RUN  ] decision_G_input_latency_is_measured_and_corrected
+    1-step input delay: estimated latency 1 (re-simulation error 1.51 / 0.00 / 1.55 for 0/1/2, 53 windows); spikes completed after 1 attempts
+[  OK  ] decision_G_input_latency_is_measured_and_corrected (201 ms)
+[ RUN  ] step_clock_counts_physics_steps
+[  OK  ] step_clock_counts_physics_steps (0 ms)
+[ RUN  ] game_like_frame_gaps_keep_predictions_trusted
+    one tick per call (old): x speed 2.0772 (true 1.2982), drift 0.186/step, trusted no
+    real steps (StepClock):  x speed 1.2983 (true 1.2982), drift 0.000/step, trusted yes, 1.74 steps per call
+    basics  at 1-3 steps per call: completed after 1 attempts (388 decisions with trusted prediction, 0 untrusted)
+    spikes  at 1-3 steps per call: completed after 1 attempts (378 decisions with trusted prediction, 0 untrusted)
+    blocks  at 1-3 steps per call: completed after 1 attempts (301 decisions with trusted prediction, 0 untrusted)
+[  OK  ] game_like_frame_gaps_keep_predictions_trusted (309 ms)
+[ RUN  ] plan_early_landing_cancels_the_obsolete_plan
+    completed; first invalidation at step 248: "Landing detected earlier than expected (landed at y=45.0, planned airborne at y=43.6)", 2 pending action(s) cancelled; replanned in the same step: yes, new plan from the landed state: yes; old-plan inputs executed afterwards: 0; 174 decisions followed a plan
+    panel: Landing detected earlier than expected (landed at y=45.0, planned airborne at y=45.0) - cancelling 2 pending actions; replanning from the actual state
+[  OK  ] plan_early_landing_cancels_the_obsolete_plan (56 ms)
+[ RUN  ] plan_valid_plan_is_followed_without_new_searches
+    spikes: completed, 9 presses, 1364 decisions followed a valid plan, 143 plans made, 0 invalidated, 1.8 simulations per step
+[  OK  ] plan_valid_plan_is_followed_without_new_searches (106 ms)
+[ RUN  ] plan_gravity_change_invalidates_pending_actions
+    gravity portal: completed; plan invalidated by the gravity change: yes
+[  OK  ] plan_gravity_change_invalidates_pending_actions (44 ms)
+[ RUN  ] optimiser_prefers_the_jump_that_sets_up_the_next_one
+    spikes at 10 and 13.0: earliest safe first jump in 7 steps, best in 17 (score 1001.6); search chose wait in 18, second press 0 after landing, score 1000.7, stage two jumps, 71 simulations
+    spikes at 10 and 13.5: earliest safe first jump in 7 steps, best in 17 (score 1002.0); search chose wait in 18, second press 0 after landing, score 1000.7, stage two jumps, 71 simulations
+    spikes at 10 and 14.0: earliest safe first jump in 7 steps, best in 17 (score 1002.0); search chose wait in 18, second press 0 after landing, score 1000.7, stage two jumps, 71 simulations
+    spikes at 10 and 14.5: earliest safe first jump in 7 steps, best in 17 (score 1002.0); search chose wait in 18, second press 0 after landing, score 1000.7, stage two jumps, 71 simulations
+[  OK  ] optimiser_prefers_the_jump_that_sets_up_the_next_one (292 ms)
+[ RUN  ] optimiser_uses_learned_timing_without_forcing_it
+    no hint: first safe candidate after 8 simulations; good hint: after 4, chosen from the hint: yes
+    wrong hint (press in 3): seeded yes, chosen from the hint no, chosen press in 20 (safe)
+[  OK  ] optimiser_uses_learned_timing_without_forcing_it (6 ms)
+[ RUN  ] optimiser_stays_within_its_budget
+    budget 40: blocks completed, at most 42 simulations in one decision
+[  OK  ] optimiser_stays_within_its_budget (156 ms)
+[ RUN  ] optimiser_resolution_follows_model_and_decision_rate
+    1.74 steps per decision -> timing resolution 2 step(s)
+[  OK  ] optimiser_resolution_follows_model_and_decision_rate (10 ms)
+[ RUN  ] learned_sequence_is_not_replayed_in_a_different_state
+    experiment "Added a press 1.6 blocks before the obstacle at 10.8%": 1 cancelled (Experiment cancelled: the state at its first changed cell differs from the reference attempt (Added a press 1.6 blocks before the obstacle at 10.8%)), 0 forced steps played
+[  OK  ] learned_sequence_is_not_replayed_in_a_different_state (1 ms)
+[ RUN  ] wrong_saved_x_speed_is_corrected
+    saved 1.5579/step -> after loading: 1.2982 (true 1.2982)
+    learned with one tick per call: 2.0772; after real steps: 1.2983 (true 1.2982)
+[  OK  ] wrong_saved_x_speed_is_corrected (8 ms)
+[ RUN  ] situation_descriptor_is_relative_and_transferable
+    double spike, landing space 4+ blocks | spike row, landing space 4+ blocks | block 1.0 blocks high, landing space 4+ blocks
+[  OK  ] situation_descriptor_is_relative_and_transferable (1 ms)
+[ RUN  ] strategy_library_tracks_provenance_and_negative_transfer
+[  OK  ] strategy_library_tracks_provenance_and_negative_transfer (0 ms)
+[ RUN  ] strategy_memory_persists_and_resets_separately
+[  OK  ] strategy_memory_persists_and_resets_separately (1813 ms)
+[ RUN  ] transfer_to_unseen_levels
+    -- without trajectory prediction (learning only) --
+    trained on 6 levels: 23 situations, 114 strategy records
+    none                                         first attempt:  11.8% mean progress, 0/8 completed | attempts to complete: mean   50.8 (1 not completed)
+    general knowledge                            first attempt:  51.5% mean progress, 1/8 completed | attempts to complete: mean   12.8
+    general knowledge + strategy library         first attempt:  74.3% mean progress, 4/8 completed | attempts to complete: mean    1.6
+    strategy library only                        first attempt:  74.3% mean progress, 4/8 completed | attempts to complete: mean    1.6
+    -- with trajectory prediction --
+    trained on 6 levels: 22 situations, 52 strategy records
+    none                                         first attempt:  11.8% mean progress, 0/8 completed | attempts to complete: mean    3.0
+    general knowledge                            first attempt: 100.0% mean progress, 8/8 completed | attempts to complete: mean    1.0
+    general knowledge + strategy library         first attempt: 100.0% mean progress, 8/8 completed | attempts to complete: mean    1.0
+    strategy library only                        first attempt: 100.0% mean progress, 8/8 completed | attempts to complete: mean    1.0
+[  OK  ] transfer_to_unseen_levels (17751 ms)
+[ RUN  ] negative_transfer_is_detected_and_contained
+    delayed input: completed after 12 attempts with the library, 10 without | 87 situations met, 33 failures recorded on this level, 3 strategies rejected for it (0 still proposed here, 0 proposed on other levels)
+[  OK  ] negative_transfer_is_detected_and_contained (1529 ms)
+[ RUN  ] transfer_uses_relative_geometry_not_positions
+    shifted copy: 17 situations before, 17 after; first attempt 71% (18 groups met, 17 known)
+[  OK  ] transfer_uses_relative_geometry_not_positions (149 ms)
+[ RUN  ] strategies_guide_the_search_but_never_dictate
+    correct strategies: 9 seeded, 8 confirmed, 1 rejected | wrong strategies: 9 seeded, 1 confirmed, 8 rejected; first attempt completed / completed
+      New level detected - using previously learned spike-clearing strategy (jump, press 13 steps before contact; worked 3 times, on 2 other levels) - confirmed by simulation
+      New level detected - using previously learned spike-clearing strategy (jump, press 94 steps before contact; worked 3 times, on 3 other levels) - confirmed by simulation
+      Using previously learned spike-clearing strategy (jump, press 13 steps before contact; worked 4 times, on 2 other levels) - confirmed by simulation
+      New level detected - using previously learned spike-clearing strategy (jump, press 34 steps before contact; worked 5 times, on 2 other levels) - confirmed by simulation
+      New level detected - using previously learned block-climbing strategy (jump, press 40 steps before contact; worked 9 times, on 4 other levels) - confirmed by simulation
+      Using previously learned block-climbing strategy (jump, press 40 steps before contact; worked 10 times, on 4 other levels) - confirmed by simulation
+[  OK  ] strategies_guide_the_search_but_never_dictate (2137 ms)
+[ RUN  ] transfer_cost_per_step_is_small
+    307.9 us per decision without the library, 295.4 with it
+[  OK  ] transfer_cost_per_step_is_small (6315 ms)
+[ RUN  ] level_map_extracts_the_whole_level
+    29 objects indexed in 0.034 ms; 29 beyond the 480-unit window at the start; last object at x=4740 found: yes; 27 obstacles + 2 physics events over the whole level
+[  OK  ] level_map_extracts_the_whole_level (0 ms)
+[ RUN  ] level_analysis_finds_sequences_and_physics_changes
+    13 objects (8 hazards, 3 blocks, 2 portals, 0 not simulated, 0 moved by triggers, 0 rotated boxes); x 0 to 2400; 3 sections (2 with obstacle groups, 1 checked for vertical room only, 0 narrow passages); 6 obstacle groups (0 with under 2 blocks of landing space; library: 0 known, 0 similar); physics changes: 1 speed, 1 gravity, 0 mode, 0 size; 0.06 ms
+      group 0: x 370-380, single spike, landing space 2-4 blocks, gap before 370, landing space 100, headroom open, difficulty 0.5
+      group 1: x 480-540, block 1.0 blocks high, landing space 2-4 blocks, gap before 100, landing space 100, headroom open, difficulty 0.5
+      group 2: x 640-680, double spike, landing space 2-4 blocks, gap before 100, landing space 111, headroom open, difficulty 1.0
+      group 3: x 790-860, spike row, landing space 4+ blocks, gap before 111, landing space 141, headroom open, difficulty 1.5
+      group 4: x 1000-1010, single spike under something, landing space 4+ blocks, gap before 141, landing space 300, headroom 60, difficulty 2.5
+      group 5: x 1450-1460, single spike, landing space 4+ blocks, gap before 236, landing space 300, headroom open, difficulty 0.5
+[  OK  ] level_analysis_finds_sequences_and_physics_changes (0 ms)
+[ RUN  ] strategic_planner_handles_sequences_the_local_planner_does_not
+    16 dense sequence levels, first attempt: controller alone 11 completed (85.1% mean progress), with strategic planning 13 completed (89.9%)
+    250 sequence plans (78 chose a different first press than the locally best one); 2188 us per plan on average, 7729 us at most
+[  OK  ] strategic_planner_handles_sequences_the_local_planner_does_not (7158 ms)
+[ RUN  ] planner_takes_no_unnecessary_jump
+    spike + hanging spikes: completed, 1 press(es); the first sequence plan has 1 press(es)
+    hanging spikes only: completed, 0 press(es)
+[  OK  ] planner_takes_no_unnecessary_jump (40 ms)
+[ RUN  ] physics_transition_changes_the_plan
+    with the 3x portal: plan made 61 units before it, first press in 58 steps (without the portal: 115); largest position error after the portal 0.00 units; completed
+[  OK  ] physics_transition_changes_the_plan (44 ms)
+[ RUN  ] dynamic_obstacle_updates_the_map_and_the_plan
+    refreshed map: completed (3 presses), version 1 -> 2, plan: "the level geometry changed (a moving or toggled object) - replanning the sequence" | stale map: DIED at x=656
+[  OK  ] dynamic_obstacle_updates_the_map_and_the_plan (54 ms)
+[ RUN  ] strategic_plan_is_replanned_when_the_state_diverges
+    completed; strategic: 1 plans, 1 invalidated: "state left the strategic plan (height +2.5, in the air, planned on the ground) - replanning the sequence from the actual state"; live plans invalidated: 22
+[  OK  ] strategic_plan_is_replanned_when_the_state_diverges (41 ms)
+[ RUN  ] sequence_strategy_transfers_to_another_level
+    on another level: single spike, landing space 4+ blocks (sequence match, lead 37 steps, worked 5 times); first attempt 100% with the library, 30% without
+[  OK  ] sequence_strategy_transfers_to_another_level (25 ms)
+[ RUN  ] level_analysis_and_planning_cost
+      1000 objects: index 0.18 ms, whole-level analysis 0.45 ms (63 groups), window query 2.1 us
+     10000 objects: index 2.50 ms, whole-level analysis 4.32 ms (590 groups), window query 2.2 us
+     50000 objects: index 10.89 ms, whole-level analysis 24.30 ms (2981 groups), window query 2.3 us
+    per physics step (simulator, prediction and agent included): 43.2 us without strategic planning, 116.3 us with it
+[  OK  ] level_analysis_and_planning_cost (2710 ms)
+[ RUN  ] understanding_overlay_shows_the_executed_plan
+    completed; overlay: 220 extracted boxes, 168 inferred outlines, 1956 predicted segments; 7 of 10 presses at a planned press position; overview strip 41 marks
+[  OK  ] understanding_overlay_shows_the_executed_plan (215 ms)
+[ RUN  ] overlay_resets_metadata_and_keeps_selected_endpoint
+[  OK  ] overlay_resets_metadata_and_keeps_selected_endpoint (0 ms)
+[ RUN  ] followed_plan_overlay_keeps_tail_and_landing_height
+[  OK  ] followed_plan_overlay_keeps_tail_and_landing_height (0 ms)
+[ RUN  ] full_level_map_tracks_small_motion_and_reactivation
+[  OK  ] full_level_map_tracks_small_motion_and_reactivation (0 ms)
+[ RUN  ] orbs_are_detected_and_classified
+    8 orbs: yellow orb ... gravity dash orb (dash direction -45 deg)
+[  OK  ] orbs_are_detected_and_classified (0 ms)
+[ RUN  ] orb_effect_is_learned_and_predicted_after_activation
+    yellow orb  learned vy  11.20; path error before calibration   9.67, after  0.00 units (160 steps compared)
+    pink orb    learned vy   7.90; path error before calibration   5.68, after  0.00 units (160 steps compared)
+    red orb     learned vy  14.60; path error before calibration  17.44, after  0.00 units (163 steps compared)
+    blue orb    learned vy  -3.30 (flips gravity); path error before calibration  12.09, after  0.00 units (160 steps compared)
+    green orb   learned vy  11.00 (flips gravity); path error before calibration   0.00, after  0.00 units (160 steps compared)
+    black orb   learned vy -17.60; path error before calibration   0.00, after  0.00 units (160 steps compared)
+[  OK  ] orb_effect_is_learned_and_predicted_after_activation (65 ms)
+[ RUN  ] orb_activation_is_compared_with_skipping_it
+    hanging spikes over a yellow orb: activate collision (hits above) (16 timings), skip safe -> skip
+    spike pit with a yellow orb: activate safe, skip collision; planner alone COMPLETED
+[  OK  ] orb_activation_is_compared_with_skipping_it (267 ms)
+[ RUN  ] unsafe_post_orb_trajectory_is_detected
+    red orb into a spike row: activation clear at x=379, then collision (collision at x=488)
+[  OK  ] unsafe_post_orb_trajectory_is_detected (11 ms)
+[ RUN  ] agent_uses_an_orb_when_it_is_needed
+    completed; orbs seen 1, activations planned 1, confirmed 1, missed 0
+      Yellow orb detected - evaluating activation and skip options
+      yellow orb selected: activation safe, skipping would be collision in 93 steps
+      yellow orb activation confirmed by the game
+[  OK  ] agent_uses_an_orb_when_it_is_needed (61 ms)
+[ RUN  ] dash_orb_movement_is_predicted
+    dash held 10 steps: predicted end at step 10, actual 10; largest position error 0.01 units over 200 steps
+    dash held 24 steps: predicted end at step 24, actual 24; largest position error 0.00 units over 200 steps
+    dash held 40 steps: predicted end at step 40, actual 40; largest position error 0.00 units over 200 steps
+    model: dash x speed x1.00, slope x1.00, end velocity 2.00 (known: yes)
+[  OK  ] dash_orb_movement_is_predicted (10 ms)
+[ RUN  ] dash_termination_and_movement_after_it
+    dash limited to 0.05 s, held 60 steps: predicted end at step 12, actual 12; largest error 0.00 units
+[  OK  ] dash_termination_and_movement_after_it (9 ms)
+[ RUN  ] planner_handles_orbs_within_obstacle_sequences
+    completed at 100%; orb activations planned 2, confirmed 2; 14 sequence plans
+      Yellow orb detected - evaluating activation and skip options
+      yellow orb selected: activation safe, skipping would be collision in 96 steps
+      yellow orb activation confirmed by the game
+      Dash orb detected - evaluating activation and skip options
+      Orb activation predicted to collide with an obstacle in 197 steps - testing alternative timing (28 timings simulated)
+      Dash orb selected - evaluating post-dash landing: lands at x=1130, uncertain
+      dash orb activation confirmed by the game
+[  OK  ] planner_handles_orbs_within_obstacle_sequences (364 ms)
+[ RUN  ] obsolete_orb_actions_are_cancelled
+    activation did not happen: noticed at step 378, replanned in the same step: yes; "Orb activation not confirmed (yellow orb expected 2 steps ago) - replanning from actual player state"
+[  OK  ] obsolete_orb_actions_are_cancelled (61 ms)
+[ RUN  ] orb_model_is_corrected_when_the_game_differs
+    learned yellow orb vy 11.20 -> 12.32 (game: 13.44); last error +1.34
+[  OK  ] orb_model_is_corrected_when_the_game_differs (638 ms)
+[ RUN  ] orb_strategy_transfers_to_another_level
+    27 orb-strategy successes recorded in training; on another level, first attempt 100% with the library, 47% without (the pit ends at 75%)
+[  OK  ] orb_strategy_transfers_to_another_level (1767 ms)
+[ RUN  ] orb_overlay_shows_the_selected_interaction
+    completed; 28 decisions drawn with the orb activation selected, 4 with it skipped, 0 inconsistencies; activation happened where drawn: yes
+[  OK  ] orb_overlay_shows_the_selected_interaction (59 ms)
+[ RUN  ] upside_down_cube_contact_is_not_a_ceiling
+[  OK  ] upside_down_cube_contact_is_not_a_ceiling (0 ms)
+[ RUN  ] diag_level_prediction
+[  OK  ] diag_level_prediction (0 ms)
+[ RUN  ] diag_level
+[  OK  ] diag_level (0 ms)
+
+112 tests, 2705 checks, 0 failures

@@ -1,0 +1,36 @@
+[0/1] Re-running CMake...
+-- Configuring done (0.1s)
+-- Generating done (0.0s)
+-- Build files have been written to: D:/GeodeDev/build-tests-rel
+[1/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\OrbPhysics.cpp.obj
+[2/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\StepClock.cpp.obj
+[3/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\Types.cpp.obj
+[4/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\FailureAnalyzer.cpp.obj
+[5/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\Physics.cpp.obj
+[6/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\Situation.cpp.obj
+[7/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\PlanManager.cpp.obj
+[8/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\Strategy.cpp.obj
+[9/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\Overlay.cpp.obj
+[10/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\LevelMap.cpp.obj
+[11/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\LevelAnalysis.cpp.obj
+[12/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\Predictor.cpp.obj
+[13/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\StrategyStorage.cpp.obj
+[14/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\StrategicPlanner.cpp.obj
+[15/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\Storage.cpp.obj
+[16/20] Building CXX object core\CMakeFiles\aigd_core.dir\src\Agent.cpp.obj
+[17/20] Linking CXX static library core\aigd_core.lib
+[18/20] Building CXX object CMakeFiles\aigd_tests.dir\tests.cpp.obj
+[19/20] Linking CXX executable aigd_tests.exe
+[ RUN  ] mode_followup_inputs_and_cache_invalidation
+[  OK  ] mode_followup_inputs_and_cache_invalidation (25 ms)
+[ RUN  ] mode_lookahead_comparison_on_shifted_courses
+    Ship: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 80.8 -> 123.4 us/decision
+    Wave: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 75.3 -> 121.7 us/decision
+    UFO: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 73.0 -> 126.2 us/decision
+    Swing: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 69.9 -> 111.1 us/decision
+    Ball: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 103.7 -> 102.3 us/decision
+    Spider: baseline 2/3 78.1%; enhanced 3/3 100.0%; search 123.3 -> 127.5 us/decision
+    Robot: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 171.8 -> 175.9 us/decision
+[  OK  ] mode_lookahead_comparison_on_shifted_courses (9002 ms)
+
+2 tests, 31 checks, 0 failures

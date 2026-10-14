@@ -1,5 +1,7 @@
 # AI Geode
 
+**v0.6.3:** mode-specific follow-up inputs, longer flying-mode lookahead, finer robot holds and prediction-cache fixes. See [mode comparison and validation](V063-VALIDATION.md).
+
 **v0.6.2:** a three-tab GD-style control popup and compact, screen-bounded HUD. See [UI validation notes](V062-VALIDATION.md).
 
 **v0.6.1:** trajectory label/landing fixes, complete plan tails, reliable elapsed-tick map refresh, and bounded whole-level change audits. See [validation notes](V061-VALIDATION.md).

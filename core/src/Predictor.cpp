@@ -222,6 +222,7 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
     out.landStep = -1;
     int32_t secondPress = -1;   // plan step of the second press (set at the first landing)
     int32_t thirdPress = -1;    // ... of the third (set at the landing after the second jump)
+    int32_t activeDuration = plan.holdFor;
     int jumps = 0;              // take-offs so far
     bool jumped = false;
     // After an orb activation the path is followed until it lands (or 200
@@ -254,12 +255,18 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
                 effects = 0;
                 nextPress = plan.repeatEvery > 0 ? ps + plan.repeatEvery : -1;
             }
+            if (plan.followAt >= 0 && ps == plan.followAt) {
+                pressActive = true;
+                pressStart = ps;
+                effects = 0;
+                activeDuration = plan.followHold;
+            }
             if (plan.orbPressAt >= 0 && ps == plan.orbPressAt) orbPressUntil = ps + std::max(2, plan.orbHoldFor);
             if (pressActive) {
                 int32_t heldFor = ps - pressStart;
-                if (plan.holdFor > 0 && heldFor >= plan.holdFor) pressActive = false;
-                else if (plan.holdFor == 0 && tapRelease && heldFor >= 2) pressActive = false;
-                else if (plan.holdFor == 0 && !tapRelease && effects >= target && heldFor >= 2) pressActive = false;
+                if (activeDuration > 0 && heldFor >= activeDuration) pressActive = false;
+                else if (activeDuration == 0 && tapRelease && heldFor >= 2) pressActive = false;
+                else if (activeDuration == 0 && !tapRelease && effects >= target && heldFor >= 2) pressActive = false;
             }
             hold = pressActive || ps < orbPressUntil;
         }
@@ -622,7 +629,8 @@ float Predictor::score(PredictedPath const& p) const {
 
 bool Predictor::sameState(Observation const& obs, bool holding) const {
     return obs.tick == m_adviceTick && holding == m_adviceHolding && obs.x == m_stateX && obs.y == m_stateY && obs.vy == m_stateVy &&
-           obs.mode == m_computedMode && obs.onGround == m_stateGround && obs.upsideDown == m_stateFlipped;
+           obs.mode == m_computedMode && obs.onGround == m_stateGround && obs.upsideDown == m_stateFlipped &&
+           obs.speedClass() == m_stateSpeed && obs.mini == m_stateMini && obs.geometryVersion == m_stateGeometry;
 }
 
 bool Predictor::offPredictedPath(Observation const& obs) const {
@@ -688,7 +696,8 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     // (16 steps: several times the time an input needs to take effect)
     bool const danger = m_advice.outcome(ex) != Certainty::Safe || m_advice.keepForSafe(ex) < 16;
     if (allowReuse && m_advice.valid && obs.tick > m_adviceTick && holding == m_adviceHolding && obs.mode == m_computedMode && !imminent &&
-        !danger && holding == m_executedPress && !offPredictedPath(obs)) {
+        !danger && obs.speedClass() == m_stateSpeed && obs.mini == m_stateMini && obs.geometryVersion == m_stateGeometry &&
+        holding == m_executedPress && !offPredictedPath(obs)) {
         // (not with an orb ahead: in the air, a press can activate it)
         bool orbAhead = false;
         for (auto const& o : obs.orbs) orbAhead = orbAhead || (!o.used && o.r > obs.x - 15.f);
@@ -714,6 +723,9 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     m_adviceTick = obs.tick;
     m_computedTick = obs.tick;
     m_computedMode = obs.mode;
+    m_stateSpeed = obs.speedClass();
+    m_stateMini = obs.mini;
+    m_stateGeometry = obs.geometryVersion;
     m_adviceHolding = holding;
     m_advice.computedTick = obs.tick;
     m_budgetNow = m_budget;
@@ -729,16 +741,16 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     m_never = PredictedPath{};
     m_press = PredictedPath{};
     m_release = PredictedPath{};
-    if (!supports(obs.mode) || obs.obstacles.empty()) return m_advice;
+    if (!supports(obs.mode) || (obs.obstacles.empty() && obs.orbs.empty() && !continuousControl(obs.mode) && !tapControl(obs.mode))) return m_advice;
 
     SimStart s = startFrom(obs, holding);
     int const savedHorizon = m_horizon;
     if (extend > m_horizon && (s.mode == GameMode::Cube || s.mode == GameMode::Robot)) m_horizon = extend;
     // flying modes: a shorter look-ahead (they re-plan every couple of steps anyway)
-    if (continuousControl(s.mode) || tapControl(s.mode)) m_horizon = std::min(m_horizon, 120);
+    if (continuousControl(s.mode) || tapControl(s.mode)) m_horizon = std::min(m_horizon, m_modeLookahead ? 180 : 120);
 
     float const reach = s.x + static_cast<float>(m_horizon) * m_model.vxPerTick(s.speedClass) + kNear;
-    bool relevant = false;
+    bool relevant = continuousControl(s.mode) || tapControl(s.mode) || !obs.orbs.empty();
     for (auto const& o : obs.obstacles) {
         if (o.kind == Obstacle::Kind::Uncertain) continue;
         if (o.l < reach && o.r > s.x - 20.f) {
@@ -764,7 +776,7 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
             press({0, 0, 0, true});
             break;
         case GameMode::Robot:
-            for (int d : {0, 12, 30, 60}) press({0, d, 0, false});
+            for (int d : {0, 4, 8, 12, 18, 30, 45, 60}) press({0, d, 0, false});
             break;
         case GameMode::Ship:
         case GameMode::Wave:
@@ -831,7 +843,8 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     // candidate, and only chosen if they score best.
     auto samePlan = [](Plan const& a, Plan const& b) {
         return a.pressAt == b.pressAt && a.holdFor == b.holdFor && a.repeatEvery == b.repeatEvery && a.rejump == b.rejump &&
-               a.secondAt == b.secondAt && a.thirdAt == b.thirdAt && a.orbPressAt == b.orbPressAt && a.orbHoldFor == b.orbHoldFor;
+               a.secondAt == b.secondAt && a.thirdAt == b.thirdAt && a.orbPressAt == b.orbPressAt && a.orbHoldFor == b.orbHoldFor &&
+               a.followAt == b.followAt && a.followHold == b.followHold;
     };
     for (int i = 0; i < nSeeds; ++i) {
         Plan const& p = seeds[static_cast<size_t>(i)];
@@ -908,6 +921,37 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
         evaluate(s, span, p, m_tmp, m_release, haveRelease, 0);
     }
     m_advice.stage = nRefine > 0 ? SearchStage::Refined : SearchStage::Coarse;
+
+    // Independently timed follow-up inputs, not a fixed repeating rhythm.
+    // Try both immediate-input branches and score the full simulated path.
+    // The ordinary candidates remain available; this cannot lower their score.
+    if (m_modeLookahead && s.mode != GameMode::Cube && s.mode != GameMode::Robot && !m_advice.budgetHit &&
+        m_press.outcome != Certainty::Safe && m_release.outcome != Certainty::Safe) {
+        Plan const bases[] = {m_release.plan, m_press.plan};
+        int const remaining = std::min(32, std::max(0, m_budgetNow - m_advice.simulations));
+        int attempted = 0;
+        for (int gap : {4, 8, 16, 24, 40, 64, 96, 128}) {
+            for (int branch = 0; branch < 2 && attempted < remaining; ++branch) {
+                Plan p = bases[branch];
+                if (p.pressAt < 0) p.pressAt = branch ? 0 : std::max(1, res);
+                p.repeatEvery = 0;
+                // Release before a second tap; continuous modes evaluate a
+                // finite ascent/descent interval followed by another hold.
+                if (continuousControl(s.mode) && p.holdFor <= 0) p.holdFor = 12;
+                int firstDuration = p.holdFor > 0 ? p.holdFor : 2;
+                p.followAt = p.pressAt + firstDuration + gap;
+                if (p.followAt >= m_horizon) continue;
+                for (int duration : {2, 16}) {
+                    if (attempted >= remaining) break;
+                    p.followHold = continuousControl(s.mode) ? duration : 0;
+                    evaluate(s, span, p, m_tmp, branch ? m_press : m_release,
+                             branch ? havePress : haveRelease, branch);
+                    ++attempted;
+                    if (!continuousControl(s.mode)) break;
+                }
+            }
+        }
+    }
 
     // ---- Consecutive obstacles: a second jump after the first landing ----
     // A plan whose first jump lands and then runs into the next obstacle gets

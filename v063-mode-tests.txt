@@ -1,0 +1,15 @@
+[1/2] Building CXX object CMakeFiles\aigd_tests.dir\tests.cpp.obj
+[2/2] Linking CXX executable aigd_tests.exe
+[ RUN  ] mode_followup_inputs_and_cache_invalidation
+[  OK  ] mode_followup_inputs_and_cache_invalidation (124 ms)
+[ RUN  ] mode_lookahead_comparison_on_shifted_courses
+    Ship: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 333.3 -> 894.2 us/decision
+    Wave: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 296.2 -> 796.4 us/decision
+    UFO: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 286.7 -> 597.8 us/decision
+    Swing: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 277.4 -> 624.6 us/decision
+    Ball: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 407.9 -> 615.3 us/decision
+    Spider: baseline 2/3 78.1%; enhanced 3/3 100.0%; search 485.4 -> 742.8 us/decision
+    Robot: baseline 3/3 100.0%; enhanced 3/3 100.0%; search 680.5 -> 667.9 us/decision
+[  OK  ] mode_lookahead_comparison_on_shifted_courses (44879 ms)
+
+2 tests, 31 checks, 0 failures
