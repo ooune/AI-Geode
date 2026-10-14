@@ -5,6 +5,8 @@
 #include <aigd/Memory.hpp>
 #include <aigd/PlanManager.hpp>
 #include <aigd/Predictor.hpp>
+#include <aigd/Situation.hpp>
+#include <aigd/Strategy.hpp>
 #include <aigd/Trajectory.hpp>
 #include <aigd/Types.hpp>
 
@@ -77,6 +79,29 @@ struct LearningMetrics {
     uint32_t newBests = 0;
     uint32_t referenceSteps = 0;           // decisions reproduced from an experiment's reference attempt
     uint32_t independentSteps = 0;         // all other decisions
+};
+
+// What the cross-level strategy library contributed (diagnostics + tests).
+struct TransferMetrics {
+    uint32_t situations = 0;     // obstacle groups met (approached on the ground)
+    uint32_t known = 0;          // ... with a usable strategy for exactly this layout
+    uint32_t similar = 0;        // ... with one for a similar layout only
+    uint32_t unknown = 0;        // ... with none: a new obstacle pattern
+    uint32_t rejectedHere = 0;   // ... whose strategy failed repeatedly on this level (not used here)
+    uint32_t speedAdapted = 0;   // ... whose strategy was learned at another speed
+    uint32_t seeded = 0;         // groups whose strategy was handed to the search (simulated)
+    uint32_t confirmed = 0;      // ... and what was executed matched it
+    uint32_t rejectedBySim = 0;  // ... and something else was executed (the simulation preferred it)
+    uint32_t played = 0;         // groups where the strategy was played directly (no trusted prediction, no own experience)
+    uint32_t successes = 0;      // outcomes recorded into the library: got past the group
+    uint32_t failures = 0;       // ... died at it
+
+    void add(TransferMetrics const& o) {
+        situations += o.situations; known += o.known; similar += o.similar; unknown += o.unknown;
+        rejectedHere += o.rejectedHere; speedAdapted += o.speedAdapted; seeded += o.seeded;
+        confirmed += o.confirmed; rejectedBySim += o.rejectedBySim; played += o.played;
+        successes += o.successes; failures += o.failures;
+    }
 };
 
 // Outcome of the safety check that runs on the action about to be executed.
@@ -182,6 +207,13 @@ struct AgentStatus {
     uint32_t actionsCancelledThisAttempt = 0; // pending input changes cancelled with invalid plans
     uint32_t decisionsFollowingPlan = 0;      // decisions that followed a still-valid plan (no new search)
     uint32_t experimentsCancelled = 0;        // learned test sequences cancelled because the state differed
+
+    // cross-level transfer
+    TransferMetrics transfer;                 // this attempt
+    TransferMetrics transferTotal;            // since the level was attached
+    std::string transferEvent;                // the last transfer message, made from a real decision
+    std::vector<std::string> transferLog;     // the last few transfer messages (most recent last)
+    std::string situation;                    // the obstacle group ahead, described
 };
 
 class Agent {
@@ -192,7 +224,10 @@ public:
     LearnerConfig const& config() const { return m_cfg; }
 
     // Memory is owned by the caller and must outlive the attachment.
-    void attach(LevelMemory* level, PatternMemory* patterns);
+    // `strategies` (layer B, cross-level) is optional; without it nothing is
+    // transferred between levels except the pattern prior and physics.
+    void attach(LevelMemory* level, PatternMemory* patterns, StrategyLibrary* strategies = nullptr);
+    StrategyLibrary* strategies() const { return m_strategies; }
     void detach();
     // Optional trajectory predictor (not owned). Without it the agent learns
     // purely from experience, as before.
@@ -283,6 +318,28 @@ private:
         ActionTrace base;
     };
 
+    // An obstacle group being approached or passed, and what is done about it.
+    // Resolved into the strategy library when it is passed (success) or the
+    // player dies at it (failure).
+    struct PendingGroup {
+        Situation sit;            // as described on the ground before it (relative geometry only)
+        StrategyChoice choice;    // what the library suggested then
+        Primitive primitive = Primitive::Wait; // what is actually being executed
+        float lead = -1.f;        // steps before contact of the first press
+        float second = -1.f;
+        bool pressed = false;
+        bool landed = false;
+        int32_t pressTick = 0;
+        int32_t landTick = 0;
+        bool seeded = false;      // its strategy was simulated by the search
+        bool simChose = false;    // ... and the last search chose it
+        Certainty seedOutcome = Certainty::Safe;
+        int32_t seedCollision = -1;
+        float seedScore = 0.f, bestScore = 0.f;
+        bool played = false;      // played directly (Transfer)
+        bool reported = false;    // its verdict message was produced
+    };
+
     struct LeadCandidate {
         float obstacleX;
         float lead;
@@ -293,6 +350,9 @@ private:
     LearnerConfig m_cfg;
     LevelMemory* m_level = nullptr;
     PatternMemory* m_patterns = nullptr;
+    StrategyLibrary* m_strategies = nullptr;
+    std::vector<PendingGroup> m_groups;
+    Situation m_sit;                             // the group ahead at the current step
     Predictor* m_predictor = nullptr;
     std::mt19937 m_rng;
 
@@ -358,6 +418,13 @@ private:
     bool initSearch(Search& s, FailureReport const& report, ActionTrace const& base, Observation const* last);
     void buildExperiment(Search const& s, ActionTrace const& base, FailureReport const& report);
     void refreshStatus();
+    // cross-level transfer
+    void trackGroups(Observation const& obs);
+    PendingGroup* currentGroup(Observation const& obs);
+    int transferAction(Observation const& obs, PendingGroup const& g) const;
+    void reportGroup(PendingGroup& g, bool trustedNow);
+    void resolveGroups(float deathX, bool died, bool completed);
+    void noteTransfer(std::string msg);
 
     Observation m_lastObs;
 };

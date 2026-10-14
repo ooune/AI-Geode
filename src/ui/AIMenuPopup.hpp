@@ -24,6 +24,9 @@ protected:
     void onExport(cocos2d::CCObject* sender);
     void onImport(cocos2d::CCObject* sender);
     void onFolder(cocos2d::CCObject* sender);
+    void onResetShared(cocos2d::CCObject* sender);
+    void onExportShared(cocos2d::CCObject* sender);
+    void onImportShared(cocos2d::CCObject* sender);
     void onSettings(cocos2d::CCObject* sender);
 
     cocos2d::CCLabelBMFont* m_speedLabel = nullptr;

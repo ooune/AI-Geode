@@ -70,12 +70,18 @@ public:
     void resetAllMemory();
     void exportLevelMemory();
     void importLevelMemory();
+    // Cross-level knowledge (general knowledge + strategy library), kept
+    // apart from every level's own memory.
+    void resetCrossLevelKnowledge();
+    void exportKnowledge();
+    void importKnowledge();
     void openMemoryFolder() const;
 
     // --- Status for UI ---
     aigd::AgentStatus const& status() const { return m_agent.status(); }
     aigd::LevelMemory const* levelMemory() const { return m_level.get(); }
     aigd::PatternMemory const& patterns() const { return m_patterns; }
+    aigd::StrategyLibrary const& strategies() const { return m_strategies; }
     aigd::Observation const& lastObservation() const { return m_lastObs; }
     bool inLevel() const { return m_layer != nullptr; }
     bool supported() const { return m_supported; }
@@ -94,6 +100,7 @@ private:
 
     std::filesystem::path levelsDir() const;
     std::filesystem::path patternsPath() const;
+    std::filesystem::path strategiesPath() const;
     std::filesystem::path levelPath(std::string const& key) const;
     static std::string levelKey(PlayLayer* layer);
 
@@ -110,7 +117,8 @@ private:
     Settings m_settings;
     aigd::Agent m_agent;
     std::unique_ptr<aigd::LevelMemory> m_level;
-    aigd::PatternMemory m_patterns;
+    aigd::PatternMemory m_patterns;      // layer A: physics, timing statistics, pattern prior
+    aigd::StrategyLibrary m_strategies;  // layer B: strategies per kind of situation
     bool m_patternsLoaded = false;
     Observer m_observer;
     SaveWorker m_saver;

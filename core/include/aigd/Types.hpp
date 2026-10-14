@@ -127,6 +127,7 @@ enum class DecisionSource : uint8_t {
     Debounce,     // kept the button state (minimum time between changes)
     Economy,      // a press was proposed, but not pressing is predicted clear: no input
     Plan,         // following the live plan (still matching the real state)
+    Transfer,     // a strategy learned on other levels for this kind of situation (no trusted prediction, no own experience)
     Count
 };
 

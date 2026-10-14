@@ -44,13 +44,18 @@ The **AI popup** in the pause menu holds:
 - the toggles above;
 - learning speed;
 - memory stats for the level;
-- **Reset Level / Reset All** (both ask for confirmation);
-- **Export / Import**, which saves or loads a level's memory as JSON;
-- **Open Folder** and **All Settings**.
+- **Reset Level / Export Level / Import Level**: one level's own memory;
+- **Reset Shared / Export Shared / Import Shared**: the cross-level knowledge (physics, timings, pattern prior and the strategy library), without touching any level's own memory;
+- **Reset All** (everything), **Open Folder** and **All Settings**.
+
+Every reset asks for confirmation.
 
 Memory is stored under `%LOCALAPPDATA%\GeometryDash\geode\mods\aqvose.ai-geode\`:
-- `levels/<level-key>.json` holds one file per level;
-- `patterns.json` holds knowledge shared across levels.
+- `levels/<level-key>.json` holds one file per level (layer C);
+- `patterns.json` holds general knowledge shared across levels (layer A);
+- `strategies.json` holds the strategy library (layer B, from v0.4.0).
+
+All three are versioned. Files from older versions load unchanged (there is simply no strategy library yet), and a file from a newer version is refused rather than misread.
 
 Each write goes to a temporary file followed by a rename. The previous version is kept as `.bak` and used automatically if the main file is ever corrupt.
 
@@ -385,6 +390,97 @@ A game-like test (one call every 1–3 steps) reproduces the in-game failure wit
 - Per attempt: plans made, invalidated, pending actions cancelled, decisions that followed a plan.
 - The Geode log gets a `Plans:` line per attempt, with the measured physics steps per AI call, the calibrated x speed, the plan counts and the last cancellation.
 
+### Cross-level learning (v0.4.0)
+
+**Audit (before v0.4.0).** What already carried over between levels:
+- the physics calibration;
+- press-lead statistics per mode/speed and per kind of obstacle ahead (used to order the timing search);
+- a pattern-keyed value table used as a prior in states with no experience of their own.
+
+The prior is keyed by a coarse feature of the nearest hazard and solid only. It has no notion of an obstacle *group*, of landing space, or of which levels its evidence came from. It cannot tell "this worked on five levels" from "this worked once here", and a failure on a new level was averaged into everything else. Everything else (the per-state values, failure memory, experiments, the best run) is per level and keyed by position.
+
+**Three layers, kept apart:**
+
+| Layer | Contents | File | Reset |
+|---|---|---|---|
+| A: general knowledge | physics calibration, timing statistics, pattern prior | `patterns.json` | Reset Shared |
+| B: strategy library | per kind of situation: strategies with success/failure statistics and provenance | `strategies.json` | Reset Shared |
+| C: level memory | per-state values, failure memory, experiments, hotspots, history | `levels/*.json` | Reset Level |
+
+**Transferable situations** (`core/Situation`). When the player is on the ground in cube or robot mode, the obstacle group ahead (within 110 steps) is described by relative geometry only:
+- each element: on the walking path or above it, hazard or block, start and width in half-blocks from the group's start, bottom and top relative to the player's feet (gravity-normalised);
+- adjacent blocks of the same height are merged, so a platform is one element however the level built it;
+- the free landing space after the group (<1, 1–2, 2–4, 4+ blocks), and whether an orb, pad or portal is nearby;
+- the mode, size, gravity and ground state.
+
+Two keys are made from it. The **fine** key covers the whole layout and the landing space. The **coarse** key covers the first element plus the number of elements, for "similar" situations. Nothing in a description refers to a level position: the same group anywhere, in any level, gives the same keys (tested by moving a level by 7 blocks: 11 situations before, 11 after).
+
+**Strategy library** (`core/Strategy`). Movement primitives:
+- no jump;
+- jump (pressed *lead* steps before contact; a small lead is a delayed jump);
+- jump and hold through the landing;
+- two jumps (the second *n* steps after landing);
+- robot long jump (held *n* steps).
+
+A strategy is one primitive in one timing window (leads in 4-step buckets), so a failure counts against the timing that failed, not against jumping in general. Each strategy records:
+- its successes and failures;
+- the leads that worked;
+- the speeds it worked at;
+- per level, how often it worked and failed there (provenance, up to 8 levels).
+
+Leads are in physics steps, not distance. A jump takes the same time at every speed, so a timing learned at 1× is reused at 2× as the same number of steps, which is a longer distance. This is reported as *"Known strategy adapted for current speed"*.
+
+**Learning from every attempt.** Every group the player approaches on the ground is tracked:
+- what was executed is recorded: the first press and its lead (only if that group was in front of the player), holding through the landing, and a second press after landing;
+- when the group is passed, it is a success for that strategy;
+- if the player dies at the group, it is a failure.
+
+This happens on every attempt, whoever made the decision (planner, learned policy, experiment or a strategy).
+
+**Transfer is guidance, never dictation.**
+- *With a trusted prediction*, the library's strategy for the group ahead becomes a whole candidate plan for the timing search (`Predictor::addSeed`). It is simulated first, like any other candidate, and executed only if it scores best. When the executed plan matches it, the message reads *"New level detected - using previously learned spike-clearing strategy (jump, press 13 steps before contact; worked 3 times, on 2 other levels) - confirmed by simulation"*. Otherwise it reads *"Previous strategy rejected - simulation predicts a collision ..."* or *"... the search found a better plan"*, with *"landing space differs from where it was learned"* or *"the layout is only similar"* when that is the case.
+- *Without a trusted prediction* (not calibrated yet, or prediction off), in a state with no experience of its own, the strategy is played directly (decision source *learned strategy*). It replaces the generic pattern prior there. The failure memory and, where the model can check, the safety layer still apply. As soon as the state has its own experience, that decides.
+
+**Negative transfer.** A strategy's relevance is its overall success rate. On a given level, every net failure there beyond the first halves it. From the second net failure on that level, the strategy is *rejected for that level*: *"Previous strategy rejected - it failed N times on this level"*. Its evidence and its use on other levels are untouched. A new group with nothing usable in the library is reported as *"New obstacle pattern - gathering experience (double spike, landing space 2-4 blocks)"*.
+
+**Physics stays separate.** The library never writes the physics model, and strategies only ever reach the controller through the predictor's search or, without a trusted model, through the same checks as every other policy decision.
+
+**Diagnostics.**
+- Status panel: the group ahead (*Ahead: double spike, landing space 4+ blocks*), the last transfer message, and per attempt: groups met (known / similar / new), strategies executed as learned, replaced by the search, played directly, and rejected after failing here.
+- Geode log: one `Transfer:` line per attempt with the same counts, the library size and the last message.
+- Popup: library size (situations, strategies, levels learned on).
+
+**Results (simulator, procedurally generated levels).** Levels are generated from 8 kinds of obstacle pattern (single, double and triple spikes, a block, blocks with spikes, stairs, spikes under a raised platform, spike–gap–spike) with random order and spacing. Training seeds are 1–6, evaluation seeds 101–106, and evaluation levels are never played during training. Each evaluation level starts from a fresh level memory and a copy of the trained knowledge.
+
+`AIGD_TRANSFER_FULL=1`, 3 agent seeds × 6 unseen levels = 18 runs per row:
+
+| Condition | First attempt: mean progress | First attempt completed | Attempts to complete (mean) |
+|---|---|---|---|
+| *No prediction (learning only)* | | | |
+| no cross-level knowledge | 11.9% | 0/18 | 40.5 |
+| general knowledge (A) | 61.0% | 6/18 | 35.1 (1 not completed in 300) |
+| A + strategy library (B) | 62.3% | 6/18 | **2.4** |
+| *With trajectory prediction* | | | |
+| no cross-level knowledge | 11.9% | 0/18 | 3.0 |
+| general knowledge (A) | 100% | 18/18 | 1.0 |
+| A + strategy library (B) | 100% | 18/18 | 1.0 |
+| strategy library only (no physics calibration) | 85.8% | 15/18 | 1.2 |
+
+What this shows, and what it does not:
+- **Without prediction, the library makes learning a new level about 15× faster** (2.4 vs 35.1 attempts). The first attempt is barely better than with general knowledge alone (62.3% vs 61.0%, the same 6/18 completed).
+- **With a calibrated prediction there was nothing left to improve.** The planner alone completes every unseen generated level on the first attempt once the physics calibration (layer A) has transferred. The library adds nothing measurable there.
+- **Without the physics calibration, the library alone carries most of the way:** 15/18 first-attempt completions, against 0/18 with no knowledge.
+- **Search guidance:**
+  - with the trained library, 6 of 7 strategies handed to the search were executed as learned;
+  - with deliberately wrong strategies (press 95 steps early), 8 of 9 were rejected by simulation, and the level was still completed on the first attempt;
+  - the one "confirmed" wrong timing was really safe there.
+- **Negative transfer:**
+  - on a level whose input takes effect 14 steps late (a difference the situation description cannot see), 22 failures were recorded against that level only, and 2 strategies were rejected for it and are no longer proposed there;
+  - the evidence from the training levels is intact;
+  - that level took 12 attempts with the library and 10 without, so the bad strategies cost a little before they were rejected.
+- **Cost:** within measurement noise. Two runs of the agent loop (simulator and predictor included) took 278 → 277 µs and 214 → 220 µs per decision, without → with the library.
+- **Benchmark:** unchanged, because the existing learning benchmark does not attach a library.
+
 ### Practice-mode learning
 With **Practice Mode Learning** on, the AI:
 - switches the level to practice mode;
@@ -479,6 +575,12 @@ Add `--bench` to also run the multi-seed learning benchmark.
   - **H**: learning with prediction still completes ship and blocks, records per-state evidence and keeps it through save/reload;
   - the cost of a whole decision per step;
   - on the code before the fix, B, C and D failed (both ships crashed) and E reported nothing;
+- **cross-level transfer (v0.4.0)**, with separate training (seeds 1–6) and evaluation levels (101–106), several agent seeds (`AIGD_TRANSFER_FULL=1` for the full protocol):
+  - `situation_descriptor_is_relative_and_transferable`: the same group elsewhere gives the same keys, while a different layout or a block does not;
+  - `strategy_library_tracks_provenance_and_negative_transfer`: provenance, speed adaptation, rejection on the failing level only, and a better local timing preferred;
+  - `strategy_memory_persists_and_resets_separately`: round trip, export bundle, old pattern files, newer formats refused, `.bak` recovery, level reset vs. shared reset;
+  - `transfer_to_unseen_levels`: first-attempt progress, completions and attempts to complete, for no / general / general + strategies / strategies only, with and without prediction;
+  - `negative_transfer_is_detected_and_contained`, `transfer_uses_relative_geometry_not_positions` (no copying), `strategies_guide_the_search_but_never_dictate` (planning, physics untouched), `transfer_cost_per_step_is_small`;
 - **real time, live plans and optimisation (v0.3.0):**
   - the step clock counts steps exactly (1, 2, 3 per call, repeated calls, respawns);
   - the wrong x speed saved in the real game (1.5579) is dropped on load, and a wrong estimate learned during play is replaced by correct samples;
@@ -523,7 +625,7 @@ Add `--bench` to also run the multi-seed learning benchmark.
 
 ### Results
 
-Unit tests: 77 tests, 2068 checks, 0 failures.
+Unit tests: 85 tests, 2140 checks, 0 failures.
 
 Trajectory prediction against the simulator:
 - calibration recovers the simulator's physics exactly (g 0.2200, k 0.2326,
@@ -648,6 +750,12 @@ Report:
 - any death where the log's last record says *safe* or *kept* with a current prediction: that is a model error;
 - any input mismatch error in the log: that would be a controller bug.
 
+**For v0.4.0, check first** (Geode log):
+1. At start-up: `Loaded strategy library: N situations, M strategies, learned on K levels` (or `No strategy library yet` on the first run; it fills while playing).
+2. One `Transfer:` line per attempt: obstacle groups met (known / similar / new), strategies simulated and executed as learned or replaced by the search, strategies played directly, passes and failures recorded, and the last message.
+3. On a level the AI has never played, after it has played a few others: the status panel's *Transfer:* line should read *New level detected - ...*, and the first attempts' `Transfer:` lines should show known or similar groups.
+4. The popup shows the library size. **Reset Shared** clears it (with physics and timings) but keeps every level's memory; **Export Shared / Import Shared** move it between installs.
+
 **For v0.3.0, check first** (Geode log, per attempt):
 1. The `Plans:` line: *physics steps per AI call* tells how often the game really calls the AI (the v0.2.2 session implied ~1.3–1.7). *x speed* should be 1.2983 at normal speed (0.5×: 1.0465, 2×: 1.6143); 1.5579 was the old, wrong value. It is dropped automatically when the memory is loaded.
 2. The `Decisions:` line: most decisions should now be *with a trusted prediction*, with drift well below 0.15.
@@ -689,7 +797,14 @@ sizes and landing tolerance are still unconfirmed.
   - the plan tolerance is 2.5 units, since the game snaps the player onto surfaces;
   - when both inputs only collide far ahead (60+ steps), the record no longer says "NO SAFE OPTION" (later decisions can still act).
 
-  Not tested in game at the time of writing.
+  **In game (Dry Out):**
+  - the first attempt went past the old 48.8% wall to 94.2%;
+  - 15,973 decisions had a trusted prediction and 150 did not; x speed 1.2984;
+  - the level was **completed on attempt 508**, 8 attempts after installing v0.3.1 (it had 1 completion in its first 500 attempts), and again on attempt 512.
+  - Later in the same session, several new online levels were completed within 5–41 attempts.
+- **Cross-level transfer (v0.4.0) is limited to cube and robot.** Situations are only described from the ground in those modes. Ship, wave and the other modes still transfer only through the physics calibration, timing statistics and pattern prior.
+- **The situation description does not see everything that matters:** orbs and pads (only flagged), the floor ending, moving objects, or a different input delay. Such differences are only discovered through failures on the new level (negative-transfer handling).
+- **Strategies were evaluated on generated simulator levels.** Whether the in-game first attempt on an unseen level improves can only be shown by playing new levels in game.
 - **The calibration saved by earlier versions was wrong** (x speed learned 1.2× too high, and the calibration then rejected every correct sample because it was more than 5% off). On loading, a saved speed more than 10% away from GD's exact speed for that speed class is now dropped. During play, 40 consistent samples that disagree with the estimate replace it. Both are tested with the value saved in the real game (1.5579 → 1.2982).
 - **Between two AI calls the button cannot change.** At ~1.7 steps per call, a plan's input change can happen a step late. The search refines only to that resolution, and the plan tolerances absorb one step, but frame-perfect timings are out of reach while the game calls the AI less often than every step.
 - **Plans behind learned-policy decisions are not followed**, only validated: the learned policy's future decisions cannot be simulated.
@@ -712,7 +827,8 @@ sizes and landing tolerance are still unconfirmed.
 
 ```
 core/      learning library (Agent, FailureAnalyzer, Memory, Storage, Json,
-           Physics, Predictor, Overlay) – no Geode dependency
+           Physics, Predictor, PlanManager, StepClock, Situation, Strategy,
+           Overlay) – no Geode dependency
 tests/     unit tests, GD-like simulator, benchmark
 src/       Geode mod: Observer, AIController, SaveWorker, hooks/, ui/ (StatusPanel, AIMenuPopup, TrajectoryOverlay)
 mod.json   Geode metadata and settings

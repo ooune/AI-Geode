@@ -111,16 +111,27 @@ char const* safetyVerdictName(SafetyVerdict v) {
 
 Agent::Agent(LearnerConfig cfg) : m_cfg(cfg), m_rng(cfg.seed) {}
 
-void Agent::attach(LevelMemory* level, PatternMemory* patterns) {
+void Agent::attach(LevelMemory* level, PatternMemory* patterns, StrategyLibrary* strategies) {
     m_level = level;
     m_patterns = patterns;
+    m_strategies = strategies;
     resetTransient();
+    m_status.transferTotal = {};
+    m_status.transferLog.clear();
+    m_status.transferEvent.clear();
+    if (m_strategies && m_level && m_level->totalAttempts == 0 && m_strategies->size() > 0) {
+        int other = 0;
+        for (auto const& l : m_strategies->levels) other += l != m_level->key ? 1 : 0;
+        noteTransfer(fmt("New level detected - %zu known situations from %d other level%s available as search guidance",
+                         m_strategies->size(), other, other == 1 ? "" : "s"));
+    }
     refreshStatus();
 }
 
 void Agent::detach() {
     m_level = nullptr;
     m_patterns = nullptr;
+    m_strategies = nullptr;
     resetTransient();
     m_status = AgentStatus{};
 }
@@ -146,6 +157,7 @@ void Agent::resetTransient() {
     m_avoidedThisAttempt.clear();
     m_removeTried.clear();
     m_plan.clear();
+    m_groups.clear();
     m_nextChange.clear();
     m_lastReport = {};
     m_curAction = 0;
@@ -244,6 +256,8 @@ void Agent::beginAttempt(Observation const& first, bool fromCheckpoint) {
     m_status.decisionsTrusted = 0;
     m_status.decisionsUntrusted = 0;
     m_status.safety = SafetyRecord{};
+    m_status.transfer = {};
+    m_groups.clear();
     if (m_cfg.learningEnabled && m_pendingExp.active && m_pendingExp.toCell >= xCell(first.x, m_cfg.cellSize)) {
         m_activeExp = std::move(m_pendingExp);
     }
@@ -278,6 +292,10 @@ bool Agent::act(Observation const& obs) {
             ++it;
         }
     }
+
+    // Obstacle groups ahead (cross-level strategies): resolved when passed,
+    // and a new one is described and looked up when it comes into view.
+    trackGroups(obs);
 
     bool holdingNow = m_curAction == 1;
     uint64_t key = encodeLevelKey(obs, holdingNow, m_cfg.cellSize);
@@ -373,7 +391,28 @@ bool Agent::act(Observation const& obs) {
             float const vx = unitsPerSecond(obs.speedClass()) / static_cast<float>(kTicksPerSecond);
             if (lead > 0.f) m_predictor->setHint(static_cast<int32_t>(std::lround((obs.hazard.dx - lead) / vx)));
         }
+        // A strategy from the library for the group ahead goes to the search
+        // as a whole plan (simulated first, chosen only if it scores best).
+        PendingGroup* const g = m_strategies ? currentGroup(obs) : nullptr;
+        if (g && g->choice.usable && !g->pressed && obs.onGround && g->choice.primitive != Primitive::Wait && g->choice.leadSteps >= 0.f) {
+            float const vx = unitsPerSecond(obs.speedClass()) / static_cast<float>(kTicksPerSecond);
+            float const contact = (g->sit.startX - (obs.x + situationHalfSize(obs.mini))) / vx;
+            Plan p;
+            p.pressAt = std::max(0, static_cast<int32_t>(std::lround(contact - g->choice.leadSteps)));
+            if (g->choice.primitive == Primitive::RejumpChain) p.rejump = true;
+            if (g->choice.primitive == Primitive::DoubleJump) p.secondAt = std::max(0, static_cast<int32_t>(std::lround(g->choice.secondSteps)));
+            if (g->choice.primitive == Primitive::LongJump) p.holdFor = std::max(12, static_cast<int32_t>(std::lround(g->choice.secondSteps)));
+            m_predictor->addSeed(p);
+        }
         adv = &m_predictor->advise(obs, holdingNow, !m_danger && !offPath);
+        if (g && adv->strategySeeded && adv->computedTick == obs.tick && !adv->reused) {
+            g->seeded = true;
+            g->simChose = adv->fromStrategy;
+            g->seedOutcome = adv->seedOutcome;
+            g->seedCollision = adv->seedCollisionStep;
+            g->seedScore = adv->seedScore;
+            g->bestScore = adv->bestScore;
+        }
         m_status.predictionValid = adv->valid;
         m_status.predictionTrusted = adv->trusted;
         if (adv->valid) {
@@ -385,6 +424,22 @@ bool Agent::act(Observation const& obs) {
     }
     bool const trusted = adv && adv->valid && adv->trusted;
     auto predicted = [&](int k) { return k ? adv->press : adv->release; };
+
+    // No trusted prediction and no experience of its own in this state: a
+    // strategy that worked for this kind of situation on other levels is
+    // played (instead of the generic pattern prior). Still subject to the
+    // failure memory and to the safety check where the model can check it.
+    if (!following && !trusted && m_strategies && !e->visited(0) && !e->visited(1)) {
+        if (PendingGroup* g = currentGroup(obs)) {
+            int const ta = transferAction(obs, *g);
+            if (ta >= 0) {
+                a = ta;
+                src = DecisionSource::Transfer;
+                fromPrior = false;
+                g->played = true;
+            }
+        }
+    }
 
     int32_t cell = xCell(obs.x, m_cfg.cellSize);
     if (m_activeExp.tests(cell) && cell == m_activeExp.testFrom && !m_expChecked) {
@@ -752,6 +807,27 @@ bool Agent::act(Observation const& obs) {
     if (a != m_curAction) {
         m_lastToggleTick = obs.tick;
         m_inputs.emplace_back(obs.x, static_cast<uint8_t>(a));
+        if (a == 1 && obs.onGround) {
+            PendingGroup* g = currentGroup(obs);
+            // A first press only counts for the group if that group is what is
+            // in front of the player (not an obstacle that was never tracked).
+            // Later presses (on top of the group) are its second jump.
+            if (g && !g->pressed && !(m_sit.valid && std::fabs(m_sit.startX - g->sit.startX) < 1.f)) g = nullptr;
+            if (g) {
+                float const vx = unitsPerSecond(obs.speedClass()) / static_cast<float>(kTicksPerSecond);
+                if (!g->pressed) {
+                    g->pressed = true;
+                    g->primitive = Primitive::Jump;
+                    g->lead = std::max(0.f, (g->sit.startX - (obs.x + situationHalfSize(obs.mini))) / vx);
+                    g->pressTick = obs.tick;
+                    // the verdict on the library's suggestion is known now
+                    if (!g->reported) reportGroup(*g, trusted);
+                } else if (g->landed && g->primitive == Primitive::Jump) {
+                    g->primitive = Primitive::DoubleJump;
+                    g->second = static_cast<float>(obs.tick - g->landTick);
+                }
+            }
+        }
         if (a == 1 && obs.hazard.present && obs.hazard.dx >= 0.f && obs.hazard.dx < 6.f * kBlock && m_leads.size() < 8) {
             m_leads.push_back({obs.x + obs.hazard.dx, obs.hazard.dx, timingKey(obs.mode, obs.speedClass(), obs.mini), obstacleKey(obs)});
         }
@@ -1184,6 +1260,7 @@ void Agent::onDeath(Observation const& last, DeathInfo const& death) {
     }
     h.lastKind = rep.kind;
     m_lastReport = rep;
+    resolveGroups(endX, true, false);
 
     assignCredit(last.tick, &rep, false);
     if (m_cfg.learningEnabled) {
@@ -1219,6 +1296,7 @@ void Agent::onComplete(Observation const& last) {
     m_lastObs = last;
     float endX = std::max(last.x, m_maxX);
     if (!m_steps.empty()) m_steps.back().reward += progressReward(endX - m_steps.back().x);
+    resolveGroups(endX, false, true);
     assignCredit(last.tick, nullptr, true);
     if (m_cfg.learningEnabled) {
         applyNewBestBonus(endX);
@@ -1245,6 +1323,7 @@ void Agent::abortAttempt(Observation const*) {
     m_steps.clear();
     m_inputs.clear();
     m_leads.clear();
+    resolveGroups(0.f, false, false);
     m_curAction = 0;
     m_curKey = ~uint64_t(0);
 }
@@ -1736,6 +1815,172 @@ float LevelMemory::averageProgress(size_t window) const {
     float sum = 0.f;
     for (size_t i = history.size() - n; i < history.size(); ++i) sum += history[i].progress;
     return sum / static_cast<float>(n);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-level transfer (strategy library)
+
+void Agent::noteTransfer(std::string msg) {
+    m_status.transferEvent = msg;
+    m_status.transferLog.push_back(std::move(msg));
+    if (m_status.transferLog.size() > 6) m_status.transferLog.erase(m_status.transferLog.begin());
+}
+
+Agent::PendingGroup* Agent::currentGroup(Observation const& obs) {
+    // The nearest group not yet passed.
+    float const h = situationHalfSize(obs.mini);
+    PendingGroup* best = nullptr;
+    for (auto& g : m_groups) {
+        if (g.sit.endX < obs.x - h) continue;
+        if (!best || g.sit.startX < best->sit.startX) best = &g;
+    }
+    return best;
+}
+
+void Agent::trackGroups(Observation const& obs) {
+    m_sit = Situation{};
+    if (!m_strategies || !m_level) return;
+    if (obs.mode != GameMode::Cube && obs.mode != GameMode::Robot) {
+        m_groups.clear(); // another mode: what was being tracked no longer applies
+        return;
+    }
+    float const h = situationHalfSize(obs.mini);
+    auto& T = m_status.transfer;
+    // Passed groups: success.
+    for (auto it = m_groups.begin(); it != m_groups.end();) {
+        if (obs.x - h > it->sit.endX + 2.f) {
+            if (!it->reported) reportGroup(*it, false);
+            if (m_cfg.learningEnabled) m_strategies->record(it->sit, it->primitive, it->lead, it->second, true, m_level->key);
+            ++T.successes;
+            it = m_groups.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto& g : m_groups) {
+        if (g.pressed && !g.landed && obs.onGround && obs.tick > g.pressTick + 2) {
+            g.landed = true;
+            g.landTick = obs.tick;
+            // still holding when it lands: a cube jumps again right away
+            if (m_curAction == 1 && g.primitive == Primitive::Jump && obs.mode == GameMode::Cube) g.primitive = Primitive::RejumpChain;
+        }
+        if (g.pressed && obs.mode == GameMode::Robot && g.primitive == Primitive::Jump && m_curAction == 1 && obs.tick - g.pressTick >= 12)
+            g.primitive = Primitive::LongJump;
+        if (g.primitive == Primitive::LongJump && m_curAction == 1) g.second = static_cast<float>(obs.tick - g.pressTick);
+    }
+
+    if (obs.obstacles.empty() || !obs.onGround) return;
+    m_sit = describeSituation(obs);
+    m_status.situation = m_sit.valid ? m_sit.describe() : std::string();
+    if (!m_sit.valid || m_sit.contactSteps < 0.f) return;
+    for (auto const& g : m_groups)
+        if (std::fabs(g.sit.startX - m_sit.startX) < 1.f) return; // already tracked
+    if (m_groups.size() >= 8) return;
+
+    PendingGroup g;
+    g.sit = m_sit;
+    g.choice = m_strategies->choose(m_sit, m_level->key);
+    ++T.situations;
+    auto const& c = g.choice;
+    if (c.rejectedHere) {
+        ++T.rejectedHere;
+        noteTransfer(fmt("Previous strategy rejected - it failed %u times on this level (%s); learning this level's own timing",
+                         c.localFailures, m_sit.describe().c_str()));
+    } else if (!c.usable) {
+        ++T.unknown;
+        noteTransfer(fmt("New obstacle pattern - gathering experience (%s)", m_sit.describe().c_str()));
+    } else {
+        if (c.match == StrategyChoice::Match::Exact) ++T.known;
+        else ++T.similar;
+        if (c.speedAdapted) ++T.speedAdapted;
+    }
+    m_groups.push_back(std::move(g));
+}
+
+int Agent::transferAction(Observation const& obs, PendingGroup const& g) const {
+    auto const& c = g.choice;
+    if (!c.usable) return -1;
+    if (!g.pressed) {
+        if (!obs.onGround) return -1;
+        if (c.primitive == Primitive::Wait || c.leadSteps < 0.f) return 0;
+        float const vx = unitsPerSecond(obs.speedClass()) / static_cast<float>(kTicksPerSecond);
+        float const contact = (g.sit.startX - (obs.x + situationHalfSize(obs.mini))) / vx;
+        return contact <= c.leadSteps + 0.5f ? 1 : 0;
+    }
+    if (!g.landed) {
+        switch (c.primitive) {
+            case Primitive::RejumpChain: return 1;
+            case Primitive::LongJump: return obs.tick - g.pressTick < std::lround(std::max(c.secondSteps, 12.f)) ? 1 : 0;
+            default: return 0; // a single jump: release in the air (holding would jump again on landing)
+        }
+    }
+    if (c.primitive == Primitive::DoubleJump && g.primitive != Primitive::DoubleJump && obs.onGround)
+        return obs.tick - g.landTick >= std::lround(std::max(c.secondSteps, 0.f)) ? 1 : 0;
+    return 0;
+}
+
+void Agent::reportGroup(PendingGroup& g, bool trustedNow) {
+    (void)trustedNow;
+    g.reported = true;
+    auto const& c = g.choice;
+    if (!c.usable) return;
+    auto& T = m_status.transfer;
+    bool const jumpChoice = c.primitive != Primitive::Wait;
+    bool const matches =
+        jumpChoice ? (g.pressed && g.primitive == c.primitive && std::fabs(g.lead - c.leadSteps) <= 4.f) : !g.pressed;
+    char const* name = primitiveName(c.primitive);
+    std::string what = jumpChoice ? fmt("%s, press %.0f steps before contact", name, c.leadSteps) : std::string(name);
+    std::string evidence = fmt("worked %u times, on %d other level%s", c.successes, c.otherLevels, c.otherLevels == 1 ? "" : "s");
+    std::string speed;
+    if (c.speedAdapted && c.learnedSpeed >= 0)
+        speed = fmt("Known strategy adapted for current speed (learned at speed class %d, now %d: same steps, %s distance). ",
+                    c.learnedSpeed, g.sit.speedClass, g.sit.speedClass > c.learnedSpeed ? "longer" : "shorter");
+    bool const newLevel = !c.learnedHere && m_level && m_level->completions == 0;
+    char const* lead = newLevel ? "New level detected - using" : "Using";
+    if (g.played) {
+        ++T.played;
+        noteTransfer(speed + fmt("%s previously learned %s strategy (%s; %s) - no trusted prediction yet, played directly", lead,
+                                 g.sit.category(), what.c_str(), evidence.c_str()));
+        return;
+    }
+    if (!g.seeded) return; // the search never saw it (e.g. a plan was being followed): no verdict
+    ++T.seeded;
+    if (matches) {
+        ++T.confirmed;
+        noteTransfer(speed + fmt("%s previously learned %s strategy (%s; %s) - confirmed by simulation", lead, g.sit.category(),
+                                 what.c_str(), evidence.c_str()));
+    } else {
+        ++T.rejectedBySim;
+        std::string why = g.seedOutcome == Certainty::Collision
+                              ? fmt("simulation predicts a collision %d steps after the decision", g.seedCollision + 1)
+                              : fmt("the search found a better plan (score %.1f vs %.1f)", g.bestScore, g.seedScore);
+        if (c.landingDiffers) why += "; landing space differs from where it was learned";
+        else if (c.match == StrategyChoice::Match::Similar) why += "; the layout is only similar to where it was learned";
+        noteTransfer(fmt("Previous strategy rejected - %s (%s for %s)", why.c_str(), what.c_str(), g.sit.describe().c_str()));
+    }
+}
+
+void Agent::resolveGroups(float deathX, bool died, bool completed) {
+    if (m_strategies && m_level && m_cfg.learningEnabled) {
+        // Sorted by position: only the group the player died at is a failure.
+        std::sort(m_groups.begin(), m_groups.end(), [](PendingGroup const& a, PendingGroup const& b) { return a.sit.startX < b.sit.startX; });
+        for (auto& g : m_groups) {
+            if (completed) {
+                if (!g.reported) reportGroup(g, false);
+                m_strategies->record(g.sit, g.primitive, g.lead, g.second, true, m_level->key);
+                ++m_status.transfer.successes;
+                continue;
+            }
+            if (died && deathX >= g.sit.startX - 2.f * kBlock && deathX <= g.sit.endX + kBlock) {
+                if (!g.reported) reportGroup(g, false);
+                m_strategies->record(g.sit, g.primitive, g.lead, g.second, false, m_level->key);
+                ++m_status.transfer.failures;
+                break;
+            }
+        }
+    }
+    if (m_strategies) m_status.transferTotal.add(m_status.transfer);
+    m_groups.clear();
 }
 
 } // namespace aigd

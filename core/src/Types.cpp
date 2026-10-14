@@ -86,6 +86,7 @@ char const* decisionSourceName(DecisionSource source) {
         case DecisionSource::Debounce: return "debounce";
         case DecisionSource::Economy: return "no input needed";
         case DecisionSource::Plan: return "following plan";
+        case DecisionSource::Transfer: return "learned strategy";
         default: return "?";
     }
 }

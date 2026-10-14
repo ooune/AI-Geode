@@ -131,6 +131,11 @@ public:
         int firstSafeSim = -1;           // simulations needed until the first fully safe candidate
         bool seeded = false;             // a learned timing was tried first
         bool fromSeed = false;           // ... and the chosen timing is (within the resolution of) it
+        bool strategySeeded = false;     // a plan from the strategy library was simulated
+        bool fromStrategy = false;       // ... and the chosen plan is (within the resolution of) it
+        Certainty seedOutcome = Certainty::Safe; // the best strategy plan's simulated outcome
+        int32_t seedCollisionStep = -1;
+        float seedScore = 0.f;
         bool budgetHit = false;          // the computation budget ended the search early
         int resolution = 1;              // smallest timing step the search refined to
         bool reused = false;             // carried over from an earlier tick (not recomputed)
@@ -160,6 +165,13 @@ public:
     // situation. It is evaluated first, like any other candidate; it is never
     // executed without being simulated. Applies to the next advise() only.
     void setHint(int32_t pressAt) { m_hint = pressAt; }
+    // Whole plans from the strategy library (another level's experience in
+    // a comparable situation): also evaluated first, also never executed
+    // without being simulated. Apply to the next advise() only.
+    static constexpr int kMaxSeeds = 4;
+    void addSeed(Plan const& p) {
+        if (m_nSeeds < kMaxSeeds) m_seeds[static_cast<size_t>(m_nSeeds++)] = p;
+    }
     int horizon() const { return m_horizon; }
     bool trusted(GameMode mode, bool mini) const;
     bool trusted(bool mini) const { return trusted(GameMode::Cube, mini); }
@@ -261,6 +273,8 @@ private:
     int m_budget = 200;
     int m_budgetNow = 200;
     int32_t m_hint = -1;
+    std::array<Plan, kMaxSeeds> m_seeds{};
+    int m_nSeeds = 0;
     float m_caution = 1.f;
     uint32_t m_mispredictions = 0;
     uint64_t m_totalSims = 0;

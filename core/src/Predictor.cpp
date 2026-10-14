@@ -516,7 +516,10 @@ void Predictor::evaluate(SimStart const& s, std::span<Obstacle const> obs, Plan 
 Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding, bool allowReuse) {
     // The same state again in the same tick: nothing can have changed.
     // (A new learned-timing hint always gets a fresh search.)
-    if (sameState(obs, holding) && (allowReuse || m_computedTick == obs.tick) && m_hint < 0) return m_advice;
+    int const nSeeds = m_nSeeds;
+    std::array<Plan, kMaxSeeds> const seeds = m_seeds;
+    m_nSeeds = 0;
+    if (sameState(obs, holding) && (allowReuse || m_computedTick == obs.tick) && m_hint < 0 && nSeeds == 0) return m_advice;
     // Reuse the last plan where re-planning cannot change anything (or every
     // other step for continuously controlled modes) - but never while a
     // collision is near, and never once the player is not where the executed
@@ -661,6 +664,30 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
             p.pressAt = hint + d;
             evaluate(s, span, p, m_tmp, m_release, haveRelease, 0);
         }
+    }
+    // Whole plans from the strategy library: simulated like every other
+    // candidate, and only chosen if they score best.
+    auto samePlan = [](Plan const& a, Plan const& b) {
+        return a.pressAt == b.pressAt && a.holdFor == b.holdFor && a.repeatEvery == b.repeatEvery && a.rejump == b.rejump &&
+               a.secondAt == b.secondAt;
+    };
+    for (int i = 0; i < nSeeds; ++i) {
+        Plan const& p = seeds[static_cast<size_t>(i)];
+        if (p.pressAt < 0 || p.pressAt >= m_horizon || p.pressAt > neverHit) continue;
+        int const branch = p.pressAt == 0 ? 1 : 0;
+        PredictedPath& best = branch ? m_press : m_release;
+        bool& have = branch ? havePress : haveRelease;
+        int const simsBefore = m_advice.simulations;
+        evaluate(s, span, p, m_tmp, best, have, branch);
+        if (m_advice.simulations == simsBefore) continue;
+        PredictedPath const& r = samePlan(best.plan, p) ? best : m_tmp;
+        float const sc = score(r);
+        if (!m_advice.strategySeeded || sc > m_advice.seedScore) {
+            m_advice.seedScore = sc;
+            m_advice.seedOutcome = r.outcome;
+            m_advice.seedCollisionStep = r.collisionStep;
+        }
+        m_advice.strategySeeded = true;
     }
     for (int k : kCoarseDelays) {
         if (k >= m_horizon) break;
@@ -858,6 +885,12 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
         m_advice.bestLanded = b.landed;
         m_advice.bestLandX = b.landX;
         m_advice.fromSeed = m_advice.seeded && !m_bestPresses && hint > 0 && std::abs(b.plan.pressAt - hint) <= res;
+        for (int i = 0; i < nSeeds && m_advice.strategySeeded && !m_advice.fromStrategy; ++i) {
+            Plan const& p = seeds[static_cast<size_t>(i)];
+            m_advice.fromStrategy = std::abs(b.plan.pressAt - p.pressAt) <= res && (b.plan.pressAt == 0) == (p.pressAt == 0) &&
+                                    (b.plan.secondAt < 0) == (p.secondAt < 0) && b.plan.rejump == p.rejump;
+        }
+        if (m_advice.fromStrategy) m_advice.fromSeed = true;
     }
 
     if (groundOnly(s.mode) && !s.onGround && !holding && !m_bestPresses && m_release.landed) {

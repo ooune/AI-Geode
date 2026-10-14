@@ -16,6 +16,7 @@
 #include <cmath>
 #include <string>
 #include <deque>
+#include <random>
 #include <vector>
 
 namespace sim {
@@ -521,6 +522,59 @@ inline Level levelShip() {
 }
 
 inline std::vector<Level> allLevels() { return {levelBasics(), levelSpikes(), levelBlocks(), levelShip()}; }
+
+
+// ---------------------------------------------------------------------------
+// Procedurally generated cube levels, for testing transfer between levels.
+// A level is a random sequence of obstacle patterns with random spacing (and
+// optionally a random offset), so two seeds give different levels made of the
+// same kinds of obstacles. Training and evaluation use disjoint seeds.
+
+enum class Pattern : int {
+    Spike1 = 0, Spike2, Spike3, Block1, BlockSpike, Stairs, RaisedSpikes, SpikeGapSpike, Count
+};
+
+inline float placePattern(Level& L, Pattern p, float x) {
+    switch (p) {
+        case Pattern::Spike1: L.spike(x); return 1;
+        case Pattern::Spike2: L.spike(x); L.spike(x + 1); return 2;
+        case Pattern::Spike3: L.spike(x); L.spike(x + 1); L.spike(x + 2); return 3;
+        case Pattern::Block1: L.block(x); return 1;
+        case Pattern::BlockSpike: L.block(x); L.block(x + 1); L.spike(x + 2); L.spike(x + 3); return 4;
+        case Pattern::Stairs: L.block(x); L.block(x + 1, 0, 1, 2); L.block(x + 2, 0, 3, 2); return 5;
+        case Pattern::RaisedSpikes: L.block(x, 1, 4, 1); L.spike(x + 1); L.spike(x + 2); return 4;
+        case Pattern::SpikeGapSpike: L.spike(x); L.spike(x + 4); return 5;
+        default: return 0;
+    }
+}
+
+// `allowed`: bit mask of the patterns that may appear (all by default).
+inline Level generatedLevel(uint32_t seed, int segments = 9, uint32_t allowed = ~0u) {
+    std::mt19937 rng(seed * 2654435761u + 12345u);
+    Level L;
+    L.name = "gen-" + std::to_string(seed);
+    std::vector<Pattern> pool;
+    for (int i = 0; i < static_cast<int>(Pattern::Count); ++i)
+        if (allowed & (1u << i)) pool.push_back(static_cast<Pattern>(i));
+    float x = 12.f + static_cast<float>(rng() % 6);
+    for (int i = 0; i < segments; ++i) {
+        Pattern p = pool[rng() % pool.size()];
+        x += placePattern(L, p, x);
+        x += 6.f + static_cast<float>(rng() % 6); // free run before the next pattern
+    }
+    L.finish(x + 8.f);
+    return L;
+}
+
+// The same level with everything moved by `blocks` (a level that only
+// memorised positions would not recognise anything in it).
+inline Level shiftedLevel(Level const& base, float blocks) {
+    Level L = base;
+    L.name = base.name + "-shifted";
+    for (auto& o : L.objs) o.x += blocks * 30.f;
+    L.finish(base.length / 30.f + blocks);
+    return L;
+}
 
 // A corridor course for one game mode: a portal into the mode right away,
 // a floor and a ceiling (block rows), and a handful of obstacles that need the

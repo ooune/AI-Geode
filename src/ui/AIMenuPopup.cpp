@@ -13,7 +13,7 @@ using namespace geode::prelude;
 namespace {
 enum ToggleTag { kAI = 0, kLearning, kAutoRetry, kPractice, kDebug, kPanel, kPrediction, kTrajectory };
 constexpr float kWidth = 360.f;
-constexpr float kHeight = 290.f;
+constexpr float kHeight = 330.f;
 
 char const* settingKey(int tag) {
     switch (tag) {
@@ -94,11 +94,15 @@ bool AIMenuPopup::init() {
     m_stats->setPosition({kWidth / 2.f, speedY - 16.f});
     m_mainLayer->addChild(m_stats);
 
+    float row0 = 80.f;
     float row1 = 52.f;
     float row2 = 24.f;
-    addButton(menu, "Reset Level", menu_selector(AIMenuPopup::onReset), {kWidth * 0.2f, row1});
-    addButton(menu, "Export", menu_selector(AIMenuPopup::onExport), {kWidth * 0.5f, row1});
-    addButton(menu, "Import", menu_selector(AIMenuPopup::onImport), {kWidth * 0.8f, row1});
+    addButton(menu, "Reset Level", menu_selector(AIMenuPopup::onReset), {kWidth * 0.2f, row0});
+    addButton(menu, "Export Level", menu_selector(AIMenuPopup::onExport), {kWidth * 0.5f, row0});
+    addButton(menu, "Import Level", menu_selector(AIMenuPopup::onImport), {kWidth * 0.8f, row0});
+    addButton(menu, "Reset Shared", menu_selector(AIMenuPopup::onResetShared), {kWidth * 0.2f, row1});
+    addButton(menu, "Export Shared", menu_selector(AIMenuPopup::onExportShared), {kWidth * 0.5f, row1});
+    addButton(menu, "Import Shared", menu_selector(AIMenuPopup::onImportShared), {kWidth * 0.8f, row1});
     addButton(menu, "Reset All", menu_selector(AIMenuPopup::onResetAll), {kWidth * 0.2f, row2});
     addButton(menu, "Open Folder", menu_selector(AIMenuPopup::onFolder), {kWidth * 0.5f, row2});
     addButton(menu, "All Settings", menu_selector(AIMenuPopup::onSettings), {kWidth * 0.8f, row2});
@@ -146,6 +150,9 @@ void AIMenuPopup::refresh() {
     } else {
         stats = fmt::format("No level loaded\n{} shared patterns learned", ai.patterns().q.size());
     }
+    auto const& lib = ai.strategies();
+    stats += fmt::format("\nCross-level strategies: {} situations, {} strategies, learned on {} levels", lib.size(), lib.records(),
+                         lib.levels.size());
     m_stats->setString(stats.c_str());
     m_stats->limitLabelWidth(kWidth - 30.f, 0.5f, 0.2f);
 }
@@ -190,6 +197,19 @@ void AIMenuPopup::onResetAll(CCObject*) {
     );
 }
 
+void AIMenuPopup::onResetShared(CCObject*) {
+    createQuickPopup(
+        "Reset Shared", "Forget the <cy>cross-level knowledge</c> (physics, timings, strategies)? Every level's own memory is kept.",
+        "Cancel", "Reset",
+        [this](auto, bool confirmed) {
+            if (!confirmed) return;
+            AIController::get().resetCrossLevelKnowledge();
+            refresh();
+        }
+    );
+}
+void AIMenuPopup::onExportShared(CCObject*) { AIController::get().exportKnowledge(); }
+void AIMenuPopup::onImportShared(CCObject*) { AIController::get().importKnowledge(); }
 void AIMenuPopup::onExport(CCObject*) { AIController::get().exportLevelMemory(); }
 void AIMenuPopup::onImport(CCObject*) { AIController::get().importLevelMemory(); }
 void AIMenuPopup::onFolder(CCObject*) { AIController::get().openMemoryFolder(); }

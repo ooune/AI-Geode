@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -3146,6 +3147,396 @@ static void runBench() {
                         fails ? (" (" + std::to_string(fails) + "/5 failed)").c_str() : "");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-level transfer (v0.4.0)
+//
+// Training and evaluation levels are generated from disjoint seeds: an
+// evaluation level is never seen during training, so anything it gains can
+// only come from knowledge that transfers, not from memorised positions.
+
+namespace {
+constexpr uint32_t kTrainSeeds[] = {1, 2, 3, 4, 5, 6};
+constexpr uint32_t kEvalSeeds[] = {101, 102, 103, 104, 105, 106};
+
+sim::Level solvableGenerated(uint32_t seed, uint32_t allowed = ~0u) {
+    for (uint32_t k = 0; k < 50; ++k) {
+        sim::Level L = sim::generatedLevel(seed + k * 7919u, 9, allowed);
+        if (cubeLevelSolvable(L)) {
+            L.name = "gen-" + std::to_string(seed);
+            return L;
+        }
+    }
+    return sim::levelBasics();
+}
+
+struct Knowledge {
+    PatternMemory patterns;
+    StrategyLibrary strategies;
+};
+
+// Plays a level until it is completed (or maxAttempts), sharing `k`.
+TrainResult playLevel(Knowledge& k, sim::Level const& level, int maxAttempts, bool prediction, bool useGeneral, bool useStrategies,
+                      uint32_t seed, TransferMetrics* totalOut = nullptr, LevelMemory* memOut = nullptr,
+                      std::vector<std::string>* messages = nullptr) {
+    LevelMemory mem = freshLevel(level);
+    LearnerConfig cfg;
+    cfg.seed = seed;
+    cfg.usePrediction = prediction;
+    Agent agent(cfg);
+    PatternMemory none;
+    agent.attach(&mem, useGeneral ? &k.patterns : &none, useStrategies ? &k.strategies : nullptr);
+    PredictionRig rig;
+    if (useGeneral) rig.model.loadCalibration(k.patterns.physics);
+    TrainResult r;
+    if (prediction) {
+        agent.setPredictor(&rig.predictor);
+        r = train(agent, level, maxAttempts, &rig);
+        if (useGeneral) k.patterns.physics = rig.model.calibration();
+    } else {
+        // no predictor, but the same observations as in game (the obstacles around the player)
+        r = train(agent, level, maxAttempts, &rig);
+    }
+    if (totalOut) *totalOut = agent.status().transferTotal;
+    if (messages) *messages = agent.status().transferLog;
+    if (memOut) *memOut = mem;
+    return r;
+}
+
+Knowledge trainedKnowledge(bool prediction, uint32_t seed, int maxAttempts = 400) {
+    Knowledge k;
+    for (uint32_t s : kTrainSeeds) playLevel(k, solvableGenerated(s), maxAttempts, prediction, true, true, seed);
+    return k;
+}
+
+struct EvalStats {
+    double firstProgress = 0;
+    int firstCompleted = 0;
+    double attempts = 0;
+    int failed = 0;
+    int runs = 0;
+    TransferMetrics transfer;
+};
+
+void report(char const* label, EvalStats const& s) {
+    std::printf("    %-44s first attempt: %5.1f%% mean progress, %d/%d completed | attempts to complete: mean %6.1f%s\n", label,
+                100.0 * s.firstProgress / std::max(1, s.runs), s.firstCompleted, s.runs, s.attempts / std::max(1, s.runs),
+                s.failed ? (" (" + std::to_string(s.failed) + " not completed)").c_str() : "");
+}
+} // namespace
+
+TEST(situation_descriptor_is_relative_and_transferable) {
+    // The same obstacles anywhere in a level (or in another level) give the
+    // same description; different landing space or height gives another.
+    auto at = [](sim::Level const& L, float playerBlock) {
+        sim::World w(L);
+        Observation o = w.observe();
+        PredictionRig rig;
+        while (o.x < playerBlock * 30.f && !w.dead() && !w.complete()) {
+            w.step(false);
+            o = rig.observe(w);
+        }
+        return describeSituation(o);
+    };
+    sim::Level a, b, c, d;
+    a.spike(20); a.spike(21); a.finish(60);
+    b.spike(40); b.spike(41); b.finish(80);           // same pair, elsewhere
+    c.spike(20); c.spike(21); c.spike(23); c.finish(60); // a third spike right after: other layout
+    d.block(20, 0, 1, 1); d.finish(60);               // a block instead
+    Situation sa = at(a, 16), sb = at(b, 36), sc = at(c, 16), sd = at(d, 16);
+    CHECK(sa.valid && sb.valid && sc.valid && sd.valid);
+    CHECK(sa.fine == sb.fine);
+    CHECK(sa.coarse == sb.coarse);
+    CHECK(sa.fine != sc.fine);
+    CHECK(sa.fine != sd.fine);
+    CHECK(sa.coarse != sd.coarse);
+    CHECK(sa.count == 2 && sa.el[0].kind == SituationElement::Hazard);
+    CHECK(std::fabs(sa.contactSteps - sb.contactSteps) < 2.f);
+    std::printf("    %s | %s | %s\n", sa.describe().c_str(), sc.describe().c_str(), sd.describe().c_str());
+}
+
+TEST(strategy_library_tracks_provenance_and_negative_transfer) {
+    StrategyLibrary lib;
+    Situation s;
+    s.valid = true;
+    s.fine = 1234;
+    s.coarse = (uint64_t(1) << 52) | 99;
+    s.speedClass = 1;
+    for (int i = 0; i < 5; ++i) lib.record(s, Primitive::Jump, 20.f, -1.f, true, "level-a");
+    for (int i = 0; i < 3; ++i) lib.record(s, Primitive::Jump, 21.f, -1.f, true, "level-b");
+    auto c = lib.choose(s, "level-new");
+    CHECK(c.usable && c.match == StrategyChoice::Match::Exact);
+    CHECK(c.primitive == Primitive::Jump && std::fabs(c.leadSteps - 20.4f) < 0.2f);
+    CHECK(c.otherLevels == 2 && !c.learnedHere);
+    // at another speed: the same steps, flagged as adapted
+    s.speedClass = 3;
+    CHECK(lib.choose(s, "level-new").speedAdapted);
+    s.speedClass = 1;
+    // It keeps failing on a new level: rejected there, still used elsewhere.
+    lib.record(s, Primitive::Jump, 20.f, -1.f, false, "level-new");
+    CHECK(lib.choose(s, "level-new").usable);  // one failure may have had another cause
+    lib.record(s, Primitive::Jump, 20.f, -1.f, false, "level-new");
+    auto here = lib.choose(s, "level-new");
+    CHECK(!here.usable && here.rejectedHere);
+    CHECK(lib.choose(s, "level-c").usable);
+    auto const& rec = lib.situations.at(s.fine)[0];
+    CHECK(rec.successes == 8 && rec.failures == 2);
+    CHECK(rec.on("level-a")->successes == 5 && rec.on("level-new")->failures == 2);
+    // A different timing that works on the new level is preferred there.
+    for (int i = 0; i < 3; ++i) lib.record(s, Primitive::Jump, 12.f, -1.f, true, "level-new");
+    auto alt = lib.choose(s, "level-new");
+    CHECK(alt.usable && std::fabs(alt.leadSteps - 12.f) < 0.5f);
+}
+
+TEST(strategy_memory_persists_and_resets_separately) {
+    Knowledge k = trainedKnowledge(true, 1, 60);
+    CHECK(k.strategies.size() > 0);
+    // round trip, including provenance
+    std::string text = storage::serializeStrategies(k.strategies);
+    StrategyLibrary back;
+    std::string err;
+    CHECK(storage::deserializeStrategies(text, back, &err));
+    CHECK(back.size() == k.strategies.size() && back.records() == k.strategies.records());
+    CHECK(back.levels == k.strategies.levels);
+    CHECK(storage::serializeStrategies(back) == text);
+    // the whole cross-level knowledge as one export document
+    PatternMemory p2;
+    StrategyLibrary s2;
+    std::string bundle = storage::serializeKnowledge(k.patterns, k.strategies);
+    CHECK(storage::deserializeKnowledge(bundle, p2, s2, &err));
+    CHECK(s2.records() == k.strategies.records() && p2.q.size() == k.patterns.q.size());
+    // a pattern file written before v0.4.0 (no strategies) still loads
+    std::string v2 = storage::serializePatterns(k.patterns);
+    PatternMemory p3;
+    CHECK(storage::deserializePatterns(v2, p3, &err));
+    // a newer strategy format is refused, not misread
+    std::string newer = text;
+    newer.replace(newer.find("\"version\":1"), 11, "\"version\":9");
+    StrategyLibrary s3;
+    CHECK(!storage::deserializeStrategies(newer, s3, &err));
+    // corrupt main file: the backup copy is used
+    auto dir = tempDir();
+    auto path = dir / "strategies.json";
+    CHECK(storage::writeFileAtomic(path, text));
+    CHECK(storage::writeFileAtomic(path, text)); // second write keeps the first as .bak
+    { std::ofstream(path, std::ios::trunc) << "{garbage"; }
+    StrategyLibrary s4;
+    CHECK(storage::loadStrategyFile(path, s4, &err));
+    CHECK(s4.records() == k.strategies.records());
+
+    // Level reset (layer C) keeps the library; a general-knowledge reset
+    // keeps the level memory.
+    sim::Level L = solvableGenerated(101);
+    LevelMemory mem;
+    playLevel(k, L, 30, true, true, true, 1, nullptr, &mem);
+    size_t const libBefore = k.strategies.records();
+    CHECK(mem.q.size() > 0);
+    LevelMemory fresh = freshLevel(L); // what "reset this level" does
+    CHECK(fresh.q.size() == 0 && k.strategies.records() == libBefore);
+    k.strategies.clear();             // what "reset cross-level knowledge" does
+    k.patterns = PatternMemory{};
+    CHECK(mem.q.size() > 0 && mem.totalAttempts > 0);
+}
+
+TEST(transfer_to_unseen_levels) {
+    // Separate training and evaluation levels, several agent seeds. Reported:
+    // first-attempt progress / completions and attempts to complete, for
+    //   none      - no cross-level knowledge at all,
+    //   general   - physics calibration, timing statistics, pattern prior (layer A),
+    //   general + strategies - plus the strategy library (layer B).
+    bool const full = std::getenv("AIGD_TRANSFER_FULL") != nullptr;
+    int const seeds = full ? 3 : 2;
+    int const evalLevels = full ? 6 : 4;
+    int const cap = full ? 300 : 150;
+    for (bool prediction : {false, true}) {
+        std::printf("    -- %s --\n", prediction ? "with trajectory prediction" : "without trajectory prediction (learning only)");
+        EvalStats none, general, both, onlyLib;
+        for (int sd = 1; sd <= seeds; ++sd) {
+            Knowledge trained = trainedKnowledge(prediction, static_cast<uint32_t>(sd));
+            if (sd == 1)
+                std::printf("    trained on %zu levels: %zu situations, %zu strategy records\n", std::size(kTrainSeeds),
+                            trained.strategies.size(), trained.strategies.records());
+            for (int i = 0; i < evalLevels; ++i) {
+                sim::Level L = solvableGenerated(kEvalSeeds[i]);
+                for (int cond = 0; cond < 4; ++cond) {
+                    Knowledge k = trained; // every evaluation starts from the same trained knowledge
+                    LevelMemory mem;
+                    bool const useGeneral = cond == 1 || cond == 2;
+                    bool const useLib = cond >= 2;
+                    auto r = playLevel(k, L, cap, prediction, useGeneral, useLib, static_cast<uint32_t>(100 + sd), nullptr, &mem);
+                    EvalStats& s = cond == 0 ? none : cond == 1 ? general : cond == 2 ? both : onlyLib;
+                    ++s.runs;
+                    s.firstProgress += r.attempts.empty() ? 0.0 : r.attempts[0].progress;
+                    s.firstCompleted += (!r.attempts.empty() && r.attempts[0].completed) ? 1 : 0;
+                    s.attempts += r.attemptsToComplete > 0 ? r.attemptsToComplete : cap + 1;
+                    s.failed += r.attemptsToComplete > 0 ? 0 : 1;
+                }
+            }
+        }
+        report("none", none);
+        report("general knowledge", general);
+        report("general knowledge + strategy library", both);
+        report("strategy library only", onlyLib);
+        if (!prediction) {
+            // Without prediction, the library is what can act on a new level:
+            // it must help the first attempt and not slow learning down.
+            CHECK(both.firstProgress >= general.firstProgress);
+            CHECK(both.attempts <= general.attempts * 1.15 + 2);
+        } else {
+            CHECK(both.attempts <= general.attempts * 1.15 + 2);
+            CHECK(both.firstCompleted >= general.firstCompleted - 1);
+        }
+    }
+}
+
+TEST(negative_transfer_is_detected_and_contained) {
+    // Strategies learned on normal levels, then a level where the input takes
+    // effect 8 steps late (a context the situation description cannot see):
+    // the transferred timings fail there. They must stop being used on that
+    // level, the level must still be learned, and what was learned on the
+    // other levels must stay intact.
+    Knowledge k = trainedKnowledge(false, 1);
+    size_t const before = k.strategies.records();
+    uint32_t successesBefore = 0;
+    for (auto const& [key, recs] : k.strategies.situations)
+        for (auto const& r : recs) successesBefore += r.successes;
+    sim::Level L = solvableGenerated(kEvalSeeds[0]);
+    L.name = "delayed";
+    TrainResult withLib, without;
+    TransferMetrics total;
+    {
+        SimHooks late(14, 0.f, 0.f);
+        Knowledge k2 = k;
+        without = playLevel(k2, L, 300, false, true, false, 7);
+        withLib = playLevel(k, L, 300, false, true, true, 7, &total);
+    }
+    uint32_t localFailures = 0, otherSuccesses = 0;
+    int rejected = 0, proposedHere = 0, proposedElsewhere = 0;
+    for (auto const& [key, recs] : k.strategies.situations) {
+        for (auto const& r : recs) {
+            for (auto const& p : r.levels) {
+                if (p.level == "sim-delayed") localFailures += p.failures;
+                else otherSuccesses += p.successes;
+            }
+            bool rej = false;
+            strategyRelevance(r, "sim-delayed", &rej);
+            if (!rej || r.successes < 2) continue;
+            ++rejected;
+            // Is that timing still what the library proposes, here / on another level?
+            bool const isCoarse = (key >> 52) != 0;
+            Situation s;
+            s.valid = true;
+            s.fine = isCoarse ? 1 : key;
+            s.coarse = isCoarse ? key : ((uint64_t(1) << 52) | 1);
+            s.speedClass = 1;
+            auto same = [&](StrategyChoice const& c) {
+                return c.usable && c.primitive == r.primitive && r.leadBucket >= 0 &&
+                       std::lround(c.leadSteps / StrategyRecord::kLeadBucket) == r.leadBucket;
+            };
+            proposedHere += same(k.strategies.choose(s, "sim-delayed")) ? 1 : 0;
+            proposedElsewhere += same(k.strategies.choose(s, "sim-other")) ? 1 : 0;
+        }
+    }
+    std::printf("    delayed input: completed after %d attempts with the library, %d without | %u situations met, %u failures recorded "
+                "on this level, %d strategies rejected for it (%d still proposed here, %d proposed on other levels)\n",
+                withLib.attemptsToComplete, without.attemptsToComplete, total.situations, localFailures, rejected, proposedHere,
+                proposedElsewhere);
+    CHECK(withLib.attemptsToComplete > 0);
+    CHECK(localFailures > 0);
+    CHECK(rejected > 0);
+    CHECK(proposedHere == 0);
+    // contained: not much slower than without transferred strategies
+    CHECK(withLib.attemptsToComplete <= without.attemptsToComplete * 2 + 10);
+    // the evidence from the other levels is untouched (only added to)
+    CHECK(otherSuccesses >= successesBefore - 0);
+    CHECK(k.strategies.records() >= before);
+    // and still used on a level without the delay
+    sim::Level M = solvableGenerated(kEvalSeeds[1]);
+    TransferMetrics t2;
+    playLevel(k, M, 1, false, true, true, 7, &t2);
+    CHECK(t2.known + t2.similar > 0);
+}
+
+TEST(transfer_uses_relative_geometry_not_positions) {
+    // No copying: a level's strategies are keyed by what is in front of the
+    // player, never by where. The same level moved by 7 blocks adds no new
+    // situation, and is played from the library as well as the original.
+    Knowledge k;
+    sim::Level L = solvableGenerated(kTrainSeeds[0]);
+    playLevel(k, L, 300, false, true, true, 3);
+    size_t const situations = k.strategies.size();
+    Knowledge k2 = k;
+    sim::Level S = sim::shiftedLevel(L, 7.f);
+    TransferMetrics t;
+    auto r = playLevel(k2, S, 300, false, true, true, 3, &t);
+    std::printf("    shifted copy: %zu situations before, %zu after; first attempt %.0f%% (%u groups met, %u known)\n", situations,
+                k2.strategies.size(), r.attempts.empty() ? 0.f : r.attempts[0].progress * 100.f, t.situations, t.known);
+    CHECK(situations > 0);
+    CHECK(k2.strategies.size() == situations);
+    CHECK(t.known > 0);
+    // nothing in the library refers to a level position
+    std::string text = storage::serializeStrategies(k.strategies);
+    CHECK(text.find("\"x\"") == std::string::npos);
+}
+
+TEST(strategies_guide_the_search_but_never_dictate) {
+    // With a trusted model the library only seeds the search. A correct
+    // strategy is confirmed by simulation; a wrong one (pressing far too
+    // early) is simulated, rejected, and the level is still completed on the
+    // first attempt. The physics model is not touched by the library.
+    Knowledge good = trainedKnowledge(true, 1, 60);
+    sim::Level L = solvableGenerated(kEvalSeeds[2]);
+    TransferMetrics tg;
+    std::vector<std::string> msgs;
+    auto rg = playLevel(good, L, 5, true, true, true, 11, &tg, nullptr, &msgs);
+    Knowledge bad = good;
+    for (auto& [key, recs] : bad.strategies.situations)
+        for (auto& r : recs) {
+            r.lead = TimingStat{};
+            r.lead.add(95.0); // press 95 steps before contact: lands in front of the obstacle
+            r.primitive = Primitive::Jump;
+        }
+    PhysicsCalibration const calBefore = bad.patterns.physics;
+    TransferMetrics tb;
+    auto rb = playLevel(bad, L, 5, true, true, true, 11, &tb);
+    std::printf("    correct strategies: %u seeded, %u confirmed, %u rejected | wrong strategies: %u seeded, %u confirmed, %u rejected; "
+                "first attempt %s / %s\n",
+                tg.seeded, tg.confirmed, tg.rejectedBySim, tb.seeded, tb.confirmed, tb.rejectedBySim,
+                rg.attemptsToComplete == 1 ? "completed" : "died", rb.attemptsToComplete == 1 ? "completed" : "died");
+    for (auto const& m : msgs) std::printf("      %s\n", m.c_str());
+    CHECK(rg.attemptsToComplete == 1);
+    CHECK(rb.attemptsToComplete == 1);
+    CHECK(tg.confirmed > 0);
+    CHECK(tb.rejectedBySim > 0);
+    CHECK(tb.rejectedBySim > tb.confirmed);
+    // the library never writes physics; calibration changes only from observed play
+    for (size_t i = 0; i < PhysicsCalibration::kSlots; ++i)
+        CHECK(bad.patterns.physics.modes[i].impulse.n >= calBefore.modes[i].impulse.n);
+}
+
+TEST(transfer_cost_per_step_is_small) {
+    Knowledge k = trainedKnowledge(true, 1, 60);
+    sim::Level L = solvableGenerated(kEvalSeeds[3]);
+    double us[2] = {0, 0};
+    for (int withLib = 0; withLib < 2; ++withLib) {
+        Knowledge kk = k;
+        LevelMemory mem = freshLevel(L);
+        Agent agent;
+        agent.attach(&mem, &kk.patterns, withLib ? &kk.strategies : nullptr);
+        PredictionRig rig;
+        rig.model.loadCalibration(kk.patterns.physics);
+        agent.setPredictor(&rig.predictor);
+        auto t0 = std::chrono::steady_clock::now();
+        size_t steps = 0;
+        for (int i = 0; i < 3; ++i) {
+            runAttempt(agent, L, &rig);
+            steps += agent.steps().size();
+        }
+        us[withLib] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / std::max<size_t>(1, steps);
+    }
+    std::printf("    %.1f us per decision without the library, %.1f with it\n", us[0], us[1]);
+    CHECK(us[1] < us[0] * 1.5 + 5.0);
 }
 
 TEST(upside_down_cube_contact_is_not_a_ceiling) {

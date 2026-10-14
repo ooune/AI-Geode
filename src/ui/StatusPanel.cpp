@@ -148,6 +148,17 @@ void StatusPanel::refresh() {
             }
         }
 
+        // Cross-level transfer: what is ahead, and what the strategy library did about it.
+        if (!st.situation.empty()) text += "\nAhead: " + st.situation;
+        if (!st.transferEvent.empty()) text += "\nTransfer: " + st.transferEvent;
+        {
+            auto const& T = st.transfer;
+            if (T.situations > 0)
+                text += fmt::format("\nStrategies this attempt: {} groups ({} known, {} similar, {} new) | {} executed as learned, {} replaced "
+                                    "by the search, {} played directly, {} rejected after failing here",
+                                    T.situations, T.known, T.similar, T.unknown, T.confirmed, T.rejectedBySim, T.played, T.rejectedHere);
+        }
+
         if (set.showDebug) {
             auto const& o = ai.lastObservation();
             auto feat = [](char const* name, aigd::Feature const& f) {

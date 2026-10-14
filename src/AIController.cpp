@@ -80,6 +80,10 @@ std::filesystem::path AIController::patternsPath() const {
     return Mod::get()->getSaveDir() / "patterns.json";
 }
 
+std::filesystem::path AIController::strategiesPath() const {
+    return Mod::get()->getSaveDir() / "strategies.json";
+}
+
 std::filesystem::path AIController::levelPath(std::string const& key) const {
     return levelsDir() / (aigd::storage::sanitizeFileName(key) + ".json");
 }
@@ -108,6 +112,13 @@ void AIController::ensurePatternsLoaded() {
                   m_patterns.leads.size(), m_physics.describe());
     } else {
         log::info("No pattern memory yet ({})", err);
+    }
+    std::string serr;
+    if (aigd::storage::loadStrategyFile(strategiesPath(), m_strategies, &serr)) {
+        log::info("Loaded strategy library: {} situations, {} strategies, learned on {} levels", m_strategies.size(),
+                  m_strategies.records(), m_strategies.levels.size());
+    } else {
+        log::info("No strategy library yet ({})", serr);
     }
 }
 
@@ -152,7 +163,7 @@ void AIController::onLevelInit(PlayLayer* layer) {
         m_level = std::move(mem);
     }
     m_level->name = std::string(layer->m_level->m_levelName);
-    m_agent.attach(m_level.get(), &m_patterns);
+    m_agent.attach(m_level.get(), &m_patterns, &m_strategies);
     applyAgentConfig();
     m_agent.setPhase(m_settings.aiEnabled && m_supported ? aigd::AgentPhase::Observing : aigd::AgentPhase::Disabled);
 
@@ -379,6 +390,13 @@ void AIController::logAttemptQuality(aigd::GameMode mode, bool mini) const {
               m_clock.averageInterval(), m_clock.recentMaxInterval(), model.vxPerTick(aigd::speedClassFromPlayerSpeed(m_lastObs.playerSpeed)),
               plans.adopted, st.plansInvalidatedThisAttempt, st.actionsCancelledThisAttempt, st.decisionsFollowingPlan, st.experimentsCancelled,
               st.planEvent.empty() ? "" : " | last: ", st.planEvent);
+    auto const& T = st.transfer;
+    log::info("Transfer: {} obstacle groups ({} known, {} similar, {} new, {} rejected after failing here, {} speed-adapted) | strategies "
+              "simulated {}: executed as learned {}, replaced by the search {}; played directly {} | recorded {} passes, {} failures | "
+              "library {} situations from {} levels{}{}",
+              T.situations, T.known, T.similar, T.unknown, T.rejectedHere, T.speedAdapted, T.seeded, T.confirmed, T.rejectedBySim, T.played,
+              T.successes, T.failures, m_strategies.size(), m_strategies.levels.size(), st.transferEvent.empty() ? "" : " | last: ",
+              st.transferEvent);
     (void)mini;
 }
 
@@ -449,6 +467,8 @@ void AIController::saveAsync() {
         m_patterns.physics = m_physics.calibration();
         auto snapshot = std::make_shared<aigd::PatternMemory>(m_patterns);
         m_saver.enqueue(patternsPath(), [snapshot] { return aigd::storage::serializePatterns(*snapshot); });
+        auto lib = std::make_shared<aigd::StrategyLibrary>(m_strategies);
+        m_saver.enqueue(strategiesPath(), [lib] { return aigd::storage::serializeStrategies(*lib); });
     }
 }
 
@@ -489,7 +509,7 @@ void AIController::resetLevelMemory() {
     fresh.levelLength = m_level->levelLength;
     *m_level = std::move(fresh);
     m_agent.resetTransient();
-    m_agent.attach(m_level.get(), &m_patterns);
+    m_agent.attach(m_level.get(), &m_patterns, &m_strategies);
     saveNow();
     notify("AI memory for this level was reset.", NotificationIcon::Success);
 }
@@ -501,7 +521,10 @@ void AIController::resetAllMemory() {
     std::filesystem::remove_all(levelsDir(), ec);
     std::filesystem::remove(patternsPath(), ec);
     std::filesystem::remove(patternsPath().string() + ".bak", ec);
+    std::filesystem::remove(strategiesPath(), ec);
+    std::filesystem::remove(strategiesPath().string() + ".bak", ec);
     m_patterns = aigd::PatternMemory{};
+    m_strategies.clear();
     m_physics.reset();
     if (m_level) {
         aigd::LevelMemory fresh;
@@ -510,9 +533,84 @@ void AIController::resetAllMemory() {
         fresh.levelLength = m_level->levelLength;
         *m_level = std::move(fresh);
         m_agent.resetTransient();
-        m_agent.attach(m_level.get(), &m_patterns);
+        m_agent.attach(m_level.get(), &m_patterns, &m_strategies);
     }
     notify("All AI memory was deleted.", NotificationIcon::Success);
+}
+
+void AIController::resetCrossLevelKnowledge() {
+    if (m_layer) endAttemptWithoutOutcome(m_layer);
+    m_saver.flush();
+    std::error_code ec;
+    for (auto const& p : {patternsPath(), strategiesPath()}) {
+        std::filesystem::remove(p, ec);
+        std::filesystem::remove(p.string() + ".bak", ec);
+    }
+    m_patterns = aigd::PatternMemory{};
+    m_strategies.clear();
+    m_physics.reset();
+    if (m_level) {
+        m_agent.resetTransient();
+        m_agent.attach(m_level.get(), &m_patterns, &m_strategies);
+    }
+    notify("Cross-level knowledge was reset (every level's own memory is kept).", NotificationIcon::Success);
+}
+
+void AIController::exportKnowledge() {
+    m_patterns.physics = m_physics.calibration();
+    auto patterns = std::make_shared<aigd::PatternMemory>(m_patterns);
+    auto lib = std::make_shared<aigd::StrategyLibrary>(m_strategies);
+    file::FilePickOptions options;
+    options.defaultPath = Mod::get()->getConfigDir() / "knowledge.aigeode.json";
+    options.filters.push_back({"AI Geode knowledge", {"*.json"}});
+    async::spawn(file::pick(file::PickMode::SaveFile, std::move(options)), [patterns, lib](file::PickResult result) {
+        if (result.isErr()) {
+            notify("Export failed: " + result.unwrapErr(), NotificationIcon::Error);
+            return;
+        }
+        auto path = result.unwrap();
+        if (!path) return;
+        std::string err;
+        if (aigd::storage::writeFileAtomic(*path, aigd::storage::serializeKnowledge(*patterns, *lib), &err)) {
+            notify("Exported cross-level knowledge to " + path->filename().string(), NotificationIcon::Success);
+        } else {
+            notify("Export failed: " + err, NotificationIcon::Error);
+        }
+    });
+}
+
+void AIController::importKnowledge() {
+    file::FilePickOptions options;
+    options.filters.push_back({"AI Geode knowledge", {"*.json"}});
+    async::spawn(file::pick(file::PickMode::OpenFile, std::move(options)), [this](file::PickResult result) {
+        if (result.isErr()) {
+            notify("Import failed: " + result.unwrapErr(), NotificationIcon::Error);
+            return;
+        }
+        auto path = result.unwrap();
+        if (!path) return;
+        std::string err;
+        auto text = aigd::storage::readFile(*path, &err);
+        aigd::PatternMemory patterns;
+        aigd::StrategyLibrary lib;
+        if (!text || !aigd::storage::deserializeKnowledge(*text, patterns, lib, &err)) {
+            notify("Import failed: " + err, NotificationIcon::Error);
+            return;
+        }
+        if (m_layer) endAttemptWithoutOutcome(m_layer);
+        m_saver.flush();
+        m_patterns = std::move(patterns);
+        m_strategies = std::move(lib);
+        m_physics.loadCalibration(m_patterns.physics);
+        if (m_level) {
+            m_agent.resetTransient();
+            m_agent.attach(m_level.get(), &m_patterns, &m_strategies);
+        }
+        saveNow();
+        notify(fmt::format("Imported cross-level knowledge: {} strategy situations from {} levels", m_strategies.size(),
+                           m_strategies.levels.size()),
+               NotificationIcon::Success);
+    });
 }
 
 void AIController::exportLevelMemory() {
@@ -566,7 +664,7 @@ void AIController::importLevelMemory() {
             if (m_layer) endAttemptWithoutOutcome(m_layer);
             *m_level = std::move(imported);
             m_agent.resetTransient();
-            m_agent.attach(m_level.get(), &m_patterns);
+            m_agent.attach(m_level.get(), &m_patterns, &m_strategies);
             notify("Imported memory for this level.", NotificationIcon::Success);
         } else {
             notify("Imported memory for level " + (imported.name.empty() ? imported.key : imported.name) + ".", NotificationIcon::Success);
