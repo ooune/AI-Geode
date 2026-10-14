@@ -174,6 +174,11 @@ bool StrategicPlanner::makePlan(Observation const& obs, bool holding, Predictor 
 
     PredictedPath tmp;
     int sims = 0;
+    auto outOfBudget = [&]() {
+        if (sims >= m_cfg.maxSimulations) return true;
+        if (m_cfg.maxMicros <= 0.f || (sims & 7) != 0) return false;
+        return std::chrono::duration<float, std::micro>(std::chrono::steady_clock::now() - t0).count() > m_cfg.maxMicros;
+    };
     std::vector<SequenceCandidate> all;
     all.reserve(96);
 
@@ -250,7 +255,7 @@ bool StrategicPlanner::makePlan(Observation const& obs, bool holding, Predictor 
     std::vector<Partial> frontier;
     std::vector<SequenceCandidate> level1;
     for (int k : firstDelays) {
-        if (sims >= m_cfg.maxSimulations) break;
+        if (outOfBudget()) break;
         Plan p{k, 0, 0, false};
         SequenceCandidate c = evaluate(p);
         bool const exp = expandable(c, 1);
@@ -267,7 +272,7 @@ bool StrategicPlanner::makePlan(Observation const& obs, bool holding, Predictor 
             if (t.plan.pressAt < 0) continue;
             for (int d : {-2, -1, 1, 2}) {
                 int const k = t.plan.pressAt + d;
-                if (k < 0 || k >= P.horizon || sims >= m_cfg.maxSimulations) continue;
+                if (k < 0 || k >= P.horizon || outOfBudget()) continue;
                 bool tried = false;
                 for (auto const& c : level1) tried = tried || c.plan.pressAt == k;
                 if (tried) continue;
@@ -296,7 +301,7 @@ bool StrategicPlanner::makePlan(Observation const& obs, bool holding, Predictor 
         std::vector<Partial> next;
         for (auto const& f : frontier) {
             for (int d : kAfterLanding) {
-                if (sims >= m_cfg.maxSimulations) break;
+                if (outOfBudget()) break;
                 Plan p = f.c.plan;
                 (depth == 1 ? p.secondAt : p.thirdAt) = d;
                 SequenceCandidate c = evaluate(p);

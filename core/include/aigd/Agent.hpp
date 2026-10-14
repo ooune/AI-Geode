@@ -234,7 +234,12 @@ class Agent {
 public:
     explicit Agent(LearnerConfig cfg = {});
 
-    void setConfig(LearnerConfig const& cfg) { m_cfg = cfg; }
+    void setConfig(LearnerConfig const& cfg) {
+        m_cfg = cfg;
+        StrategicConfig sc = m_strategic.config();
+        sc.maxMicros = cfg.strategicMaxMicros;
+        m_strategic.setConfig(sc);
+    }
     LearnerConfig const& config() const { return m_cfg; }
 
     // Memory is owned by the caller and must outlive the attachment.

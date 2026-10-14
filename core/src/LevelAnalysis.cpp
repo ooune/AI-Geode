@@ -146,7 +146,16 @@ LevelAnalysis analyzeLevel(LevelMap const& map, AnalysisStart const& start, Stra
                     }
                 }
                 g.gapBefore = s.startX - prevEnd;
-                g.landingSpace = s.landingSpace;
+                // the free path after the group, from the whole map (the
+                // description only sees a limited window)
+                g.landingSpace = 10.f * kBlock;
+                map.query(g.endX + 1.f, g.endX + 10.f * kBlock, hits);
+                for (uint32_t i : hits) {
+                    MapObject const& m = map.at(i);
+                    if (m.kind != MapKind::Hazard && m.kind != MapKind::Solid) continue;
+                    if (m.l <= g.endX || m.t <= surface + 1.f || m.b >= surface + 2.f * h - 2.f) continue; // not on the walking path
+                    g.landingSpace = std::min(g.landingSpace, m.l - g.endX);
+                }
                 g.unmodelled = s.unmodelled;
                 map.query(g.startX - 1.f, g.endX + 1.f, hits);
                 for (uint32_t i : hits) {

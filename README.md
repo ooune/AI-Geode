@@ -481,6 +481,103 @@ What this shows, and what it does not:
 - **Cost:** within measurement noise. Two runs of the agent loop (simulator and predictor included) took 278 → 277 µs and 214 → 220 µs per decision, without → with the library.
 - **Benchmark:** unchanged, because the existing learning benchmark does not attach a library.
 
+### Full-level perception and strategic planning (v0.5.0)
+
+**What can be read from the game.** GD 2.2 creates every object of a level when the level loads (`PlayLayer::m_objects`), so the whole level is available before the first step. Per object, the mod uses:
+- the game's collision rectangle (`GameObject::getObjectRect`). For spikes this is the real hitbox, smaller than the artwork;
+- the object type (`m_objectType`) and id (`m_objectID`), which give the kind: hazard, block, one-way platform (`m_isPassable`), slope, pad, orb, speed portal (ids 200–203, 1334), gravity portal (normal / inverse / toggle), mode, size, dual and teleport portals;
+- `m_isNoTouch` (ignored) and `m_isGroupDisabled` (toggled off);
+- the rotation: a hitbox rotated by a non-right angle is stored as its bounding box and marked *approximate*;
+- the groups (`m_groups`, `m_groupCount`), and for triggers the target group (`EffectGameObject::m_targetGroupID`). Objects in a group targeted by a move, rotate, toggle, follow, follow-player-Y, animate, area, advanced-follow or keyframe trigger are marked *dynamic*.
+
+What is **not** read or simulated:
+- when a trigger fires and where it moves things (the map refreshes dynamic objects from the game instead of predicting them);
+- spawn, count, item and collision triggers;
+- the effect of orbs, pads, slopes, one-way platforms, mode, size, dual and teleport portals (paths touching them are uncertain, as before);
+- the exact oriented hitboxes of rotated objects.
+
+**Level map** (`core/LevelMap`):
+- static objects are indexed once: sorted by left edge, plus a grid of 120-unit columns, so a window query never scans the level;
+- dynamic objects are kept apart. Near the player they are re-read every step, and all of them every 8 steps;
+- every 30 steps up to 64 static objects ahead are checked against the game, and one that moved is treated as dynamic from then on;
+- every change bumps a version number, which invalidates plans made with the old geometry;
+- speed and gravity portals become *physics events* for the predictor. Everything else that is not simulated stays an uncertain obstacle.
+
+Optimised build: indexing 1 000 / 10 000 / 50 000 objects takes 0.14 / 0.74 / 3.8 ms, and a window query 0.3–0.5 µs.
+
+**Whole-level analysis** (`core/LevelAnalysis`). Once per level load, before playing, the AI works out:
+- the start, the finish, and the sections between physics changes (mode, speed, gravity, size, as far as the portals tell);
+- the obstacle groups, with the same relative description the strategy library uses: the free path before and after each group, the headroom above it, and whether it contains unmodelled, moving or approximate objects;
+- a difficulty estimate, the tight landings and the hardest groups;
+- for corridor modes and flipped gravity, only the smallest vertical gap and the number of narrow passages (groups are described for cube and robot with normal gravity only);
+- which groups the strategy library already knows (exactly or similar).
+
+Nothing is simulated in the analysis; the walking surface in front of a group is assumed from the floor and from the blocks a jump could reach. In the optimised build it takes 0.21 / 0.96 / 6.0 ms for 1 000 / 10 000 / 50 000 objects. The Geode log gets `Level map:` and `Level analysis:` lines and the five hardest groups.
+
+**Physics transitions in the prediction.**
+- *Speed portals* are simulated: the horizontal speed changes when the hitbox reaches the portal. In the simulator, the position error after a 1× → 3× portal stayed below 0.01 units.
+- *Gravity portals* are simulated too (the flip, then falling the other way). The simulator matches exactly (landing on the ceiling at x 253.88 in both). In game the model of the flip has not been checked, so a path through a gravity portal is never reported as safe there: it is *uncertain* from the portal on.
+
+**Strategic planner** (`core/StrategicPlanner`). Two cooperating systems:
+- the *strategic planner* decides which upcoming obstacles have to be handled together and with which input sequence;
+- the *real-time controller* (the predictor's search, the safety layer and the live plan of v0.3.0) decides every input and cancels whatever no longer fits.
+
+How a sequence plan is made:
+1. **The sequence.** From the ground in cube or robot mode, the group ahead and every following group with less than 4 blocks of free path between them (at most 18 blocks, 6 groups) form one sequence. It is described, e.g. *"single spike -> 2-4-block landing -> double spike"*. A sequence is planned once its first group is at most 160 steps away.
+2. **The search** uses the same trajectory simulation, covering the whole sequence (up to 420 steps), at most 160 simulations per plan:
+   - when to press first (or not at all): a coarse grid, the timing from the strategy library if one fits, and single-step refinement around the three best;
+   - then, for the most promising timings (beam of 4), a second press timed from the landing, and a third from the next landing;
+   - deeper levels are only searched while no fully safe sequence with fewer presses exists.
+3. **Scoring**, in order:
+   - safety;
+   - for sequences that are safe until the landing after their last press and only hit something later (*open-ended*), the number of groups they get past;
+   - clearance;
+   - a cost per press;
+   - the free path in front of every landing;
+   - robustness, i.e. whether neighbouring timings work too.
+4. **What judging only the next obstacles would have chosen** is recorded too. When the chosen first press differs and the locally best one collides later, the plan says so: *"press in 0 clears the first obstacle but collides 184 steps ahead (1 of 2 groups handled); press in 20 handles ..."*.
+5. **To the controller.** The plan is handed over only if it is safe at least up to its last landing:
+   - its next press is added as a candidate that is evaluated *after* the controller's own and wins only if strictly better;
+   - the controller's look-ahead is extended to the part the plan covers, so the controller's own candidates are judged by what they do to the later obstacles too;
+   - if no such plan exists, the controller decides alone as before. Judging every candidate by a far-away collision made the next input worse: measured, see below.
+6. **Staying correct.** The plan is checked on every step against the real state (position, height, on the ground or not, mode, speed, gravity) and against the map version. It is re-made from the actual state when they differ: *"state left the strategic plan (...) - replanning the sequence from the actual state"*. When the controller's own search finds a better sequence over the same look-ahead, the plan takes over the path of the action that was actually executed, so it keeps describing reality instead of being invalidated again and again.
+
+Safety is never overridden: the safety ladder, the "no unnecessary jump" rule, the failure memory and plan cancellation all work as before.
+
+**Sequence keys (cross-level).** Situations now also have a *sequence* key: the group plus the first element of what follows it. The library records and retrieves strategies under it first (then exact, then similar), so it learns that the same spike needs another timing when a double spike follows closely. On another level with the same sequence somewhere else, that timing is retrieved for it. Without prediction, the first attempt there reached 100% with the library and 30% without.
+
+**Level-understanding debug view** (*Show Level Understanding*, off by default; every layer can be switched off):
+- *extracted* objects, as filled boxes: red hazards, grey blocks, cyan simulated portals;
+- *uncertain* objects, as outlines: yellow not simulated, magenta moved by triggers, orange approximate;
+- *inferred* geometry, as outlines: white obstacle groups, orange tight landings, blue the sequence being planned, green landing space;
+- *predicted* movement, as lines and dots: the strategic plan's path, its presses, landing targets and the other evaluated first presses;
+- a strip at the bottom with the whole level, its obstacle groups and physics changes, and the player;
+- warnings for uncertain geometry ahead.
+
+The overlay builder is in the core and tested: the drawn path is exactly the plan's path.
+
+**Results (simulator).**
+
+| Test | Result |
+|---|---|
+| whole-level extraction | every object indexed; objects beyond the old 480-unit window known from the start; window queries agree with a brute-force scan everywhere |
+| obstacle sequence (spike, short platform, two spikes, spike pit, low ceiling, speed and gravity portal) | 6 groups in order with their spacing (e.g. 101 units of landing space after the first spike), the low ceiling over the spike (headroom 60), 2 physics changes, 3 sections |
+| landing planning: 40 dense sequence levels not used while writing the planner (seeds 400–439), first attempt, no learning | controller alone: 26 completed, 84.2% mean progress; with strategic planning: **29 completed, 86.8%** |
+| an early version that also used plans without a safe sequence | 9 vs. 11 completed on 16 levels (worse); found, traced, fixed (see step 5 above) |
+| no unnecessary jump (a spike, then hanging spikes over the landing) | 1 press, and the sequence plan has 1 press; hanging spikes only: 0 presses |
+| physics transition (1× → 3× portal before a sequence) | the first press moves from 115 to 58 steps ahead; position error after the portal < 0.01 units |
+| dynamic obstacle (a block drops onto the path at step 120) | map version 1 → 2, the plan is re-made (*"the level geometry changed"*), completed; with stale geometry the AI dies at x=656 |
+| replanning (landing early on a block the AI cannot see) | sequence plan and live plan invalidated from the real state, completed |
+| cross-level sequence transfer | sequence-key match on another level; first attempt 100% vs. 30% without the library |
+| overlay consistency | drawn path = plan path (0 mismatches); 10 of 20 presses exactly at a planned press, the others where the controller's refinement moved them (the plan then follows them) |
+
+All 95 unit tests pass (2583 checks, 0 failures).
+
+**Cost** (optimised build, with the simulator, prediction and agent included):
+- a sequence plan takes 0.54 ms on average and 1.8 ms at most;
+- the agent loop takes 36 µs per physics step with strategic planning and 11.5 µs without (the 3× is the longer look-ahead the controller then searches over);
+- the whole-level analysis runs once per load.
+
 ### Practice-mode learning
 With **Practice Mode Learning** on, the AI:
 - switches the level to practice mode;
@@ -625,7 +722,7 @@ Add `--bench` to also run the multi-seed learning benchmark.
 
 ### Results
 
-Unit tests: 85 tests, 2140 checks, 0 failures.
+Unit tests: 95 tests, 2583 checks, 0 failures.
 
 Trajectory prediction against the simulator:
 - calibration recovers the simulator's physics exactly (g 0.2200, k 0.2326,
@@ -807,6 +904,20 @@ sizes and landing tolerance are still unconfirmed.
   - the first in-game run showed a recording error: a group that an *earlier* jump had already cleared (the player was in the air over it) was recorded as a successful "no jump". Such groups are now not recorded ("not attributable": 46 of 82 groups on Dry Out, because in real levels the player is often already in the air when approaching the next group). The fix also improved the simulator result above (15/18 to 18/18);
   - a strategy that reached the search was **never executed as learned in game**: the search always found a plan it scored higher, often by a small margin (560.0 vs 549.0). With a calibrated, trusted model the library adds nothing measurable in game, matching the simulator;
   - completion was not affected: Dry Out was completed in practice mode in 2 attempts.
+- **v0.5.0 in game** (GD 2.2081, three main levels):
+  - *Level map:* Dry Out 1166 of 1493 objects, Time Machine 2563 of 3735, Cycles 2269 of 4069, each indexed in 0.5–1.1 ms. None of these levels uses move or toggle triggers, so the dynamic-object path was **not exercised in game**.
+  - *Analysis at load* took 0.16–0.31 ms. Dry Out: 47 obstacle groups, 2 gravity and 2 mode portals, 11 groups already known to the library and 10 similar. Time Machine: 54 groups, 10 gravity portals. Cycles: 33 groups, 22 gravity portals. The first build reported 8.0 blocks of landing space for many groups (the default when the next obstacle lay outside the describing window); landing space is now measured on the whole map.
+  - *Dry Out* (500+ earlier attempts of memory) was completed on the first attempt of the session: 15 043 decisions with a trusted prediction, 81 without; 216 sequence plans, 10 of them choosing another first press than the locally best one; the controller executed the plan in 980 of 1 720 decisions where it was a candidate.
+  - *New levels:* Time Machine reached 44.5% in 21 practice attempts (stuck at a ship / cube section around 43%). Cycles stayed at 3.6% for 17 attempts and then at 13.2–13.6% up to attempt 57 (sections with orbs and pads, which are not simulated). **There is no in-game comparison with strategic planning off**, so whether it helps in game is not shown.
+  - *Cost:* sequence plans took 0.8–1.5 ms on average with peaks up to 4.3 ms. With the 2 ms budget added after that, the peaks were 0.96 ms. 60–70% of plans were re-made after the state left them, mostly where the learned policy (not the planner) decided differently.
+  - *Debug view:* checked visually on Cycles. It shows the planned sequences (blue), the inferred groups, the whole-level strip, and the warning about objects that are not simulated.
+- **v0.5.0 limits:**
+  - sequence planning and obstacle groups cover cube and robot only; other modes get the corridor check and the longer map window, but no sequence plans;
+  - a sequence plan has at most three presses (an open-ended plan hands over to the next decision after its last landing);
+  - the trigger list that marks objects as moving may be incomplete. Unlisted movement is only noticed by the runtime check (64 objects ahead every 30 steps), and an object a trigger moves *into* view from far away is only refreshed every 8 steps;
+  - the gravity-portal model is unverified in game (such paths are uncertain), and mode / size / dual / teleport portals, orbs, pads, slopes and one-way platforms are still not simulated;
+  - the whole-level analysis is geometric. Its walking surface and difficulty are estimates, and only the predictor decides what is safe;
+  - a sequence plan can take up to ~1.8 ms (optimised build), in the game thread, at most once every few steps.
 - **Cross-level transfer (v0.4.0) is limited to cube and robot.** Situations are only described from the ground in those modes. Ship, wave and the other modes still transfer only through the physics calibration, timing statistics and pattern prior.
 - **The situation description does not see everything that matters:** orbs and pads (only flagged), the floor ending, moving objects, or a different input delay. Such differences are only discovered through failures on the new level (negative-transfer handling).
 - **Strategies were evaluated on generated simulator levels.** Whether the in-game first attempt on an unseen level improves can only be shown by playing new levels in game.
@@ -833,7 +944,7 @@ sizes and landing tolerance are still unconfirmed.
 ```
 core/      learning library (Agent, FailureAnalyzer, Memory, Storage, Json,
            Physics, Predictor, PlanManager, StepClock, Situation, Strategy,
-           Overlay) – no Geode dependency
+           LevelMap, LevelAnalysis, StrategicPlanner, Overlay) – no Geode dependency
 tests/     unit tests, GD-like simulator, benchmark
 src/       Geode mod: Observer, AIController, SaveWorker, hooks/, ui/ (StatusPanel, AIMenuPopup, TrajectoryOverlay)
 mod.json   Geode metadata and settings

@@ -76,6 +76,7 @@ void AIController::applyAgentConfig() {
     cfg.learningEnabled = m_settings.learning;
     cfg.usePrediction = m_settings.prediction;
     cfg.useStrategicPlanning = m_settings.strategicPlanning;
+    cfg.strategicMaxMicros = 2000.f; // a sequence plan never takes much more than 2 ms of a frame
     m_agent.setConfig(cfg);
     m_predictor.setHorizon(static_cast<int>(m_settings.predictionHorizon * aigd::kTicksPerSecond));
 }

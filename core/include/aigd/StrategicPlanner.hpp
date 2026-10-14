@@ -20,6 +20,9 @@ struct StrategicConfig {
     int replanEvery = 60;            // steps (a plan is also re-made when the state leaves it)
     int beam = 4;                    // partial sequences expanded per depth
     float planAhead = 160.f;         // steps: a sequence is planned once its first group is this close
+    // Time budget per plan in microseconds (0 = none). The search stops early
+    // when it is used up (bounded frame time in game; tests stay deterministic).
+    float maxMicros = 0.f;
 };
 
 // One evaluated input sequence (presses relative to the step the plan was made in).

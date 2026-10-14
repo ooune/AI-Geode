@@ -109,7 +109,7 @@ char const* safetyVerdictName(SafetyVerdict v) {
     }
 }
 
-Agent::Agent(LearnerConfig cfg) : m_cfg(cfg), m_rng(cfg.seed) {}
+Agent::Agent(LearnerConfig cfg) : m_cfg(cfg), m_rng(cfg.seed) { setConfig(cfg); }
 
 void Agent::attach(LevelMemory* level, PatternMemory* patterns, StrategyLibrary* strategies) {
     m_level = level;
@@ -263,6 +263,7 @@ void Agent::beginAttempt(Observation const& first, bool fromCheckpoint) {
     m_strategic.plansMade = 0;
     m_strategic.invalidations = 0;
     m_strategic.overrides = 0;
+    m_strategic.adopted = 0;
     m_strategic.totalMicros = 0.0;
     m_strategic.maxMicros = 0.f;
     m_status.strategic.clear();
