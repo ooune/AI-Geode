@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <optional>
+#include <unordered_set>
 
 using namespace geode::prelude;
 
@@ -79,7 +80,84 @@ std::optional<uint8_t> classify(GameObjectType type) {
 }
 } // namespace
 
+namespace {
+// What an object is for the level map: kind and value (speed class, mode, ...).
+std::optional<std::pair<aigd::MapKind, uint8_t>> classifyForMap(GameObject* obj) {
+    using K = aigd::MapKind;
+    using M = aigd::GameMode;
+    switch (obj->m_objectID) {
+        case 200: return std::pair{K::SpeedPortal, uint8_t(0)}; // 0.5x
+        case 201: return std::pair{K::SpeedPortal, uint8_t(1)}; // 1x
+        case 202: return std::pair{K::SpeedPortal, uint8_t(2)}; // 2x
+        case 203: return std::pair{K::SpeedPortal, uint8_t(3)}; // 3x
+        case 1334: return std::pair{K::SpeedPortal, uint8_t(4)}; // 4x
+        default: break;
+    }
+    auto mode = [](M m) { return std::pair{K::ModePortal, static_cast<uint8_t>(m)}; };
+    switch (obj->m_objectType) {
+        case GameObjectType::Hazard:
+        case GameObjectType::AnimatedHazard: return std::pair{K::Hazard, uint8_t(0)};
+        case GameObjectType::Solid:
+        case GameObjectType::Breakable: return std::pair{obj->m_isPassable ? K::Platform : K::Solid, uint8_t(0)};
+        case GameObjectType::Slope: return std::pair{K::Slope, uint8_t(0)};
+        case GameObjectType::YellowJumpPad:
+        case GameObjectType::PinkJumpPad:
+        case GameObjectType::GravityPad:
+        case GameObjectType::RedJumpPad:
+        case GameObjectType::SpiderPad: return std::pair{K::Pad, uint8_t(0)};
+        case GameObjectType::YellowJumpRing:
+        case GameObjectType::PinkJumpRing:
+        case GameObjectType::GravityRing:
+        case GameObjectType::GreenRing:
+        case GameObjectType::DropRing:
+        case GameObjectType::RedJumpRing:
+        case GameObjectType::CustomRing:
+        case GameObjectType::DashRing:
+        case GameObjectType::GravityDashRing:
+        case GameObjectType::SpiderOrb:
+        case GameObjectType::TeleportOrb: return std::pair{K::Orb, uint8_t(0)};
+        case GameObjectType::NormalGravityPortal: return std::pair{K::GravityPortal, uint8_t(0)};
+        case GameObjectType::InverseGravityPortal: return std::pair{K::GravityPortal, uint8_t(1)};
+        case GameObjectType::GravityTogglePortal: return std::pair{K::GravityPortal, uint8_t(2)};
+        case GameObjectType::CubePortal: return mode(M::Cube);
+        case GameObjectType::ShipPortal: return mode(M::Ship);
+        case GameObjectType::BallPortal: return mode(M::Ball);
+        case GameObjectType::UfoPortal: return mode(M::Ufo);
+        case GameObjectType::WavePortal: return mode(M::Wave);
+        case GameObjectType::RobotPortal: return mode(M::Robot);
+        case GameObjectType::SpiderPortal: return mode(M::Spider);
+        case GameObjectType::SwingPortal: return mode(M::Swing);
+        case GameObjectType::RegularSizePortal: return std::pair{K::SizePortal, uint8_t(0)};
+        case GameObjectType::MiniSizePortal: return std::pair{K::SizePortal, uint8_t(1)};
+        case GameObjectType::DualPortal:
+        case GameObjectType::SoloPortal:
+        case GameObjectType::TeleportPortal: return std::pair{K::OtherPortal, uint8_t(0)};
+        default: return std::nullopt;
+    }
+}
+
+// Triggers that move, rotate, toggle or animate the objects of a group.
+bool movesGroups(int id) {
+    switch (id) {
+        case 901:  // move
+        case 1346: // rotate
+        case 1049: // toggle
+        case 1347: // follow
+        case 1814: // follow player y
+        case 1585: // animate
+        case 3006: case 3007: case 3008: case 3009: case 3010: // area move / rotate / scale / fade / tint
+        case 3011: case 3012: case 3013: case 3014: case 3015: // edit area triggers
+        case 3016: // advanced follow
+        case 3660: case 3661: // edit / re-target advanced follow
+        case 3033: // keyframe animation
+            return true;
+        default: return false;
+    }
+}
+} // namespace
+
 void Observer::reset() {
+    m_mapSources.clear();
     m_items.clear();
     m_items.shrink_to_fit();
     m_cursor = 0;
@@ -88,10 +166,10 @@ void Observer::reset() {
     m_layer = nullptr;
 }
 
-void Observer::ensureIndex(PlayLayer* layer) {
-    if (!layer || !layer->m_objects) return;
+bool Observer::ensureIndex(PlayLayer* layer) {
+    if (!layer || !layer->m_objects) return false;
     unsigned count = layer->m_objects->count();
-    if (layer == m_layer && count == m_indexedCount) return;
+    if (layer == m_layer && count == m_indexedCount) return false;
 
     m_items.clear();
     m_layer = layer;
@@ -108,6 +186,86 @@ void Observer::ensureIndex(PlayLayer* layer) {
     m_cursor = 0;
     m_lastX = 0.f;
     log::info("Observer indexed {} relevant objects (of {})", m_items.size(), count);
+    return true;
+}
+
+void Observer::buildMap(PlayLayer* layer, aigd::LevelMap& map, float floorSurface, MapStats& stats) {
+    stats = MapStats{};
+    m_mapSources.clear();
+    map.clear();
+    if (!layer || !layer->m_objects) return;
+    stats.levelObjects = layer->m_objects->count();
+    // groups that triggers move or toggle
+    std::unordered_set<int> moved;
+    for (auto* obj : CCArrayExt<GameObject*>(layer->m_objects)) {
+        if (!obj || !obj->m_isTrigger || !movesGroups(obj->m_objectID)) continue;
+        if (auto* e = typeinfo_cast<EffectGameObject*>(obj)) {
+            ++stats.triggers;
+            if (e->m_targetGroupID > 0) moved.insert(e->m_targetGroupID);
+        }
+    }
+    stats.movedGroups = moved.size();
+    std::vector<aigd::MapObject> objs;
+    objs.reserve(stats.levelObjects / 3);
+    for (auto* obj : CCArrayExt<GameObject*>(layer->m_objects)) {
+        if (!obj || obj->m_isNoTouch) continue;
+        auto k = classifyForMap(obj);
+        if (!k) continue;
+        auto const& rect = obj->getObjectRect();
+        if (rect.size.width <= 0.f || rect.size.height <= 0.f) {
+            ++stats.skipped;
+            continue;
+        }
+        aigd::MapObject m;
+        m.l = rect.getMinX();
+        m.b = rect.getMinY();
+        m.r = rect.getMaxX();
+        m.t = rect.getMaxY();
+        m.kind = k->first;
+        m.value = k->second;
+        m.enabled = !obj->m_isGroupDisabled;
+        float const rot = std::fmod(std::fabs(obj->getRotation()), 90.f);
+        m.approximate = rot > 1.f && rot < 89.f; // the box is the bounding box of a rotated hitbox
+        if (obj->m_groups && !moved.empty()) {
+            for (int g = 0; g < obj->m_groupCount && g < 10; ++g)
+                if (moved.count((*obj->m_groups)[static_cast<size_t>(g)])) m.dynamic = true;
+        }
+        m.source = static_cast<uint32_t>(m_mapSources.size());
+        m_mapSources.push_back(obj);
+        objs.push_back(m);
+    }
+    map.build(std::move(objs), std::max(1.f, layer->m_levelLength), floorSurface);
+}
+
+void Observer::refreshMap(aigd::LevelMap& map, float x, int32_t tick) {
+    if (map.empty() || m_mapSources.empty()) return;
+    bool const all = (tick & 7) == 0;
+    auto const& dyn = map.dynamicObjects();
+    for (size_t k = 0; k < dyn.size(); ++k) {
+        uint32_t const i = dyn[k];
+        auto const& m = map.at(i);
+        if (!all && (m.r < x - 200.f || m.l > x + 1400.f)) continue;
+        if (m.source >= m_mapSources.size()) continue;
+        GameObject* obj = m_mapSources[m.source];
+        auto const& r = obj->getObjectRect();
+        map.updateObject(i, r.getMinX(), r.getMinY(), r.getMaxX(), r.getMaxY(), !obj->m_isGroupDisabled);
+    }
+    if (tick % 30 == 0) {
+        // static objects ahead: check that they really do not move
+        thread_local std::vector<uint32_t> hits;
+        map.query(x, x + 600.f, hits);
+        int checked = 0;
+        for (uint32_t i : hits) {
+            if (checked++ >= 64) break;
+            auto const& m = map.at(i);
+            if (m.dynamic || m.source >= m_mapSources.size()) continue;
+            GameObject* obj = m_mapSources[m.source];
+            auto const& r = obj->getObjectRect();
+            bool const enabled = !obj->m_isGroupDisabled;
+            if (std::fabs(r.getMinX() - m.l) > 1.f || std::fabs(r.getMinY() - m.b) > 1.f || enabled != m.enabled)
+                map.updateObject(i, r.getMinX(), r.getMinY(), r.getMaxX(), r.getMaxY(), enabled);
+        }
+    }
 }
 
 aigd::GameMode Observer::modeOf(PlayerObject* p) {

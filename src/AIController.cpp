@@ -9,6 +9,7 @@
 #include <Geode/utils/file.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 using namespace geode::prelude;
@@ -57,6 +58,15 @@ void AIController::loadSettings() {
     m_settings.showTrajectory = mod->getSettingValue<bool>("show-trajectory");
     m_settings.showAlternative = mod->getSettingValue<bool>("show-alternative");
     m_settings.predictionHorizon = static_cast<float>(mod->getSettingValue<double>("prediction-horizon"));
+    m_settings.strategicPlanning = mod->getSettingValue<bool>("strategic-planning");
+    m_settings.showUnderstanding = mod->getSettingValue<bool>("show-understanding");
+    m_settings.layers.overview = mod->getSettingValue<bool>("understanding-overview");
+    m_settings.layers.objects = mod->getSettingValue<bool>("understanding-objects");
+    m_settings.layers.groups = mod->getSettingValue<bool>("understanding-groups");
+    m_settings.layers.landing = mod->getSettingValue<bool>("understanding-landing");
+    m_settings.layers.plan = mod->getSettingValue<bool>("understanding-plan");
+    m_settings.layers.alternatives = mod->getSettingValue<bool>("understanding-alternatives");
+    m_settings.layers.uncertain = mod->getSettingValue<bool>("understanding-uncertain");
     applyAgentConfig();
 }
 
@@ -65,6 +75,7 @@ void AIController::applyAgentConfig() {
     cfg.learningSpeed = std::clamp(m_settings.learningSpeed, 0.f, 1.f);
     cfg.learningEnabled = m_settings.learning;
     cfg.usePrediction = m_settings.prediction;
+    cfg.useStrategicPlanning = m_settings.strategicPlanning;
     m_agent.setConfig(cfg);
     m_predictor.setHorizon(static_cast<int>(m_settings.predictionHorizon * aigd::kTicksPerSecond));
 }
@@ -132,6 +143,11 @@ void AIController::onLevelInit(PlayLayer* layer) {
     m_layer = layer;
     m_lastTick = -1;
     m_clock.reset();
+    m_map.clear();
+    m_analysis = aigd::LevelAnalysis{};
+    m_overview.clear();
+    ++m_overviewVersion;
+    m_mapReady = false;
     m_holding = false;
     m_deathPending = false;
     m_observer.reset();
@@ -251,8 +267,9 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
     if (!player || player->m_isDead || layer->m_levelEndAnimationStarted || !layer->m_started) return;
 
     applyTimeScale(true);
-    m_observer.ensureIndex(layer);
+    bool const reindexed = m_observer.ensureIndex(layer);
     auto obs = m_observer.observe(layer, 0);
+    if (reindexed || !m_mapReady) rebuildMap(layer, obs);
     // Count the real physics steps since the last call from the horizontal
     // movement: in game this hook does not run on every physics step (1-3
     // steps per call were measured), and the level-time tick did not show
@@ -264,7 +281,19 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
     // Hitboxes around the player for the trajectory predictor: a little behind
     // (for re-simulating the last steps) up to the end of the prediction horizon.
     float reach = m_settings.predictionHorizon * aigd::unitsPerSecond(obs.speedClass()) * 1.1f;
-    m_observer.collectObstacles(obs.x - 90.f, obs.x + reach + 60.f, m_obstacles);
+    if (m_mapReady && !m_map.empty()) {
+        // From the level map: wide enough for the strategic planner's
+        // sequences (up to 420 steps), moving objects refreshed first.
+        m_observer.refreshMap(m_map, obs.x, tick);
+        float const strategicReach = 420.f * aigd::unitsPerSecond(obs.speedClass()) / aigd::kTicksPerSecond + 120.f;
+        reach = std::max(reach, m_settings.strategicPlanning ? strategicReach : 0.f);
+        // (gravity portals: the model of their effect has not been checked in game)
+        m_map.collect(obs.x - 90.f, obs.x + reach + 60.f, m_obstacles, m_events, false);
+        obs.events = m_events;
+        obs.geometryVersion = m_map.version();
+    } else {
+        m_observer.collectObstacles(obs.x - 90.f, obs.x + reach + 60.f, m_obstacles);
+    }
     obs.obstacles = m_obstacles;
     m_predictor.observe(obs, m_holding);
     if (m_level->levelLength < obs.levelLength) m_level->levelLength = obs.levelLength;
@@ -286,6 +315,7 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
     }
     m_lastObs = obs;
     m_lastObs.obstacles = {}; // the span is only valid for this step
+    m_lastObs.events = {};
 
     // Watchdog: classic levels always move right; if nothing happens for a
     // while (stuck object, odd trigger setup) restart instead of hanging.
@@ -303,6 +333,33 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
     }
 
     if (m_settings.practice) manageCheckpoints(layer, obs);
+}
+
+void AIController::rebuildMap(PlayLayer* layer, aigd::Observation const& obs) {
+    auto const t0 = std::chrono::steady_clock::now();
+    float const floor = m_physics.cubeFloorY(false) - 15.f; // GD's ground surface
+    m_observer.buildMap(layer, m_map, floor, m_mapStats);
+    aigd::AnalysisStart start;
+    start.startX = obs.x;
+    start.mode = obs.mode;
+    start.speedClass = obs.speedClass();
+    start.upsideDown = obs.upsideDown;
+    start.mini = obs.mini;
+    m_analysis = aigd::analyzeLevel(m_map, start, &m_strategies, m_level ? m_level->key : std::string());
+    aigd::buildLevelOverview(m_map, m_analysis, m_overview);
+    ++m_overviewVersion;
+    m_mapReady = true;
+    m_mapMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    log::info("Level map: {} of {} level objects matter for movement or survival ({} triggers move/toggle {} groups; {} without a usable "
+              "hitbox); index {:.2f} ms, total {:.2f} ms",
+              m_map.size(), m_mapStats.levelObjects, m_mapStats.triggers, m_mapStats.movedGroups, m_mapStats.skipped, m_map.buildMillis(), m_mapMs);
+    log::info("Level analysis: {}", m_analysis.summary());
+    float const len = std::max(1.f, m_analysis.finishX);
+    for (size_t i = 0; i < m_analysis.difficult.size() && i < 5; ++i) {
+        auto const& g = m_analysis.groups[static_cast<size_t>(m_analysis.difficult[i])];
+        log::info("  Difficult: {:.1f}% {} (landing space {:.1f} blocks, headroom {})", 100.f * g.startX / len, g.sit.describe(),
+                  g.landingSpace / aigd::kBlock, g.headroom > 1e8f ? std::string("open") : fmt::format("{:.1f} blocks", g.headroom / aigd::kBlock));
+    }
 }
 
 void AIController::manageCheckpoints(PlayLayer* layer, aigd::Observation const& obs) {
@@ -390,6 +447,13 @@ void AIController::logAttemptQuality(aigd::GameMode mode, bool mini) const {
               m_clock.averageInterval(), m_clock.recentMaxInterval(), model.vxPerTick(aigd::speedClassFromPlayerSpeed(m_lastObs.playerSpeed)),
               plans.adopted, st.plansInvalidatedThisAttempt, st.actionsCancelledThisAttempt, st.decisionsFollowingPlan, st.experimentsCancelled,
               st.planEvent.empty() ? "" : " | last: ", st.planEvent);
+    auto const& sp = m_agent.strategic();
+    log::info("Planning: {} sequence plans ({} chose another first press than the locally best one, {} refined by the controller), {} invalidated; "
+              "controller decisions with the plan as candidate {}, executed the plan {} | sequence planning {:.0f} us per plan, {:.0f} us at most | "
+              "level map: {} moving objects, {} found moving at runtime, version {}{}{}",
+              st.strategicPlans, st.strategicOverrides, sp.adopted, st.strategicInvalidated, st.strategicSeeded, st.strategicMatched,
+              st.strategicPlans ? st.strategicMicros / st.strategicPlans : 0.0, st.strategicMaxMicros, m_map.dynamicObjects().size(), m_map.promoted(),
+              m_map.version(), st.strategicEvent.empty() ? "" : " | last: ", st.strategicEvent);
     auto const& T = st.transfer;
     log::info("Transfer: {} obstacle groups ({} known, {} similar, {} new, {} rejected after failing here, {} speed-adapted) | strategies "
               "simulated {}: executed as learned {}, replaced by the search {}; played directly {} | recorded {} passes, {} failures, {} not attributable | "
@@ -670,6 +734,14 @@ void AIController::importLevelMemory() {
             notify("Imported memory for level " + (imported.name.empty() ? imported.key : imported.name) + ".", NotificationIcon::Success);
         }
     });
+}
+
+bool AIController::understandingGeometry(aigd::UnderstandingOverlay& out) const {
+    if (!m_layer || !m_supported || !m_settings.showUnderstanding || !m_mapReady) return false;
+    auto const* plan = m_agent.strategic().active() ? &m_agent.strategic().plan() : nullptr;
+    aigd::buildUnderstandingOverlay(&m_map, &m_analysis, plan, m_lastObs.x, m_lastObs.y, m_lastObs.x - 150.f, m_lastObs.x + 700.f,
+                                    m_settings.layers, out);
+    return true;
 }
 
 bool AIController::overlayGeometry(aigd::OverlayGeometry& out) const {

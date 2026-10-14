@@ -149,6 +149,21 @@ void StatusPanel::refresh() {
         }
 
         // Cross-level transfer: what is ahead, and what the strategy library did about it.
+        // Whole-level understanding and the strategic (sequence) plan.
+        {
+            auto const& A = ai.analysis();
+            if (A.valid) {
+                size_t const next = A.groupAt(ai.lastObservation().x);
+                text += fmt::format("\nLevel: {} obstacle groups, {} tight landings, {} physics changes; next group {} of {}", A.groups.size(),
+                                    A.tight.size(), A.changes.size(), std::min(next + 1, A.groups.size()), A.groups.size());
+            }
+            if (!st.strategic.empty()) text += "\nSequence: " + st.strategic;
+            if (st.strategicPlans > 0)
+                text += fmt::format("\nStrategic this attempt: {} plans ({} overrode the locally best press), {} re-made after divergence; executed "
+                                    "{} of {} times it was a candidate",
+                                    st.strategicPlans, st.strategicOverrides, st.strategicInvalidated, st.strategicMatched, st.strategicSeeded);
+            if (!st.strategicEvent.empty()) text += "\nRe-planned: " + st.strategicEvent;
+        }
         if (!st.situation.empty()) text += "\nAhead: " + st.situation;
         if (!st.transferEvent.empty()) text += "\nTransfer: " + st.transferEvent;
         {

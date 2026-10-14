@@ -4,6 +4,7 @@
 #include "AIController.hpp"
 #include "ui/StatusPanel.hpp"
 #include "ui/TrajectoryOverlay.hpp"
+#include "ui/UnderstandingOverlay.hpp"
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/AppDelegate.hpp>
@@ -39,6 +40,9 @@ class $modify(AIPlayLayer, PlayLayer) {
         StatusPanel* panel = nullptr;
         TrajectoryOverlay* overlay = nullptr;
         aigd::OverlayGeometry geometry;
+        UnderstandingWorld* understanding = nullptr;
+        LevelStrip* strip = nullptr;
+        aigd::UnderstandingOverlay understandingGeometry;
         float uiTimer = 0.f;
 
         ~Fields() {
@@ -66,7 +70,15 @@ class $modify(AIPlayLayer, PlayLayer) {
             overlay->setID("trajectory-overlay"_spr);
             m_objectLayer->addChild(overlay, 9999);
             m_fields->overlay = overlay;
+            auto* understanding = UnderstandingWorld::create();
+            understanding->setID("understanding-overlay"_spr);
+            m_objectLayer->addChild(understanding, 9998);
+            m_fields->understanding = understanding;
         }
+        auto* strip = LevelStrip::create();
+        strip->setID("level-strip"_spr);
+        this->addChild(strip, 999);
+        m_fields->strip = strip;
         return true;
     }
 
@@ -110,6 +122,17 @@ class $modify(AIPlayLayer, PlayLayer) {
             // once per rendered frame, from the latest plan
             if (AIController::get().overlayGeometry(f->geometry)) f->overlay->render(f->geometry);
             else f->overlay->clearAll();
+        }
+        if (f->understanding && f->strip) {
+            auto& ai = AIController::get();
+            if (ai.understandingGeometry(f->understandingGeometry)) {
+                f->understanding->render(f->understandingGeometry);
+                f->strip->render(ai.levelOverview(), ai.overviewVersion(), f->understandingGeometry.playerFraction,
+                                 f->understandingGeometry.warnings, ai.settings().layers.overview);
+            } else {
+                f->understanding->clearAll();
+                f->strip->hideAll();
+            }
         }
         f->uiTimer += dt;
         if (f->panel && f->uiTimer >= 0.1f) {

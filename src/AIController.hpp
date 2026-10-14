@@ -40,6 +40,9 @@ public:
         bool showTrajectory = true;
         bool showAlternative = false;
         float predictionHorizon = 0.75f; // seconds
+        bool strategicPlanning = true;
+        bool showUnderstanding = false;
+        aigd::UnderstandingLayers layers;
     };
 
     void loadSettings();
@@ -94,6 +97,13 @@ public:
     size_t obstacleCount() const { return m_obstacles.size(); }
     // Fills the trajectory overlay for the current plan; false = draw nothing.
     bool overlayGeometry(aigd::OverlayGeometry& out) const;
+    // The level-understanding view (world layers around the player); false = draw nothing.
+    bool understandingGeometry(aigd::UnderstandingOverlay& out) const;
+    std::vector<aigd::UnderstandingOverlay::Mark> const& levelOverview() const { return m_overview; }
+    uint64_t overviewVersion() const { return m_overviewVersion; }
+    aigd::LevelAnalysis const& analysis() const { return m_analysis; }
+    aigd::LevelMap const& levelMap() const { return m_map; }
+    Observer::MapStats const& mapStats() const { return m_mapStats; }
 
 private:
     AIController();
@@ -113,6 +123,7 @@ private:
     void logAttemptQuality(aigd::GameMode mode, bool mini) const;
     void endAttemptWithoutOutcome(PlayLayer* layer);
     void manageCheckpoints(PlayLayer* layer, aigd::Observation const& obs);
+    void rebuildMap(PlayLayer* layer, aigd::Observation const& obs);
 
     Settings m_settings;
     aigd::Agent m_agent;
@@ -121,6 +132,15 @@ private:
     aigd::StrategyLibrary m_strategies;  // layer B: strategies per kind of situation
     bool m_patternsLoaded = false;
     Observer m_observer;
+    // whole-level understanding (v0.5.0)
+    aigd::LevelMap m_map;
+    aigd::LevelAnalysis m_analysis;
+    Observer::MapStats m_mapStats;
+    std::vector<aigd::PhysicsEvent> m_events;
+    std::vector<aigd::UnderstandingOverlay::Mark> m_overview;
+    uint64_t m_overviewVersion = 0;
+    bool m_mapReady = false;
+    double m_mapMs = 0.0;
     SaveWorker m_saver;
 
     // trajectory prediction

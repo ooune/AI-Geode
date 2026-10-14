@@ -1,5 +1,6 @@
 #pragma once
 
+#include <aigd/LevelMap.hpp>
 #include <aigd/Types.hpp>
 
 #include <cstdint>
@@ -19,8 +20,9 @@ class GameObject;
 class Observer {
 public:
     void reset();
-    // Rebuilds the object index if the level's object count changed.
-    void ensureIndex(PlayLayer* layer);
+    // Rebuilds the object index if the level's object count changed (returns
+    // true when it did).
+    bool ensureIndex(PlayLayer* layer);
     aigd::Observation observe(PlayLayer* layer, int32_t tick);
     aigd::DeathInfo deathInfo(PlayLayer* layer, PlayerObject* player, GameObject* killer) const;
     // Hitboxes of hazards, solids and unmodelled objects (orbs, pads, portals,
@@ -29,6 +31,23 @@ public:
     // hitboxes are the real, smaller-than-the-artwork ones.
     void collectObstacles(float x0, float x1, std::vector<aigd::Obstacle>& out) const;
     size_t indexedObjects() const { return m_items.size(); }
+
+    // ---- Whole-level map (v0.5.0) ----
+    // Every loaded object that matters for movement or survival, with the
+    // game's collision rectangle (GameObject::getObjectRect, not the artwork),
+    // what it does, and whether a trigger moves or toggles it (its groups are
+    // targeted by a move / rotate / toggle / follow / animate / area trigger).
+    struct MapStats {
+        size_t levelObjects = 0;   // all objects of the level
+        size_t triggers = 0;       // moving/toggling triggers found
+        size_t movedGroups = 0;    // groups they target
+        size_t skipped = 0;        // relevant objects without a usable rectangle
+    };
+    void buildMap(PlayLayer* layer, aigd::LevelMap& map, float floorSurface, MapStats& stats);
+    // Moving/toggled objects near x are re-read every step (all of them every
+    // 8 steps); every 30 steps a few static objects ahead are checked for
+    // unexpected movement (they are then treated as moving).
+    void refreshMap(aigd::LevelMap& map, float x, int32_t tick);
 
     static aigd::GameMode modeOf(PlayerObject* player);
 
@@ -43,6 +62,7 @@ private:
     };
 
     std::vector<Item> m_items;
+    std::vector<GameObject*> m_mapSources; // MapObject::source -> game object
     size_t m_cursor = 0;
     float m_lastX = 0.f;
     unsigned m_indexedCount = ~0u;

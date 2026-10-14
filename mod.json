@@ -5,7 +5,7 @@
 	},
 	"id": "aqvose.ai-geode",
 	"name": "AI Geode",
-	"version": "v0.4.0",
+	"version": "v0.5.0",
 	"developer": "aqvose",
 	"description": "An AI player that learns Geometry Dash levels from its own deaths.",
 	"repository": "https://github.com/aqvose-prog/AI-Geode",
@@ -119,6 +119,12 @@
 			"description": "Also draw (in blue) what would happen with the other button state.",
 			"default": false
 		},
+		"strategic-planning": {
+			"type": "bool",
+			"name": "Strategic Planning",
+			"description": "Plan whole obstacle sequences ahead (cube and robot) from the level geometry: input sequences of up to three presses are simulated over all of them, and the controller gets the plan as a candidate when it is safe at least up to its last landing. The controller still decides and checks every input.",
+			"default": true
+		},
 		"prediction-horizon": {
 			"type": "float",
 			"name": "Prediction Horizon",
@@ -133,6 +139,58 @@
 				"arrow-step": 0.05,
 				"input": true
 			}
+		},
+		"title-understanding": {
+			"type": "title",
+			"name": "Level Understanding (debug view)"
+		},
+		"show-understanding": {
+			"type": "bool",
+			"name": "Show Level Understanding",
+			"description": "Draw what the AI believes is in the level. Filled boxes = objects read from the level (red hazards, grey blocks, cyan simulated portals); outlines = what the AI inferred (white obstacle groups, orange tight landings, blue the planned sequence, green landing space); lines and dots = predicted movement (the planned path, presses, landing targets); yellow / magenta / orange outlines = not simulated, moved by triggers, rotated (approximate). A strip at the bottom shows the whole level.",
+			"default": false
+		},
+		"understanding-overview": {
+			"type": "bool",
+			"name": "Level Overview Strip",
+			"description": "Show the strip with the whole level, its obstacle groups, physics changes and the player.",
+			"default": true
+		},
+		"understanding-objects": {
+			"type": "bool",
+			"name": "Extracted Objects",
+			"description": "Show the hitboxes read from the level around the player.",
+			"default": true
+		},
+		"understanding-groups": {
+			"type": "bool",
+			"name": "Obstacle Groups",
+			"description": "Show the obstacle groups found in the level and the sequence being planned.",
+			"default": true
+		},
+		"understanding-landing": {
+			"type": "bool",
+			"name": "Landing Zones",
+			"description": "Show the free landing space after each group and the planned landing points.",
+			"default": true
+		},
+		"understanding-plan": {
+			"type": "bool",
+			"name": "Strategic Plan",
+			"description": "Show the strategic plan's predicted path and presses.",
+			"default": true
+		},
+		"understanding-alternatives": {
+			"type": "bool",
+			"name": "Alternatives",
+			"description": "Show where the other evaluated first presses would start.",
+			"default": false
+		},
+		"understanding-uncertain": {
+			"type": "bool",
+			"name": "Uncertain Geometry",
+			"description": "Show (and warn about) objects that are not simulated, are moved by triggers, or whose hitbox is approximated.",
+			"default": true
 		},
 		"title-display": {
 			"type": "title",
