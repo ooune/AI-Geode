@@ -17,6 +17,7 @@ protected:
     void addButton(cocos2d::CCMenu* menu, char const* label, cocos2d::SEL_MenuHandler handler, cocos2d::CCPoint pos, float scale = 0.55f);
     void refresh();
 
+    void onTab(cocos2d::CCObject* sender);
     void onToggle(cocos2d::CCObject* sender);
     void onSpeed(cocos2d::CCObject* sender);
     void onReset(cocos2d::CCObject* sender);
@@ -29,6 +30,8 @@ protected:
     void onImportShared(cocos2d::CCObject* sender);
     void onSettings(cocos2d::CCObject* sender);
 
+    cocos2d::CCMenu* m_pages[3]{};
+    CCMenuItemSpriteExtra* m_tabs[3]{};
     cocos2d::CCLabelBMFont* m_speedLabel = nullptr;
     cocos2d::CCLabelBMFont* m_stats = nullptr;
 };

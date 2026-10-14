@@ -1,4 +1,5 @@
 #pragma once
+#include <string>
 
 #include <Geode/cocos/base_nodes/CCNode.h>
 #include <Geode/cocos/label_nodes/CCLabelBMFont.h>
@@ -13,6 +14,7 @@ public:
 protected:
     bool init() override;
 
+    std::string m_text;
     cocos2d::CCLayerColor* m_background = nullptr;
     cocos2d::CCLabelBMFont* m_label = nullptr;
 };

@@ -132,6 +132,7 @@ void LevelStrip::render(std::vector<aigd::UnderstandingOverlay::Mark> const& mar
         std::string text;
         for (size_t i = 0; i < warnings.size() && i < 3; ++i) text += (i ? "\n" : "") + warnings[i];
         m_warnings->setString(text.c_str());
+        m_warnings->limitLabelWidth(width, 0.45f, 0.25f);
         m_warnings->setPosition({x0, y0 + 3.f * rowH + 10.f});
         m_warnings->setVisible(true);
     }
