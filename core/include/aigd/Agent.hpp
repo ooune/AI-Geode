@@ -95,12 +95,14 @@ struct TransferMetrics {
     uint32_t played = 0;         // groups where the strategy was played directly (no trusted prediction, no own experience)
     uint32_t successes = 0;      // outcomes recorded into the library: got past the group
     uint32_t failures = 0;       // ... died at it
+    uint32_t unattributed = 0;   // passed or died at without a press of its own, but not on the ground
+                                 // all the way (cleared by an earlier jump): not recorded
 
     void add(TransferMetrics const& o) {
         situations += o.situations; known += o.known; similar += o.similar; unknown += o.unknown;
         rejectedHere += o.rejectedHere; speedAdapted += o.speedAdapted; seeded += o.seeded;
         confirmed += o.confirmed; rejectedBySim += o.rejectedBySim; played += o.played;
-        successes += o.successes; failures += o.failures;
+        successes += o.successes; failures += o.failures; unattributed += o.unattributed;
     }
 };
 
@@ -212,7 +214,7 @@ struct AgentStatus {
     TransferMetrics transfer;                 // this attempt
     TransferMetrics transferTotal;            // since the level was attached
     std::string transferEvent;                // the last transfer message, made from a real decision
-    std::vector<std::string> transferLog;     // the last few transfer messages (most recent last)
+    std::vector<std::string> transferLog;     // this attempt's transfer messages (the last few, most recent last)
     std::string situation;                    // the obstacle group ahead, described
 };
 
@@ -328,6 +330,7 @@ private:
         float lead = -1.f;        // steps before contact of the first press
         float second = -1.f;
         bool pressed = false;
+        bool airborne = false;    // left the ground before its own first press (an earlier jump)
         bool landed = false;
         int32_t pressTick = 0;
         int32_t landTick = 0;
@@ -336,6 +339,7 @@ private:
         Certainty seedOutcome = Certainty::Safe;
         int32_t seedCollision = -1;
         float seedScore = 0.f, bestScore = 0.f;
+        float seedContact = 0.f;  // steps to the group when the strategy was last simulated
         bool played = false;      // played directly (Transfer)
         bool reported = false;    // its verdict message was produced
     };

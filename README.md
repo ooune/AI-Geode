@@ -464,14 +464,14 @@ This happens on every attempt, whoever made the decision (planner, learned polic
 | no cross-level knowledge | 11.9% | 0/18 | 3.0 |
 | general knowledge (A) | 100% | 18/18 | 1.0 |
 | A + strategy library (B) | 100% | 18/18 | 1.0 |
-| strategy library only (no physics calibration) | 85.8% | 15/18 | 1.2 |
+| strategy library only (no physics calibration) | 100% | 18/18 | 1.0 |
 
 What this shows, and what it does not:
 - **Without prediction, the library makes learning a new level about 15× faster** (2.4 vs 35.1 attempts). The first attempt is barely better than with general knowledge alone (62.3% vs 61.0%, the same 6/18 completed).
 - **With a calibrated prediction there was nothing left to improve.** The planner alone completes every unseen generated level on the first attempt once the physics calibration (layer A) has transferred. The library adds nothing measurable there.
-- **Without the physics calibration, the library alone carries most of the way:** 15/18 first-attempt completions, against 0/18 with no knowledge.
+- **Without the physics calibration, the library alone was enough here:** 18/18 first-attempt completions, against 0/18 with no knowledge. (Before a recording fix described below it was 15/18.)
 - **Search guidance:**
-  - with the trained library, 6 of 7 strategies handed to the search were executed as learned;
+  - with the trained library, 8 of 9 strategies handed to the search were executed as learned;
   - with deliberately wrong strategies (press 95 steps early), 8 of 9 were rejected by simulation, and the level was still completed on the first attempt;
   - the one "confirmed" wrong timing was really safe there.
 - **Negative transfer:**
@@ -802,6 +802,11 @@ sizes and landing tolerance are still unconfirmed.
   - 15,973 decisions had a trusted prediction and 150 did not; x speed 1.2984;
   - the level was **completed on attempt 508**, 8 attempts after installing v0.3.1 (it had 1 completion in its first 500 attempts), and again on attempt 512.
   - Later in the same session, several new online levels were completed within 5–41 attempts.
+- **v0.4.0 in game** (Dry Out, then two main levels it had never played, Base After Base and Can't Let Go):
+  - the library fills while playing, and groups from Dry Out are recognised on the new levels (on Can't Let Go, per attempt: 1–2 known, 2–4 similar, the rest new);
+  - the first in-game run showed a recording error: a group that an *earlier* jump had already cleared (the player was in the air over it) was recorded as a successful "no jump". Such groups are now not recorded ("not attributable": 46 of 82 groups on Dry Out, because in real levels the player is often already in the air when approaching the next group). The fix also improved the simulator result above (15/18 to 18/18);
+  - a strategy that reached the search was **never executed as learned in game**: the search always found a plan it scored higher, often by a small margin (560.0 vs 549.0). With a calibrated, trusted model the library adds nothing measurable in game, matching the simulator;
+  - completion was not affected: Dry Out was completed in practice mode in 2 attempts.
 - **Cross-level transfer (v0.4.0) is limited to cube and robot.** Situations are only described from the ground in those modes. Ship, wave and the other modes still transfer only through the physics calibration, timing statistics and pattern prior.
 - **The situation description does not see everything that matters:** orbs and pads (only flagged), the floor ending, moving objects, or a different input delay. Such differences are only discovered through failures on the new level (negative-transfer handling).
 - **Strategies were evaluated on generated simulator levels.** Whether the in-game first attempt on an unseen level improves can only be shown by playing new levels in game.

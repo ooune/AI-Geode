@@ -392,11 +392,11 @@ void AIController::logAttemptQuality(aigd::GameMode mode, bool mini) const {
               st.planEvent.empty() ? "" : " | last: ", st.planEvent);
     auto const& T = st.transfer;
     log::info("Transfer: {} obstacle groups ({} known, {} similar, {} new, {} rejected after failing here, {} speed-adapted) | strategies "
-              "simulated {}: executed as learned {}, replaced by the search {}; played directly {} | recorded {} passes, {} failures | "
-              "library {} situations from {} levels{}{}",
+              "simulated {}: executed as learned {}, replaced by the search {}; played directly {} | recorded {} passes, {} failures, {} not attributable | "
+              "library {} situations from {} levels",
               T.situations, T.known, T.similar, T.unknown, T.rejectedHere, T.speedAdapted, T.seeded, T.confirmed, T.rejectedBySim, T.played,
-              T.successes, T.failures, m_strategies.size(), m_strategies.levels.size(), st.transferEvent.empty() ? "" : " | last: ",
-              st.transferEvent);
+              T.successes, T.failures, T.unattributed, m_strategies.size(), m_strategies.levels.size());
+    for (auto const& msg : st.transferLog) log::info("  Transfer message: {}", msg);
     (void)mini;
 }
 

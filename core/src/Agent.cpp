@@ -257,6 +257,7 @@ void Agent::beginAttempt(Observation const& first, bool fromCheckpoint) {
     m_status.decisionsUntrusted = 0;
     m_status.safety = SafetyRecord{};
     m_status.transfer = {};
+    m_status.transferLog.clear();
     m_groups.clear();
     if (m_cfg.learningEnabled && m_pendingExp.active && m_pendingExp.toCell >= xCell(first.x, m_cfg.cellSize)) {
         m_activeExp = std::move(m_pendingExp);
@@ -403,6 +404,7 @@ bool Agent::act(Observation const& obs) {
             if (g->choice.primitive == Primitive::DoubleJump) p.secondAt = std::max(0, static_cast<int32_t>(std::lround(g->choice.secondSteps)));
             if (g->choice.primitive == Primitive::LongJump) p.holdFor = std::max(12, static_cast<int32_t>(std::lround(g->choice.secondSteps)));
             m_predictor->addSeed(p);
+            g->seedContact = contact;
         }
         adv = &m_predictor->advise(obs, holdingNow, !m_danger && !offPath);
         if (g && adv->strategySeeded && adv->computedTick == obs.tick && !adv->reused) {
@@ -1850,14 +1852,22 @@ void Agent::trackGroups(Observation const& obs) {
     for (auto it = m_groups.begin(); it != m_groups.end();) {
         if (obs.x - h > it->sit.endX + 2.f) {
             if (!it->reported) reportGroup(*it, false);
-            if (m_cfg.learningEnabled) m_strategies->record(it->sit, it->primitive, it->lead, it->second, true, m_level->key);
-            ++T.successes;
+            // Only what was really done for this group is recorded: passing it
+            // in the air without a press of its own (an earlier jump cleared
+            // it) says nothing about how to handle it.
+            if (it->pressed || !it->airborne) {
+                if (m_cfg.learningEnabled) m_strategies->record(it->sit, it->primitive, it->lead, it->second, true, m_level->key);
+                ++T.successes;
+            } else {
+                ++T.unattributed;
+            }
             it = m_groups.erase(it);
         } else {
             ++it;
         }
     }
     for (auto& g : m_groups) {
+        if (!g.pressed && !obs.onGround) g.airborne = true;
         if (g.pressed && !g.landed && obs.onGround && obs.tick > g.pressTick + 2) {
             g.landed = true;
             g.landTick = obs.tick;
@@ -1951,9 +1961,13 @@ void Agent::reportGroup(PendingGroup& g, bool trustedNow) {
                                  what.c_str(), evidence.c_str()));
     } else {
         ++T.rejectedBySim;
-        std::string why = g.seedOutcome == Certainty::Collision
-                              ? fmt("simulation predicts a collision %d steps after the decision", g.seedCollision + 1)
-                              : fmt("the search found a better plan (score %.1f vs %.1f)", g.bestScore, g.seedScore);
+        // A collision is only the strategy's fault if it happens at this group
+        // (not at something further ahead that no single plan clears yet).
+        float const groupSteps = (g.sit.endX - g.sit.startX) / std::max(0.1f, unitsPerSecond(g.sit.speedClass) / kTicksPerSecond);
+        bool const hitsHere = g.seedOutcome == Certainty::Collision && g.seedCollision >= 0 &&
+                              static_cast<float>(g.seedCollision) <= g.seedContact + groupSteps + 20.f;
+        std::string why = hitsHere ? fmt("simulation predicts a collision at this obstacle group, %d steps after the decision", g.seedCollision + 1)
+                                   : fmt("the search found a better plan (score %.1f vs %.1f)", g.bestScore, g.seedScore);
         if (c.landingDiffers) why += "; landing space differs from where it was learned";
         else if (c.match == StrategyChoice::Match::Similar) why += "; the layout is only similar to where it was learned";
         noteTransfer(fmt("Previous strategy rejected - %s (%s for %s)", why.c_str(), what.c_str(), g.sit.describe().c_str()));
@@ -1965,16 +1979,25 @@ void Agent::resolveGroups(float deathX, bool died, bool completed) {
         // Sorted by position: only the group the player died at is a failure.
         std::sort(m_groups.begin(), m_groups.end(), [](PendingGroup const& a, PendingGroup const& b) { return a.sit.startX < b.sit.startX; });
         for (auto& g : m_groups) {
+            bool const attributable = g.pressed || !g.airborne;
             if (completed) {
                 if (!g.reported) reportGroup(g, false);
-                m_strategies->record(g.sit, g.primitive, g.lead, g.second, true, m_level->key);
-                ++m_status.transfer.successes;
+                if (attributable) {
+                    m_strategies->record(g.sit, g.primitive, g.lead, g.second, true, m_level->key);
+                    ++m_status.transfer.successes;
+                } else {
+                    ++m_status.transfer.unattributed;
+                }
                 continue;
             }
             if (died && deathX >= g.sit.startX - 2.f * kBlock && deathX <= g.sit.endX + kBlock) {
                 if (!g.reported) reportGroup(g, false);
-                m_strategies->record(g.sit, g.primitive, g.lead, g.second, false, m_level->key);
-                ++m_status.transfer.failures;
+                if (attributable) {
+                    m_strategies->record(g.sit, g.primitive, g.lead, g.second, false, m_level->key);
+                    ++m_status.transfer.failures;
+                } else {
+                    ++m_status.transfer.unattributed;
+                }
                 break;
             }
         }
