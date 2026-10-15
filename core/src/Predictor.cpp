@@ -125,10 +125,12 @@ float Predictor::margin(int step, GameMode mode, bool mini) const {
 
 void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles, Plan const& plan, PredictedPath& out,
                          std::span<uint8_t const> holds) const {
-    ModePhysics const& P = m_model.params(s.mode, s.mini);
+    GameMode mode = s.mode;
+    bool mini = s.mini;
+    ModePhysics P = m_model.params(mode, mini);
     float vx = m_model.vxPerTick(s.speedClass);
-    float const h = P.halfSize;
-    float const in = P.innerHalf;
+    float h = P.halfSize;
+    float in = P.innerHalf;
     int const steps = holds.empty() ? (s.horizon > 0 ? s.horizon : m_horizon) : static_cast<int>(holds.size());
     uint32_t eventsDone = 0; // bit per event (the first 32)
     size_t const nEvents = std::min<size_t>(s.events.size(), 32);
@@ -150,8 +152,8 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
     out.orbActivations = 0;
     out.dashEndStep = -1;
     Bounds const& B = s.bounds;
-    float const floorC = B.floor + h;  // player centre when resting on the floor
-    float const ceilC = B.ceil - h;    // ... against the ceiling
+    float floorC = B.floor + h;  // player centre when resting on the floor
+    float ceilC = B.ceil - h;    // ... against the ceiling
 
     out.points.clear();
     out.holds.clear();
@@ -190,13 +192,13 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
         sinceTakeoff = P.boostSteps - s.robotBoostLeft;
     }
     // edge-triggered modes: a plain press is a short tap
-    bool const tapRelease = P.press == PressAction::ImpulseOnEdge || P.press == PressAction::FlipOnEdge ||
+    bool tapRelease = P.press == PressAction::ImpulseOnEdge || P.press == PressAction::FlipOnEdge ||
                             P.press == PressAction::TeleportOnGround;
 
     bool potential = false;
     bool definite = false;
-    float const m0 = (trusted(s.mode, s.mini) ? 0.5f : 3.f) * m_caution;
-    float const dm = m_model.driftPerTick(s.mode, s.mini) * m_caution;
+    float m0 = (trusted(s.mode, s.mini) ? 0.5f : 3.f) * m_caution;
+    float dm = m_model.driftPerTick(s.mode, s.mini) * m_caution;
     size_t first = 0;
     size_t const nObs = obstacles.size();
 
@@ -269,6 +271,8 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
                 else if (activeDuration == 0 && !tapRelease && effects >= target && heldFor >= 2) pressActive = false;
             }
             hold = pressActive || ps < orbPressUntil;
+            // A scheduled orb tap needs an edge even if the approach held jump.
+            if (plan.orbPressAt > 0 && ps == plan.orbPressAt - 1) hold = false;
         }
         bool const edge = hold && !prevHold;
         prevHold = hold;
@@ -317,7 +321,7 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
                     stop = true;
                     break;
                 }
-                OrbPhysics const op = m_model.orb(ob.type, s.mode, s.mini);
+                OrbPhysics const op = m_model.orb(ob.type, mode, mini);
                 if (!op.known) out.unverifiedPhysics = true;
                 if (out.eventStep < 0 && !op.known) out.eventStep = step;
                 if (out.orbActivations < 2) {
@@ -363,7 +367,7 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
                     boostAlive = true;
                 } else if (!onGround) {
                     if (!hold) boostAlive = false;
-                    bool boost = s.mode == GameMode::Robot && hold && boostAlive && sinceTakeoff < P.boostSteps;
+                    bool boost = mode == GameMode::Robot && hold && boostAlive && sinceTakeoff < P.boostSteps;
                     vyN += boost ? P.accHold : P.accRelease;
                 }
                 break;
@@ -462,6 +466,29 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
             if (!ev.verified) out.unverifiedPhysics = true;
             if (ev.kind == PhysicsEvent::Kind::Speed) {
                 vx = m_model.vxPerTick(std::clamp<int>(ev.value, 0, 4));
+            } else if (ev.kind == PhysicsEvent::Kind::Mode || ev.kind == PhysicsEvent::Kind::Size) {
+                // Preview the destination physics, but do not certify portal
+                // entry velocity/corridor changes that have not been measured.
+                out.unverifiedPhysics = true;
+                if (ev.kind == PhysicsEvent::Kind::Mode) {
+                    if (ev.value >= static_cast<uint8_t>(GameMode::Count)) {
+                        out.uncertainFrom = step;
+                        stop = true;
+                        break;
+                    }
+                    mode = static_cast<GameMode>(ev.value);
+                } else mini = ev.value != 0;
+                P = m_model.params(mode, mini);
+                h = P.halfSize;
+                in = P.innerHalf;
+                floorC = B.floor + h;
+                ceilC = B.ceil - h;
+                tapRelease = P.press == PressAction::ImpulseOnEdge || P.press == PressAction::FlipOnEdge ||
+                             P.press == PressAction::TeleportOnGround;
+                m0 = (trusted(mode, mini) ? 0.5f : 3.f) * m_caution;
+                dm = m_model.driftPerTick(mode, mini) * m_caution;
+                boostAlive = false;
+                onGround = false;
             } else {
                 float const ng = ev.kind == PhysicsEvent::Kind::GravityNormal    ? 1.f
                                  : ev.kind == PhysicsEvent::Kind::GravityFlipped ? -1.f
@@ -761,7 +788,7 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     m_never = PredictedPath{};
     m_press = PredictedPath{};
     m_release = PredictedPath{};
-    if (!supports(obs.mode) || (obs.obstacles.empty() && obs.orbs.empty() && !continuousControl(obs.mode) && !tapControl(obs.mode))) return m_advice;
+    if (!supports(obs.mode) || (obs.obstacles.empty() && obs.orbs.empty() && obs.events.empty() && !continuousControl(obs.mode) && !tapControl(obs.mode))) return m_advice;
 
     SimStart s = startFrom(obs, holding);
     int const savedHorizon = m_horizon;
@@ -770,7 +797,7 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     if (continuousControl(s.mode) || tapControl(s.mode)) m_horizon = std::min(m_horizon, m_modeLookahead ? 180 : 120);
 
     float const reach = s.x + static_cast<float>(m_horizon) * m_model.vxPerTick(s.speedClass) + kNear;
-    bool relevant = continuousControl(s.mode) || tapControl(s.mode) || !obs.orbs.empty();
+    bool relevant = continuousControl(s.mode) || tapControl(s.mode) || !obs.orbs.empty() || !obs.events.empty();
     for (auto const& o : obs.obstacles) {
         if (o.kind == Obstacle::Kind::Uncertain) continue;
         if (o.l < reach && o.r > s.x - 20.f) {
@@ -822,6 +849,8 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     // Near an imminent hazard: find a viable action fast rather than the
     // finest one.
     if (neverHit < 30) m_budgetNow = std::min(m_budget, m_advice.simulations + 48);
+    int const interactionBudget = m_budgetNow;
+    if (!s.orbs.empty()) m_budgetNow = std::max(m_advice.simulations + 8, m_budgetNow - 64);
     // Drift changes confidence, not the spacing of button opportunities.
     // Search every physics step when callbacks actually arrive every step.
     int const res = std::max(1, static_cast<int>(std::lround(m_interval)));
@@ -1092,6 +1121,8 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     // pressing at all) show when the hitbox overlaps the orb; a press at the
     // start, the middle and the end of that window (for a dash orb with
     // several hold durations) is simulated through everything that follows.
+    m_budgetNow = interactionBudget;
+    m_advice.budgetHit = m_advice.simulations >= m_budgetNow;
     m_orbOn = PredictedPath{};
     m_orbOff = PredictedPath{};
     if (!s.orbs.empty()) {
@@ -1134,18 +1165,19 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
                     bases[nb++] = p;
                 }
             }
-            for (int bi = 0; bi < nb; ++bi) {
+            for (int bi = 0; bi < nb && m_advice.simulations < m_budgetNow; ++bi) {
                 Plan const base = bases[bi];
                 if (base.orbPressAt >= 0) continue;
                 simulate(s, span, base, m_orbTmp);
                 ++m_advice.simulations;
                 ++m_totalSims;
-                int32_t w0 = -1, w1 = -1;
+                bool const insideNow = ob.l <= s.x + ph && ob.r >= s.x - ph && ob.b <= s.y + ph && ob.t >= s.y - ph;
+                int32_t w0 = insideNow ? 0 : -1, w1 = insideNow ? 0 : -1;
                 for (size_t i = 0; i < m_orbTmp.points.size(); ++i) {
                     PathPoint const& pt = m_orbTmp.points[i];
                     bool const over = ob.l <= pt.x + ph && ob.r >= pt.x - ph && ob.b <= pt.y + ph && ob.t >= pt.y - ph;
-                    if (over && w0 < 0) w0 = static_cast<int32_t>(i);
-                    if (over) w1 = static_cast<int32_t>(i);
+                    if (over && w0 < 0) w0 = static_cast<int32_t>(i) + 1;
+                    if (over) w1 = static_cast<int32_t>(i) + 1;
                     if (!over && w0 >= 0) break;
                 }
                 if (w0 < 0) continue;
@@ -1154,11 +1186,11 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
                     O.windowTo = w1;
                 }
                 // (the point after step i is reached by the input of step i+1)
-                int32_t const ks[3] = {w0 + 1, (w0 + w1) / 2 + 1, w1};
+                int32_t const ks[3] = {w0, (w0 + w1) / 2, w1};
                 static constexpr int32_t kDashHolds[] = {8, 16, 28, 44, 64, 96, 140};
                 for (int ki = 0; ki < 3; ++ki) {
-                    int32_t const kstep = std::max<int32_t>(0, ks[ki] - 1);
-                    if (ki > 0 && kstep == std::max<int32_t>(0, ks[ki - 1] - 1)) continue;
+                    int32_t const kstep = std::max<int32_t>(0, ks[ki] - m_latency);
+                    if (ki > 0 && kstep == std::max<int32_t>(0, ks[ki - 1] - m_latency)) continue;
                     int const nh = isDashOrb(ob.type) ? 7 : 1;
                     for (int hi = 0; hi < nh; ++hi) {
                         Plan p = base;
@@ -1319,7 +1351,7 @@ void Predictor::onDeath(int32_t tick, float x, float y) {
 
 void Predictor::updateBounds(Observation const& obs, bool held) {
     ModePhysics const& P = m_model.params(obs.mode, obs.mini);
-    float const h = P.halfSize;
+    float h = P.halfSize;
     bool const hintChanged = obs.hasBoundsHint &&
                              (std::fabs(obs.boundsHintBottom - m_boundsHintBottom) > 1.f || std::fabs(obs.boundsHintTop - m_boundsHintTop) > 1.f);
     if (obs.mode != m_boundsMode || hintChanged) {

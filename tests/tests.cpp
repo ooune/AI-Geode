@@ -1466,6 +1466,50 @@ TEST(rotated_hazard_envelope_is_not_a_definite_hit) {
     CHECK(path.uncertainFrom >= 0);
 }
 
+TEST(portal_mode_size_continuation_uses_destination_physics) {
+    PredictionRig rig;
+    LevelMap map;
+    MapObject mode, size;
+    mode.kind = MapKind::ModePortal;
+    mode.value = static_cast<uint8_t>(GameMode::Wave);
+    mode.l = 105; mode.r = 108; mode.b = 400; mode.t = 600;
+    size = mode;
+    size.kind = MapKind::SizePortal;
+    size.value = 1;
+    size.l = 120; size.r = 123;
+    map.build({mode, size}, 1000, 0);
+    std::vector<Obstacle> obstacles;
+    std::vector<PhysicsEvent> events;
+    map.collect(0, 1000, obstacles, events, false);
+    CHECK(obstacles.empty());
+    CHECK(events.size() == 2);
+    SimStart start;
+    start.x = 100; start.y = 500; start.horizon = 40;
+    start.events = events;
+    Plan hold; hold.pressAt = 0; hold.holdFor = -1;
+    PredictedPath path;
+    rig.predictor.simulate(start, obstacles, hold, path);
+    CHECK(path.points.size() == 40);
+    CHECK(path.unverifiedPhysics);
+    CHECK(path.outcome == Certainty::Uncertain);
+    auto const& a = path.points[38];
+    auto const& b = path.points[39];
+    CHECK(std::fabs((b.y - a.y) - 2.f * (b.x - a.x)) < 0.001f);
+    Obstacle hazard{140, 400, 150, 650, Obstacle::Kind::Hazard};
+    rig.predictor.simulate(start, std::span<Obstacle const>(&hazard, 1), hold, path);
+    CHECK(path.outcome != Certainty::Safe);
+    CHECK(path.collisionStep >= 0);
+    CHECK(path.collisionX > 120);
+}
+
+TEST(portal_only_scene_still_gets_prediction) {
+    PredictionRig rig;
+    Observation obs;
+    obs.x = 100; obs.y = 500;
+    PhysicsEvent portal{110, 400, 115, 600, PhysicsEvent::Kind::Size, 1, false};
+    obs.events = std::span<PhysicsEvent const>(&portal, 1);
+    CHECK(rig.predictor.advise(obs, false).valid);
+}
 TEST(precision_confidence_isolated_for_every_mini_mode) {
     PhysicsModel model;
     for (int i = 0; i < static_cast<int>(GameMode::Count); ++i) {
@@ -3932,8 +3976,8 @@ TEST(level_map_extracts_the_whole_level) {
                 map.size(), map.buildMillis(), far.size(), lastObj, std::fabs(lastFound - lastObj) < 31.f ? "yes" : "no", obs.size(), ev.size());
     CHECK(!far.empty());
     CHECK(std::fabs(lastFound - lastObj) < 31.f);
-    CHECK(ev.size() == 2);
-    CHECK(obs.size() == spikes + blocks + 1); // the mode portal is an uncertain obstacle
+    CHECK(ev.size() == 3);
+    CHECK(obs.size() == spikes + blocks); // mode portals are transition events
     // Window queries agree with a brute-force scan everywhere.
     int mismatches = 0;
     for (float q = 0.f; q < L.length; q += 37.f) {

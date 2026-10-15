@@ -142,6 +142,12 @@ void LevelMap::collect(float x0, float x1, std::vector<Obstacle>& obstacles, std
                 events.push_back({o.l, o.b, o.r, o.t, k, 0, gravityVerified});
                 break;
             }
+            case MapKind::ModePortal:
+                events.push_back({o.l, o.b, o.r, o.t, PhysicsEvent::Kind::Mode, o.value, false});
+                break;
+            case MapKind::SizePortal:
+                events.push_back({o.l, o.b, o.r, o.t, PhysicsEvent::Kind::Size, o.value, false});
+                break;
             case MapKind::Orb:
                 if (orbs) {
                     Orb b;

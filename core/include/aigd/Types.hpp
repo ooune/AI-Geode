@@ -58,6 +58,8 @@ struct PhysicsEvent {
         GravityNormal,   // gravity down
         GravityFlipped,  // gravity up
         GravityToggle,   // the other gravity
+        Mode,            // value = GameMode; transition preview remains unverified
+        Size,            // value: 0 regular, 1 mini
     };
     float l = 0.f, b = 0.f, r = 0.f, t = 0.f;
     Kind kind = Kind::Speed;
