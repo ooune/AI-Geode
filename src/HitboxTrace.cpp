@@ -39,7 +39,7 @@ void HitboxTrace::end() {
 void HitboxTrace::player(char kind, PlayerObject* p, int32_t tick) {
     auto const outer = p->getObjectRect();
     auto const inner = p->getObjectRect(0.3f, 0.3f);
-    std::fprintf(m_file, "%c,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f", kind, tick,
+    std::fprintf(m_file, "%c,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f", kind, tick,
                  static_cast<int>(Observer::modeOf(p)), p->m_vehicleSize < 0.9f ? 1 : 0, p->m_isUpsideDown ? 1 : 0, p->m_vehicleSize,
                  p->m_position.x, p->m_position.y, outer.getMinX(), outer.getMinY(), outer.getMaxX(), outer.getMaxY(), inner.getMinX(),
                  inner.getMinY(), inner.getMaxX(), inner.getMaxY(), p->getRotation(), p->getObjectRotation(),
@@ -53,7 +53,7 @@ void HitboxTrace::player(char kind, PlayerObject* p, int32_t tick) {
 
 void HitboxTrace::object(GameObject* o) {
     auto const rect = o->getObjectRect();
-    std::fprintf(m_file, ",%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d", o->m_objectID,
+    std::fprintf(m_file, ",%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d", o->m_objectID,
                  static_cast<int>(o->m_objectType), static_cast<float>(o->m_positionX), static_cast<float>(o->m_positionY),
                  o->getRotation(), o->getScaleX(), o->getScaleY(), o->m_objectRadius, rect.getMinX(), rect.getMinY(), rect.getMaxX(),
                  rect.getMaxY(), o->m_isFlipX ? 1 : 0, o->m_isFlipY ? 1 : 0);
