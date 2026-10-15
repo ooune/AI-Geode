@@ -229,7 +229,7 @@ bool StrategicPlanner::makePlan(Observation const& obs, bool holding, Predictor 
             c.score = -1000.f + static_cast<float>(c.collisionStep) + 40.f * static_cast<float>(c.groupsCleared);
         } else {
             float base = c.outcome == Certainty::Safe ? 1000.f : 500.f;
-            c.score = base + std::min(tmp.clearance, 10.f) - 4.f * static_cast<float>(tmp.presses) + std::min(c.landingRoom, 2.f * kBlock) / kBlock;
+            c.score = base + predictor.proximityScore(tmp) - 4.f * static_cast<float>(tmp.presses) + std::min(c.landingRoom, 2.f * kBlock) / kBlock;
         }
         return c;
     };

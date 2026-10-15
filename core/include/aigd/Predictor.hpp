@@ -1,6 +1,7 @@
 #pragma once
 
 #include <aigd/Physics.hpp>
+#include <aigd/Proximity.hpp>
 #include <aigd/Types.hpp>
 
 #include <algorithm>
@@ -80,6 +81,14 @@ struct PredictedPath {
     int32_t orbId[2] = {0, 0};
     int32_t dashEndStep = -1;      // a dash along the path ended here
     bool activates(int32_t id) const { return (orbActivations > 0 && orbId[0] == id) || (orbActivations > 1 && orbId[1] == id); }
+    // Proximity (v0.7.0): clearance of the player hitbox to the nearest deadly
+    // geometry after every simulated step (see Proximity.hpp), and its minimum.
+    std::vector<float> proximity;
+    float minProximity = 1e9f;
+    int32_t minProxStep = -1;
+    float minProxX = 0.f, minProxY = 0.f;
+    int nearMisses = 0;            // steps closer than the danger threshold (without a collision)
+    float scoredProximity = 1e9f;  // min over steps of (clearance + discount * step): what scoring uses
 };
 
 // Floor / ceiling of the playing area, as surfaces (not player centres).
@@ -190,6 +199,10 @@ public:
             bool chosenActivates = false;
         };
         OrbChoice orb;
+        // proximity of the best plan (v0.7.0)
+        float minProximity = 1e9f;
+        int32_t minProxStep = -1;
+        float proximityRisk = 0.f;       // 0 safe .. 1 dangerously close
         bool lateSeeded = false;         // the strategic sequence plan was evaluated
         bool fromLateSeed = false;       // ... and it is the chosen plan
         Certainty seedOutcome = Certainty::Safe; // the best strategy plan's simulated outcome
@@ -216,6 +229,12 @@ public:
     SimStart startFrom(Observation const& obs, bool holding) const;
 
     void setHorizon(int steps) { m_horizon = std::max(30, std::min(steps, 480)); }
+    // Proximity thresholds and weights (configurable).
+    void setProximity(ProximityConfig const& cfg) { m_prox = cfg; }
+    ProximityConfig const& proximityConfig() const { return m_prox; }
+    // The part of a path's score that comes from its clearance: more margin is
+    // better up to `safe`, closer than `danger` is penalised.
+    float proximityScore(PredictedPath const& p) const;
     // A longer look-ahead for the next advise() only (cube/robot), e.g. to
     // cover a whole obstacle sequence the strategic planner is working on.
     void extendHorizonOnce(int steps) { m_extendOnce = std::max(0, std::min(steps, 480)); }
@@ -363,6 +382,7 @@ private:
     uint64_t m_stateGeometry = 0;
     int32_t m_hint = -1;
     int m_extendOnce = 0;
+    ProximityConfig m_prox;
     Plan m_lateSeed;
     bool m_hasLateSeed = false;
     std::array<Plan, kMaxSeeds> m_seeds{};

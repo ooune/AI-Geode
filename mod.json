@@ -5,7 +5,7 @@
 	},
 	"id": "aqvose.ai-geode",
 	"name": "AI Geode",
-	"version": "v0.6.8",
+	"version": "v0.7.0",
 	"developer": "aqvose",
 	"description": "An AI player that learns Geometry Dash levels from its own deaths.",
 	"repository": "https://github.com/aqvose-prog/AI-Geode",
@@ -118,6 +118,36 @@
 			"name": "Show Orb Trajectories",
 			"description": "For the nearest orb: its area (yellow box), where it would be activated (yellow dot), and the outcome that is not selected: orange = the path if the orb is activated, grey = the path if it is not. The selected path is always the action really executed: it shows the orb's effect only if the AI presses in the orb. The label compares both outcomes.",
 			"default": true
+		},
+		"show-proximity": {
+			"type": "bool",
+			"name": "Danger Colours",
+			"description": "Colour the selected trajectory by how close it comes to deadly geometry, step by step: green = clear (at least the 'safe' clearance), orange = getting close, red = very close (at most the 'danger' clearance) or a collision; yellow = uncertain movement (unmodelled objects). A ringed dot marks the closest point; the label shows its clearance and risk.",
+			"default": true
+		},
+		"proximity-scoring": {
+			"type": "bool",
+			"name": "Clearance in Decisions",
+			"description": "Score candidate timings by their clearance to deadly geometry along the whole predicted path (more margin up to the 'safe' clearance is better, closer than 'danger' is penalised). Off: the pre-v0.7.0 score (clearance only counted up to 10 units).",
+			"default": true
+		},
+		"proximity-safe": {
+			"type": "float",
+			"name": "Safe Clearance",
+			"description": "Units of clearance (a block is 30) from which a path counts as clear (green).",
+			"default": 18.0,
+			"min": 6.0,
+			"max": 40.0,
+			"control": {"slider": true, "slider-step": 1.0, "arrows": true, "arrow-step": 1.0, "input": true}
+		},
+		"proximity-danger": {
+			"type": "float",
+			"name": "Danger Clearance",
+			"description": "Units of clearance at and below which a path counts as dangerously close (red), a near miss is recorded, and learning gets a small penalty.",
+			"default": 4.0,
+			"min": 0.0,
+			"max": 15.0,
+			"control": {"slider": true, "slider-step": 0.5, "arrows": true, "arrow-step": 0.5, "input": true}
 		},
 		"show-alternative": {
 			"type": "bool",

@@ -22,6 +22,7 @@ ccColor4F color(Style s) {
         case Style::OrbActivated: return {1.f, 0.6f, 0.15f, 0.8f};
         case Style::OrbSkipped: return {0.75f, 0.75f, 0.85f, 0.6f};
         case Style::OrbPoint: return {1.f, 0.95f, 0.3f, 1.f};
+        case Style::MinClearance: return {1.f, 1.f, 1.f, 1.f};
         default: return {1.f, 1.f, 1.f, 1.f};
     }
 }
@@ -70,11 +71,25 @@ void TrajectoryOverlay::render(aigd::OverlayGeometry const& g) {
     }
     for (auto const& s : g.segments) {
         float r = s.style == Style::Alternative || s.style == Style::Keep || s.style == Style::OrbSkipped || s.style == Style::OrbActivated ? 1.f : 1.6f;
-        m_draw->drawSegment({s.x0, s.y0}, {s.x1, s.y1}, r, color(s.style));
+        ccColor4F c = color(s.style);
+        if (s.risk >= 0.f) {
+            auto const rc = aigd::riskColor(s.risk);
+            c = {rc.r, rc.g, rc.b, 0.95f};
+        }
+        m_draw->drawSegment({s.x0, s.y0}, {s.x1, s.y1}, r, c);
     }
     for (auto const& d : g.dots) {
         float r = d.style == Style::Collision ? 5.f : d.style == Style::OrbPoint ? 4.5f : 3.5f;
-        m_draw->drawDot({d.x, d.y}, r, color(d.style));
+        ccColor4F c = color(d.style);
+        if (d.risk >= 0.f) {
+            auto const rc = aigd::riskColor(d.risk);
+            c = {rc.r, rc.g, rc.b, 1.f};
+        }
+        if (d.style == Style::MinClearance) {
+            m_draw->drawDot({d.x, d.y}, 5.f, {0.f, 0.f, 0.f, 0.8f}); // ring, so it stands out on the path
+            r = 3.5f;
+        }
+        m_draw->drawDot({d.x, d.y}, r, c);
     }
 
     if (g.hasOrb && !g.orbLabel.empty()) {

@@ -61,6 +61,10 @@ void AIController::loadSettings() {
     m_settings.strategicPlanning = mod->getSettingValue<bool>("strategic-planning");
     m_settings.showUnderstanding = mod->getSettingValue<bool>("show-understanding");
     m_settings.showOrbs = mod->getSettingValue<bool>("show-orb-trajectories");
+    m_settings.showProximity = mod->getSettingValue<bool>("show-proximity");
+    m_settings.proximityScoring = mod->getSettingValue<bool>("proximity-scoring");
+    m_settings.proximitySafe = static_cast<float>(mod->getSettingValue<double>("proximity-safe"));
+    m_settings.proximityDanger = static_cast<float>(mod->getSettingValue<double>("proximity-danger"));
     m_settings.layers.overview = mod->getSettingValue<bool>("understanding-overview");
     m_settings.layers.objects = mod->getSettingValue<bool>("understanding-objects");
     m_settings.layers.groups = mod->getSettingValue<bool>("understanding-groups");
@@ -80,6 +84,11 @@ void AIController::applyAgentConfig() {
     cfg.strategicMaxMicros = 2000.f; // a sequence plan never takes much more than 2 ms of a frame
     m_agent.setConfig(cfg);
     m_predictor.setHorizon(static_cast<int>(m_settings.predictionHorizon * aigd::kTicksPerSecond));
+    aigd::ProximityConfig prox;
+    prox.danger = std::clamp(m_settings.proximityDanger, 0.f, 30.f);
+    prox.safe = std::max(prox.danger + 1.f, m_settings.proximitySafe);
+    prox.legacyScore = !m_settings.proximityScoring;
+    m_predictor.setProximity(prox);
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +483,15 @@ void AIController::logAttemptQuality(aigd::GameMode mode, bool mini) const {
               st.orbsSeen, st.orbActivationsPlanned, st.orbActivationsConfirmed, st.orbActivationsMissed, st.orbSkips, st.orbStrategiesLearned,
               m_physics.describeOrbs(), st.orbChoice.empty() ? "" : " | last choice: ", st.orbChoice);
     for (auto const& msg : st.orbLog) log::info("  Orb: {}", msg);
+    {
+        auto const& pc = m_predictor.proximityConfig();
+        float const len = std::max(1.f, m_level ? m_level->levelLength : 1.f);
+        log::info("Proximity: smallest clearance flown this attempt {} at {:.1f}% | {} near miss(es) (closer than {:.0f} units) | thresholds: green from {:.0f}, "
+                  "red at {:.0f} units | clearance {} in decisions | {} place(s) with near misses remembered for this level{}{}",
+                  st.minClearanceThisAttempt < 1e8f ? fmt::format("{:.1f} units", st.minClearanceThisAttempt) : std::string("- (nothing near)"),
+                  100.f * st.minClearanceX / len, st.nearMissesThisAttempt, pc.danger, pc.safe, pc.danger, pc.legacyScore ? "not used" : "used",
+                  m_level ? m_level->nearMisses.size() : size_t(0), st.proximityEvent.empty() ? "" : " | last: ", st.proximityEvent);
+    }
     auto const& T = st.transfer;
     log::info("Transfer: {} obstacle groups ({} known, {} similar, {} new, {} rejected after failing here, {} speed-adapted) | strategies "
               "simulated {}: executed as learned {}, replaced by the search {}; played directly {} | recorded {} passes, {} failures, {} not attributable | "
@@ -842,7 +860,7 @@ bool AIController::overlayGeometry(aigd::OverlayGeometry& out) const {
     if (!m_agent.attemptActive()) return false;
     // The executed decision's path, labelled with what is really being done.
     return aigd::buildDecisionOverlay(m_predictor, m_agent.status().safety, m_lastTick, m_settings.showAlternative, m_obstacles, out,
-                                      &m_agent.plans().plan(), m_settings.showOrbs);
+                                      &m_agent.plans().plan(), m_settings.showOrbs, m_settings.showProximity);
 }
 
 void AIController::openMemoryFolder() const {

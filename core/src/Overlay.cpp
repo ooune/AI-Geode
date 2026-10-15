@@ -22,6 +22,10 @@ void OverlayGeometry::clear() {
     hasOrb = false;
     orbSelected = false;
     orbLabel.clear();
+    hasClearance = false;
+    minClearance = 0.f;
+    risk = 0.f;
+    clearanceLabel.clear();
 }
 
 namespace {
@@ -36,10 +40,50 @@ void addPath(PredictedPath const& p, OverlayGeometry::Style style, int stride, O
     }
     if (prev != pts.size() - 1) out.segments.push_back({pts[prev].x, pts[prev].y, pts.back().x, pts.back().y, style});
 }
+
+// The path coloured by proximity: each segment by the smallest clearance of
+// the steps it covers. Steps from where the path becomes uncertain (an
+// unmodelled object, an unverified physics change) keep the uncertain style:
+// proximity is not meaningful where the movement itself is not known.
+void addProximityPath(PredictedPath const& p, ProximityConfig const& cfg, int stride, OverlayGeometry& out) {
+    auto const& pts = p.points;
+    if (pts.size() < 2) return;
+    size_t const step = static_cast<size_t>(std::max(1, stride));
+    size_t const unc = p.uncertainFrom >= 0 ? static_cast<size_t>(p.uncertainFrom) : pts.size();
+    auto segment = [&](size_t a, size_t b) {
+        if (a >= unc) {
+            out.segments.push_back({pts[a].x, pts[a].y, pts[b].x, pts[b].y, OverlayGeometry::Style::PathUncertain});
+            return;
+        }
+        float c = 1e9f;
+        for (size_t i = a; i <= b && i < p.proximity.size(); ++i) c = std::min(c, p.proximity[i]);
+        float const risk = c <= 0.f ? 1.f : riskOf(c, cfg);
+        out.segments.push_back({pts[a].x, pts[a].y, pts[b].x, pts[b].y, OverlayGeometry::Style::PathSafe, risk});
+    };
+    size_t prev = 0;
+    for (size_t i = step; i < pts.size(); i += step) {
+        segment(prev, i);
+        prev = i;
+    }
+    if (prev != pts.size() - 1) segment(prev, pts.size() - 1);
+    if (p.minProxStep >= 0 && p.minProximity < cfg.range) { // (nothing within range: no marker)
+        out.hasClearance = true;
+        out.minClearance = p.minProximity;
+        out.clearanceX = p.minProxX;
+        out.clearanceY = p.minProxY;
+        out.risk = p.minProximity <= 0.f ? 1.f : riskOf(p.minProximity, cfg);
+        out.dots.push_back({p.minProxX, p.minProxY, OverlayGeometry::Style::MinClearance, out.risk});
+        char buf[96];
+        if (p.minProximity <= 0.f) std::snprintf(buf, sizeof(buf), "collision (risk 1.00)");
+        else std::snprintf(buf, sizeof(buf), "min clearance %.1f (risk %.2f)%s", p.minProximity, out.risk,
+                           p.nearMisses > 0 ? " - near miss" : "");
+        out.clearanceLabel = buf;
+    }
+}
 } // namespace
 
 void buildOverlay(PredictedPath const& main, PredictedPath const* alternative, std::span<Obstacle const> obstacles,
-                  OverlayGeometry& out, int stride, size_t maxHazards) {
+                  OverlayGeometry& out, int stride, size_t maxHazards, ProximityConfig const* proximity) {
     out.clear();
     out.outcome = main.outcome;
     if (!main.points.empty()) {
@@ -51,7 +95,8 @@ void buildOverlay(PredictedPath const& main, PredictedPath const* alternative, s
                : main.outcome == Certainty::Uncertain ? OverlayGeometry::Style::PathUncertain
                                                        : OverlayGeometry::Style::PathDanger;
     if (alternative) addPath(*alternative, OverlayGeometry::Style::Alternative, stride, out);
-    addPath(main, style, stride, out);
+    if (proximity && !main.proximity.empty()) addProximityPath(main, *proximity, std::max(1, stride / 2), out);
+    else addPath(main, style, stride, out);
 
     if (main.landed) out.dots.push_back({main.landX, main.landY, OverlayGeometry::Style::Landing});
     if (main.collisionStep >= 0) {
@@ -131,7 +176,7 @@ void addOrbLayer(Predictor const& predictor, OverlayGeometry& out, int stride) {
 }
 
 bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decision, int32_t nowTick, bool showAlternative,
-                          std::span<Obstacle const> obstacles, OverlayGeometry& out, LivePlan const* plan, bool showOrbs) {
+                          std::span<Obstacle const> obstacles, OverlayGeometry& out, LivePlan const* plan, bool showOrbs, bool showProximity) {
     out.clear();
     if (plan && plan->active && !plan->steps.empty() && plan->indexOf(nowTick) < static_cast<int>(plan->steps.size()) && decision.proposedSource == DecisionSource::Plan && decision.tick == nowTick) {
         // Following the live plan: draw what is left of it, from now on.
@@ -139,14 +184,47 @@ bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decisi
         auto const style = plan->outcome == Certainty::Safe ? OverlayGeometry::Style::PathSafe
                          : plan->outcome == Certainty::Uncertain ? OverlayGeometry::Style::PathUncertain
                                                                  : OverlayGeometry::Style::PathDanger;
+        // (with proximity: the plan's remaining steps are measured against the
+        // obstacles around the player now, with the mode's hitbox)
+        ModePhysics const& mp = predictor.model().params(decision.mode, false);
+        ProximityConfig const& pc = predictor.proximityConfig();
+        float minC = 1e9f;
+        size_t minI = static_cast<size_t>(from);
+        auto clearanceAt = [&](size_t i) {
+            float const c = hitboxClearance(plan->steps[i].x, plan->steps[i].y, mp.halfSize, mp.innerHalf, obstacles, pc.range).clearance;
+            if (c < minC) {
+                minC = c;
+                minI = i;
+            }
+            return c;
+        };
+        auto planSegment = [&](size_t a, size_t b) {
+            OverlayGeometry::Segment sg{plan->steps[a].x, plan->steps[a].y, plan->steps[b].x, plan->steps[b].y, style};
+            if (showProximity) {
+                float c = 1e9f;
+                for (size_t i = a; i <= b; ++i) c = std::min(c, clearanceAt(i));
+                sg.risk = c <= 0.f ? 1.f : riskOf(c, pc);
+            }
+            out.segments.push_back(sg);
+        };
         size_t prev = static_cast<size_t>(from);
-        for (size_t i = prev + 4; i < plan->steps.size(); i += 4) {
-            out.segments.push_back({plan->steps[prev].x, plan->steps[prev].y, plan->steps[i].x, plan->steps[i].y, style});
+        for (size_t i = prev + 2; i < plan->steps.size(); i += 2) {
+            planSegment(prev, i);
             prev = i;
         }
         auto const& end = plan->steps.back();
-        if (prev + 1 < plan->steps.size())
-            out.segments.push_back({plan->steps[prev].x, plan->steps[prev].y, end.x, end.y, style});
+        if (prev + 1 < plan->steps.size()) planSegment(prev, plan->steps.size() - 1);
+        if (showProximity && minC < pc.range) {
+            out.hasClearance = true;
+            out.minClearance = minC;
+            out.clearanceX = plan->steps[minI].x;
+            out.clearanceY = plan->steps[minI].y;
+            out.risk = minC <= 0.f ? 1.f : riskOf(minC, pc);
+            out.dots.push_back({out.clearanceX, out.clearanceY, OverlayGeometry::Style::MinClearance, out.risk});
+            char cbuf[96];
+            std::snprintf(cbuf, sizeof(cbuf), "min clearance %.1f (risk %.2f)", minC, out.risk);
+            out.clearanceLabel = cbuf;
+        }
         out.hasEndpoint = true;
         out.endpointX = end.x;
         out.endpointY = end.y;
@@ -162,6 +240,7 @@ bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decisi
                       steered ? (out.selectedPress ? "HOLD" : "RELEASE") : (out.selectedPress ? "PRESS" : "RELEASE"),
                       plan->outcome == Certainty::Safe ? "safe" : "risky", out.predictionAge);
         out.label = buf;
+        if (out.hasClearance) out.label += " - " + out.clearanceLabel;
         if (showOrbs) addOrbLayer(predictor, out);
         return true;
     }
@@ -172,7 +251,8 @@ bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decisi
         return false;
     }
     PredictedPath const& main = predictor.executedPath();
-    buildOverlay(main, showAlternative ? &predictor.otherPath() : nullptr, obstacles, out);
+    buildOverlay(main, showAlternative ? &predictor.otherPath() : nullptr, obstacles, out, 4, 24,
+                 showProximity ? &predictor.proximityConfig() : nullptr);
     out.verdict = decision.verdict;
     out.selectedPress = predictor.executedPress();
     out.predictionAge = nowTick - adv.computedTick;
@@ -189,7 +269,10 @@ bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decisi
     }
     if (out.stale) {
         for (auto& sgm : out.segments)
-            if (sgm.style != OverlayGeometry::Style::Alternative && sgm.style != OverlayGeometry::Style::Keep) sgm.style = OverlayGeometry::Style::Stale;
+            if (sgm.style != OverlayGeometry::Style::Alternative && sgm.style != OverlayGeometry::Style::Keep) {
+                sgm.style = OverlayGeometry::Style::Stale;
+                sgm.risk = -1.f; // a stale prediction is not coloured as if it were current
+            }
     }
 
     char const* button = decision.mode == GameMode::Ship || decision.mode == GameMode::Wave || decision.mode == GameMode::Ufo ||
@@ -205,6 +288,7 @@ bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decisi
     if (decision.verdict == SafetyVerdict::NoSafeOption) n += std::snprintf(buf + n, sizeof(buf) - n, " - NO SAFE OPTION");
     if (out.stale) std::snprintf(buf + n, sizeof(buf) - n, " - prediction %d step(s) old", out.predictionAge);
     out.label = buf;
+    if (out.hasClearance && !out.stale) out.label += " - " + out.clearanceLabel;
     if (showOrbs) addOrbLayer(predictor, out);
     return true;
 }

@@ -66,7 +66,13 @@ std::string serializeStrategies(StrategyLibrary const& lib) {
                 appendNumber(out, r.levels[j].failures);
                 out += ']';
             }
-            out += "]]";
+            out += ']';
+            // v0.7.0: margin stats (optional trailing fields; older readers ignore them)
+            for (double v : {r.margin.sum, r.margin.sumSq, static_cast<double>(r.margin.count)}) {
+                out += ',';
+                appendNumber(out, v);
+            }
+            out += ']';
         }
         out += "]]";
     }
@@ -126,6 +132,11 @@ bool deserializeStrategies(std::string_view text, StrategyLibrary& out, std::str
             r.second.count = static_cast<uint32_t>(rr.at(9).asInt());
             r.speedMask = static_cast<uint8_t>(rr.at(10).asInt());
             r.lastUse = static_cast<uint32_t>(rr.at(11).asInt());
+            if (rr.size() >= 16) {
+                r.margin.sum = rr.at(13).asNumber();
+                r.margin.sumSq = rr.at(14).asNumber();
+                r.margin.count = static_cast<uint32_t>(rr.at(15).asInt());
+            }
             for (auto const& pv : rr.at(12).items()) {
                 if (!pv.isArray() || pv.size() < 3 || r.levels.size() >= StrategyRecord::kMaxLevels) continue;
                 r.levels.push_back({pv.at(0).asString(), static_cast<uint32_t>(pv.at(1).asInt()), static_cast<uint32_t>(pv.at(2).asInt())});

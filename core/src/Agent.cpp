@@ -1,4 +1,5 @@
 #include <aigd/Agent.hpp>
+#include <aigd/Proximity.hpp>
 #include <aigd/StateKey.hpp>
 
 #include <algorithm>
@@ -276,6 +277,11 @@ void Agent::beginAttempt(Observation const& first, bool fromCheckpoint) {
     m_expectOrb = {};
     m_dashWarned = false;
     m_status.orbLog.clear();
+    m_status.clearance = 1e9f;
+    m_status.minClearanceThisAttempt = 1e9f;
+    m_status.nearMissesThisAttempt = 0;
+    m_inNearMiss = false;
+    m_nearMissClosest = 1e9f;
     m_status.orbsSeen = m_status.orbActivationsPlanned = m_status.orbActivationsConfirmed = 0;
     m_status.orbActivationsMissed = m_status.orbSkips = m_status.orbStrategiesLearned = 0;
     if (m_cfg.learningEnabled && m_pendingExp.active && m_pendingExp.toCell >= xCell(first.x, m_cfg.cellSize)) {
@@ -316,6 +322,7 @@ bool Agent::act(Observation const& obs) {
     // Obstacle groups ahead (cross-level strategies): resolved when passed,
     // and a new one is described and looked up when it comes into view.
     trackGroups(obs);
+    trackProximity(obs);
     // Orbs: which ones the player is in, what the game confirmed, what the
     // model got wrong. An activation that was planned but not confirmed (or
     // one that was not planned) makes the current plans obsolete.
@@ -2018,7 +2025,8 @@ void Agent::trackGroups(Observation const& obs) {
             // in the air without a press of its own (an earlier jump cleared
             // it) says nothing about how to handle it.
             if (it->pressed || !it->airborne) {
-                if (m_cfg.learningEnabled) m_strategies->record(it->sit, it->primitive, it->lead, it->second, true, m_level->key);
+                if (m_cfg.learningEnabled)
+                    m_strategies->record(it->sit, it->primitive, it->lead, it->second, true, m_level->key, it->minClearance < 1e8f ? it->minClearance : -1.f);
                 ++T.successes;
                 if (it->primitive == Primitive::OrbActivate && m_cfg.learningEnabled) {
                     ++m_status.orbStrategiesLearned;
@@ -2171,7 +2179,7 @@ void Agent::resolveGroups(float deathX, bool died, bool completed) {
             if (completed) {
                 if (!g.reported) reportGroup(g, false);
                 if (attributable) {
-                    m_strategies->record(g.sit, g.primitive, g.lead, g.second, true, m_level->key);
+                    m_strategies->record(g.sit, g.primitive, g.lead, g.second, true, m_level->key, g.minClearance < 1e8f ? g.minClearance : -1.f);
                     ++m_status.transfer.successes;
                 } else {
                     ++m_status.transfer.unattributed;
@@ -2286,6 +2294,64 @@ bool Agent::trackOrbs(Observation const& obs) {
         }
     }
     return obsolete;
+}
+
+// ---------------------------------------------------------------------------
+// Proximity (v0.7.0)
+
+void Agent::trackProximity(Observation const& obs) {
+    if (obs.obstacles.empty() || obs.dead) return;
+    ProximityConfig const cfg = m_predictor ? m_predictor->proximityConfig() : ProximityConfig{};
+    float h = situationHalfSize(obs.mini), in = obs.mini ? 2.7f : 4.5f;
+    if (m_predictor) {
+        ModePhysics const& mp = m_predictor->model().params(obs.mode, obs.mini);
+        h = mp.halfSize;
+        in = mp.innerHalf;
+    }
+    float const c = hitboxClearance(obs.x, obs.y, h, in, obs.obstacles, cfg.range).clearance;
+    m_status.clearance = c;
+    if (c < m_status.minClearanceThisAttempt) {
+        m_status.minClearanceThisAttempt = c;
+        m_status.minClearanceX = obs.x;
+    }
+    for (auto& g : m_groups)
+        if (obs.x + h >= g.sit.startX - kBlock && obs.x - h <= g.sit.endX + kBlock) g.minClearance = std::min(g.minClearance, c);
+
+    // Learning: a step flown this close to dying is worth a little less than
+    // the same progress with room to spare (the decision that led here gets it).
+    if (c < cfg.danger && c > 0.f && m_cfg.learningEnabled && !m_steps.empty())
+        m_steps.back().reward -= cfg.learnPenalty * (cfg.danger - c) / std::max(0.01f, cfg.danger);
+
+    // Near-miss events: entering the danger zone and getting out of it again.
+    if (c < cfg.danger && c > 0.f) {
+        if (!m_inNearMiss) {
+            m_inNearMiss = true;
+            m_nearMissClosest = c;
+            m_nearMissX = obs.x;
+        } else if (c < m_nearMissClosest) {
+            m_nearMissClosest = c;
+            m_nearMissX = obs.x;
+        }
+    } else if (m_inNearMiss && c >= cfg.danger) {
+        m_inNearMiss = false;
+        ++m_status.nearMissesThisAttempt;
+        if (m_level && m_cfg.learningEnabled) {
+            int32_t const bucket = static_cast<int32_t>(std::floor(m_nearMissX / kBlock));
+            NearMissSpot& n = m_level->nearMisses[bucket];
+            float const before = n.count ? n.lastClosest : -1.f;
+            ++n.count;
+            n.closest = std::min(n.closest, m_nearMissClosest);
+            n.lastClosest = m_nearMissClosest;
+            n.lastAttempt = m_level->totalAttempts + 1;
+            float const pct = m_level->levelLength > 1.f ? 100.f * m_nearMissX / m_level->levelLength : 0.f;
+            if (before >= 0.f)
+                m_status.proximityEvent = fmt("Near miss at %.1f%%: %.1f units (earlier attempts: %.1f last time, closest %.1f, %u near misses here)%s", pct,
+                                              m_nearMissClosest, before, n.closest, n.count,
+                                              m_nearMissClosest > before + 0.5f ? " - safer than last time" : m_nearMissClosest < before - 0.5f ? " - closer than last time" : "");
+            else
+                m_status.proximityEvent = fmt("Near miss at %.1f%%: %.1f units from deadly geometry", pct, m_nearMissClosest);
+        }
+    }
 }
 
 } // namespace aigd

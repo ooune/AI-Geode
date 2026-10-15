@@ -51,6 +51,7 @@ struct StrategyRecord {
     // learned at one speed carries over to another.
     TimingStat lead;
     TimingStat second;      // DoubleJump: steps after landing; LongJump: steps held
+    TimingStat margin;      // v0.7.0: the smallest clearance actually flown through the group (successful uses)
     uint8_t speedMask = 0;  // speed classes it worked at
     uint32_t lastUse = 0;   // library clock at the last update
     std::vector<Provenance> levels;
@@ -80,6 +81,7 @@ struct StrategyChoice {
     bool learnedHere = false;     // it has worked on this level
     bool landingDiffers = false;  // only known with another landing space
     double relevance = 0.0;
+    float margin = -1.f;          // mean smallest clearance of its successful uses (units, -1 unknown)
 };
 
 // Layer B: reusable strategies, keyed by situation (fine and coarse), with
@@ -96,7 +98,8 @@ struct StrategyLibrary {
     // Levels that contributed (provenance summary).
     std::vector<std::string> levels;
 
-    void record(Situation const& s, Primitive p, float leadSteps, float secondSteps, bool success, std::string const& level);
+    // `margin`: the smallest clearance flown through the group (units, < 0 unknown).
+    void record(Situation const& s, Primitive p, float leadSteps, float secondSteps, bool success, std::string const& level, float margin = -1.f);
     StrategyChoice choose(Situation const& s, std::string const& level) const;
     size_t size() const { return situations.size(); }
     size_t records() const;
@@ -109,7 +112,7 @@ struct StrategyLibrary {
     void prune(size_t keep);
 
 private:
-    void recordInto(uint64_t key, int speed, Primitive p, float leadSteps, float secondSteps, bool success, std::string const& level);
+    void recordInto(uint64_t key, int speed, Primitive p, float leadSteps, float secondSteps, bool success, std::string const& level, float margin);
     bool best(uint64_t key, int speed, std::string const& level, StrategyChoice& out) const;
 };
 

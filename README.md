@@ -1,5 +1,7 @@
 # AI Geode
 
+**v0.7.0:** trajectory proximity. Every predicted step measures the hitbox clearance to deadly geometry using the collision rectangles; floors and blocks underfoot do not count as danger. The path is drawn green, then orange, then red as it gets closer, with a ringed marker at the closest point. Decisions reward margin up to *Safe Clearance* and penalise (without vetoing) near misses. Near misses are remembered per level, and strategies keep the margin they passed with. In the simulator, margins rise and near-miss steps halve, while survival is unchanged within noise. Jump pads are still not simulated. See [validation and limitations](V070-VALIDATION.md).
+
 **v0.6.7:** prediction drift and safety margins are now separate for normal and mini sizes in every mode. Continuous flight plans tolerate a grounded-flag disagreement while still checking position and physics changes. Flying pulse release times receive bounded one-step refinement; a trusted safe route can replace an unsafe learned choice without disrupting an already safe choice. See [validation and limitations](V067-VALIDATION.md).
 
 **v0.6.6:** wave steering also has a short hold period when both predicted actions are uncertain because of nearby unmodelled geometry, but only while the movement model is trusted. Safety overrides can still change direction immediately when one action is safer. This was prompted by a real wave-level log where the safe-only rule rarely activated.
@@ -897,6 +899,10 @@ sizes and landing tolerance are still unconfirmed.
 
 - **Platformer levels** are not supported: they need left/right input. The AI disables itself there and says why.
 - **Two-player levels**: only player 1 is controlled.
+- **Proximity (v0.7.0):**
+  - clearance is only as good as the prediction: past a jump pad (not simulated) it is wrong, and hitbox sizes are estimates, so a clearance of 1–2 units is within the estimate's error;
+  - red means "very close or colliding within the horizon", not certain death;
+  - in the simulator, proximity scoring raised margins without raising survival, and on dense levels the strategic planner lost its edge over the controller (27 vs 27 completions of 40, previously 29 vs 26).
 - **Moving obstacles**: hazards moved by triggers are indexed by their starting x. A padded lookup tolerates small movements, but heavily animated levels give the cross-level pattern features less accurate input. The per-level table is unaffected, because it is keyed by the player's own state.
 - **Hard levels still take many attempts**, and very precise sections (frame-perfect inputs, tight wave corridors) may never be beaten. The learned table's timing resolution is a 3-unit x cell, about 2 ticks at 1× speed. The planner itself works per tick.
 - **Trajectory prediction limits:**

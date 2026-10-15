@@ -112,7 +112,7 @@ bool AIMenuPopup::init() {
     addToggle(display, "Trajectory", kTrajectory, s.showTrajectory, {234.f, 174.f});
     addToggle(display, "Orb Paths", kOrbs, s.showOrbs, {234.f, 140.f});
     addToggle(display, "Other Path", kAlternative, Mod::get()->getSettingValue<bool>("show-alternative"), {234.f, 106.f});
-    caption(display, "Green: clear   /   Yellow: uncertain   /   Red: danger", 65.f);
+    caption(display, "Path: green clear / orange close / red very close / yellow uncertain", 65.f);
     caption(display, "More map layers are available in All Settings.", 43.f);
 
     auto* memory = m_pages[2];

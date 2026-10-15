@@ -94,6 +94,14 @@ struct Hotspot {
     uint32_t escalation = 0;    // how far back the search window has widened
 };
 
+// A place where the AI got past, but very close to dying (v0.7.0).
+struct NearMissSpot {
+    uint32_t count = 0;        // near-miss events here (attempts that came closer than the danger threshold)
+    float closest = 1e9f;      // the smallest clearance ever flown here (units)
+    float lastClosest = 1e9f;  // ... in the last attempt that came close here
+    uint32_t lastAttempt = 0;
+};
+
 struct PathStep {
     float x = 0.f;
     uint64_t key = 0;
@@ -167,6 +175,7 @@ struct LevelMemory {
 
     std::deque<AttemptRecord> history;
     std::map<int32_t, Hotspot> hotspots;
+    std::map<int32_t, NearMissSpot> nearMisses; // by one-block bucket
     QTable q;
 
     // Inputs (x position, new button state) of the furthest attempt so far.

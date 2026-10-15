@@ -43,6 +43,10 @@ public:
         bool strategicPlanning = true;
         bool showUnderstanding = false;
         bool showOrbs = true;
+        bool showProximity = true;
+        bool proximityScoring = true;
+        float proximitySafe = 18.f;
+        float proximityDanger = 4.f;
         aigd::UnderstandingLayers layers;
     };
 

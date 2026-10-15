@@ -120,6 +120,7 @@ public:
     static inline int s_inputDelay = 0;        // steps between the button being sent and acting
     static inline float s_noise = 0.f;         // random vertical jitter per airborne step (unpredictable)
     static inline float s_hazardInflate = 0.f; // hazards are reported this much bigger than they kill
+    static inline uint32_t s_noiseSeed = 12345u; // seed of the vertical noise (per world reset)
     static inline bool s_orbsDisabled = false;   // orbs never activate (an activation the AI expects does not happen)
     static inline float s_orbScale = 1.f;        // orb velocities scaled (the game differs from what was learned)
 
@@ -163,6 +164,7 @@ public:
         m_complete = false;
         m_tick = 0;
         m_pending.clear();
+        m_noise = s_noiseSeed;
         m_death = DeathInfo{};
         m_portalsPassed = 0;
         m_speedPassed = 0;

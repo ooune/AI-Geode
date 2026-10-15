@@ -33,14 +33,17 @@ struct OverlayGeometry {
         OrbActivated, // the path if the orb is activated (not the selected action)
         OrbSkipped,   // the path if it is not (not the selected action)
         OrbPoint,     // where the activation happens
+        MinClearance, // the closest point of the selected path to deadly geometry (coloured by risk)
     };
     struct Segment {
         float x0, y0, x1, y1;
         Style style;
+        float risk = -1.f;    // >= 0: coloured by proximity (0 green .. 0.5 orange .. 1 red) instead of by style
     };
     struct Dot {
         float x, y;
         Style style;
+        float risk = -1.f;
     };
     struct Box {
         float l, b, r, t;
@@ -62,6 +65,12 @@ struct OverlayGeometry {
     bool stale = false;           // prediction not computed for the current step
     int32_t predictionAge = 0;
     SafetyVerdict verdict = SafetyVerdict::NoPrediction;
+    // proximity of the selected path (v0.7.0)
+    bool hasClearance = false;
+    float minClearance = 0.f;     // units, <= 0 = collision
+    float clearanceX = 0.f, clearanceY = 0.f;
+    float risk = 0.f;             // of the closest point
+    std::string clearanceLabel;   // e.g. "min clearance 6.2 (risk 0.71)"
     // orb layer: the nearest orb, both outcomes, and which one is selected
     bool hasOrb = false;
     bool orbSelected = false;     // the selected (executed) path activates it
@@ -74,8 +83,11 @@ struct OverlayGeometry {
 // Builds the overlay for a main path and an optional alternative. `stride`
 // keeps every n-th simulated point (the first and last are always kept), so
 // a 180-step prediction becomes ~45 segments.
+// With `proximity`, the main path is coloured by its clearance to deadly
+// geometry, step by step (smooth green -> orange -> red), and the closest
+// point is marked; without it, by its outcome as before.
 void buildOverlay(PredictedPath const& main, PredictedPath const* alternative, std::span<Obstacle const> obstacles,
-                  OverlayGeometry& out, int stride = 4, size_t maxHazards = 24);
+                  OverlayGeometry& out, int stride = 4, size_t maxHazards = 24, ProximityConfig const* proximity = nullptr);
 
 // The overlay of the decision that was actually executed: the main path is
 // the executed action's branch (never a plan the controller is not
@@ -86,7 +98,8 @@ void buildOverlay(PredictedPath const& main, PredictedPath const* alternative, s
 // While the AI follows its live plan, `plan` is drawn from the current step
 // on instead (the path that is actually being followed).
 bool buildDecisionOverlay(Predictor const& predictor, SafetyRecord const& decision, int32_t nowTick, bool showAlternative,
-                          std::span<Obstacle const> obstacles, OverlayGeometry& out, LivePlan const* plan = nullptr, bool showOrbs = true);
+                          std::span<Obstacle const> obstacles, OverlayGeometry& out, LivePlan const* plan = nullptr, bool showOrbs = true,
+                          bool showProximity = true);
 
 // The orb layer alone (added by buildDecisionOverlay when showOrbs): the
 // orb's area; the selected path is the executed one (drawn by the decision

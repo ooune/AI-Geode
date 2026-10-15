@@ -10,6 +10,7 @@ add_library(aigd_core STATIC
     src/Physics.cpp
     src/PlanManager.cpp
     src/Predictor.cpp
+    src/Proximity.cpp
     src/Situation.cpp
     src/StepClock.cpp
     src/StrategicPlanner.cpp

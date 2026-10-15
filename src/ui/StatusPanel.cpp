@@ -62,7 +62,13 @@ void StatusPanel::refresh() {
         if (set.prediction && st.predictionValid)
             text += fmt::format("\n{}  /  {}", st.safety.executed ? "PRESS" : "RELEASE",
                 aigd::safetyVerdictName(st.safety.verdict));
+        // clearance of the planned path to deadly geometry, and near misses this attempt
+        auto const& prox = ai.predictor().lastAdvice();
+        if (set.prediction && st.predictionValid && prox.minProximity < ai.predictor().proximityConfig().range)
+            text += fmt::format("\nClearance {:.1f} (risk {:.2f})  /  Near misses {}", prox.minProximity, prox.proximityRisk,
+                st.nearMissesThisAttempt);
         if (set.showDebug) {
+            if (st.minClearanceThisAttempt < 1e8f) text += fmt::format("\nClosest this attempt {:.1f} units", st.minClearanceThisAttempt);
             auto const& adv = ai.predictor().lastAdvice();
             text += fmt::format("\nPlans {}   Overrides {}\nSearch {} sims / {:.0f} us\nPrediction error {:.2f} units",
                 ai.plans().adopted, st.overridesThisAttempt, adv.simulations, adv.micros,

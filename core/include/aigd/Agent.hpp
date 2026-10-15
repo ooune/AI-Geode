@@ -237,6 +237,13 @@ struct AgentStatus {
     bool orbSelected = false;                 // the executed action activates that orb
     uint32_t orbsSeen = 0, orbActivationsPlanned = 0, orbActivationsConfirmed = 0, orbActivationsMissed = 0, orbSkips = 0,
              orbStrategiesLearned = 0;
+
+    // proximity (v0.7.0): what was really flown
+    float clearance = 1e9f;                   // the player's clearance to deadly geometry at the last step (units)
+    float minClearanceThisAttempt = 1e9f;
+    float minClearanceX = 0.f;
+    uint32_t nearMissesThisAttempt = 0;       // times the player came closer than the danger threshold and got past
+    std::string proximityEvent;               // the last near miss / comparison with earlier attempts
 };
 
 class Agent {
@@ -370,6 +377,7 @@ private:
         float seedContact = 0.f;  // steps to the group when the strategy was last simulated
         bool played = false;      // played directly (Transfer)
         bool reported = false;    // its verdict message was produced
+        float minClearance = 1e9f; // the smallest clearance flown while the group was being handled
         int32_t orbId = 0;        // the orb the group was handled with (OrbActivate)
         int32_t dashStart = -1;   // ... a dash orb: when the dash started
     };
@@ -479,6 +487,11 @@ private:
     void reportGroup(PendingGroup& g, bool trustedNow);
     void resolveGroups(float deathX, bool died, bool completed);
     void noteTransfer(std::string msg);
+    // proximity: the real clearance at this step (learning signal + near-miss records)
+    void trackProximity(Observation const& obs);
+    bool m_inNearMiss = false;
+    float m_nearMissClosest = 1e9f;
+    float m_nearMissX = 0.f;
     // orbs: overlap, game confirmations, model checks; true = plans are obsolete
     bool trackOrbs(Observation const& obs);
     void noteOrb(std::string msg);

@@ -67,7 +67,7 @@ size_t StrategyLibrary::records() const {
 }
 
 void StrategyLibrary::recordInto(uint64_t key, int speed, Primitive p, float leadSteps, float secondSteps, bool success,
-                                 std::string const& level) {
+                                 std::string const& level, float margin) {
     auto& recs = situations[key];
     int16_t const bucket =
         p == Primitive::Wait || leadSteps < 0.f
@@ -86,6 +86,7 @@ void StrategyLibrary::recordInto(uint64_t key, int speed, Primitive p, float lea
         ++r->successes;
         if (leadSteps >= 0.f) r->lead.add(leadSteps);
         if (secondSteps >= 0.f) r->second.add(secondSteps);
+        if (margin >= 0.f) r->margin.add(margin);
         if (speed >= 0 && speed < 8) r->speedMask |= static_cast<uint8_t>(1u << speed);
     } else {
         ++r->failures;
@@ -112,12 +113,13 @@ void StrategyLibrary::recordInto(uint64_t key, int speed, Primitive p, float lea
     else ++pv->failures;
 }
 
-void StrategyLibrary::record(Situation const& s, Primitive p, float leadSteps, float secondSteps, bool success, std::string const& level) {
+void StrategyLibrary::record(Situation const& s, Primitive p, float leadSteps, float secondSteps, bool success, std::string const& level,
+                             float margin) {
     if (!s.valid) return;
     ++clock;
-    if (s.sequence) recordInto(s.sequence, s.speedClass, p, leadSteps, secondSteps, success, level);
-    recordInto(s.fine, s.speedClass, p, leadSteps, secondSteps, success, level);
-    recordInto(s.coarse, s.speedClass, p, leadSteps, secondSteps, success, level);
+    if (s.sequence) recordInto(s.sequence, s.speedClass, p, leadSteps, secondSteps, success, level, margin);
+    recordInto(s.fine, s.speedClass, p, leadSteps, secondSteps, success, level, margin);
+    recordInto(s.coarse, s.speedClass, p, leadSteps, secondSteps, success, level, margin);
     if (std::find(levels.begin(), levels.end(), level) == levels.end() && levels.size() < 256) levels.push_back(level);
     if (situations.size() > kMaxSituations) prune(kMaxSituations * 9 / 10);
 }
@@ -138,7 +140,12 @@ bool StrategyLibrary::best(uint64_t key, int speed, std::string const& level, St
             if (auto const* p = r.on(level)) rejectedFailures = std::max(rejectedFailures, p->failures);
             continue;
         }
-        if (rel > bestRel || (rel == bestRel && bestRec && r.successes > bestRec->successes)) {
+        // Among timings that work about as reliably, the one flown with more
+        // margin is preferred (v0.7.0): + up to 0.05 for 18 units of clearance.
+        double const marginBonus = r.margin.count ? 0.05 * std::min(r.margin.mean(), 18.0) / 18.0 : 0.0;
+        double const key = rel + marginBonus;
+        double const bestKey = bestRec ? bestRel + (bestRec->margin.count ? 0.05 * std::min(bestRec->margin.mean(), 18.0) / 18.0 : 0.0) : -1.0;
+        if (!bestRec || key > bestKey || (key == bestKey && r.successes > bestRec->successes)) {
             bestRel = rel;
             bestRec = &r;
         }
@@ -167,6 +174,7 @@ bool StrategyLibrary::best(uint64_t key, int speed, std::string const& level, St
     out.learnedHere = here && here->successes > 0;
     out.localFailures = here ? here->failures : 0;
     out.relevance = bestRel;
+    out.margin = bestRec->margin.count ? static_cast<float>(bestRec->margin.mean()) : -1.f;
     out.usable = bestRel >= kMinRelevance;
     out.rejectedHere = false;
     return true;

@@ -169,6 +169,11 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
     out.landings = 0;
     out.eventStep = -1;
     out.unverifiedPhysics = false;
+    out.proximity.clear();
+    out.minProximity = 1e9f;
+    out.minProxStep = -1;
+    out.nearMisses = 0;
+    out.scoredProximity = 1e9f;
 
     float maxW = 0.f;
     for (auto const& o : obstacles) maxW = std::max(maxW, o.r - o.l);
@@ -600,6 +605,21 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
             }
         }
 
+        if (!s.measureOnly) {
+            // proximity: how close this step's hitbox is to dying
+            float const cap = std::min(m_prox.range, kNear);
+            ClearanceResult const cr = hitboxClearance(x, y, h, in, obstacles.subspan(first), cap);
+            float const c = definite ? std::min(cr.clearance, 0.f) : cr.clearance;
+            out.proximity.push_back(c);
+            if (c < out.minProximity) {
+                out.minProximity = c;
+                out.minProxStep = step;
+                out.minProxX = x;
+                out.minProxY = y;
+            }
+            if (c < m_prox.danger && c > 0.f) ++out.nearMisses;
+            out.scoredProximity = std::min(out.scoredProximity, c + m_prox.discountPerStep * static_cast<float>(step));
+        }
         out.points.push_back({x, y});
         out.ground.push_back(onGround ? 1 : 0);
         out.steps = step + 1;
@@ -646,6 +666,16 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
     if (out.unverifiedPhysics && out.outcome == Certainty::Uncertain && out.uncertainFrom < 0) out.uncertainFrom = out.eventStep;
 }
 
+float Predictor::proximityScore(PredictedPath const& p) const {
+    if (p.proximity.empty()) return std::min(p.clearance, 10.f);
+    if (m_prox.legacyScore) return std::min(p.clearance, 10.f);
+    float const q = p.scoredProximity;
+    float const c = std::min(q, m_prox.safe);
+    float sc = m_prox.scoreWeight * std::max(c, 0.f) / std::max(0.01f, m_prox.safe);
+    if (q < m_prox.danger) sc -= m_prox.nearMissPenalty * (m_prox.danger - std::max(q, 0.f)) / std::max(0.01f, m_prox.danger);
+    return sc;
+}
+
 float Predictor::score(PredictedPath const& p) const {
     // Safety first; then a little extra clearance (it stops counting at 10
     // units, the margins are far smaller); then fewer inputs. Every press
@@ -671,7 +701,9 @@ float Predictor::score(PredictedPath const& p) const {
         }
         inputCost += 2.f * static_cast<float>(changes);
     }
-    return base + std::min(p.clearance, kClearanceCap) - inputCost;
+    (void)kClearanceCap;
+    // Safety margin (v0.7.0: the clearance of the whole path to deadly geometry)
+    return base + proximityScore(p) - inputCost;
 }
 
 bool Predictor::sameState(Observation const& obs, bool holding) const {
@@ -1265,6 +1297,9 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
         PredictedPath const& b = m_bestPresses ? m_press : m_release;
         m_advice.bestPlan = b.plan;
         m_advice.bestScore = score(b);
+        m_advice.minProximity = b.minProximity;
+        m_advice.minProxStep = b.minProxStep;
+        m_advice.proximityRisk = b.proximity.empty() ? 0.f : riskOf(b.minProximity, m_prox);
         m_advice.bestLanded = b.landed;
         m_advice.bestLandX = b.landX;
         m_advice.fromSeed = m_advice.seeded && !m_bestPresses && hint > 0 && std::abs(b.plan.pressAt - hint) <= res;

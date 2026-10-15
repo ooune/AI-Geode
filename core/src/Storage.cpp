@@ -147,6 +147,25 @@ std::string serializeLevel(LevelMemory const& L) {
     }
     out += "],";
 
+    // v0.7.0: places with near misses [bucket, count, closest, lastClosest, lastAttempt]
+    key(out, "nearMisses");
+    out += '[';
+    {
+        bool firstRow = true;
+        for (auto const& [bucket, n] : L.nearMisses) {
+            if (!firstRow) out += ',';
+            firstRow = false;
+            out += '[';
+            appendNumber(out, bucket); out += ',';
+            appendNumber(out, n.count); out += ',';
+            appendNumber(out, n.closest); out += ',';
+            appendNumber(out, n.lastClosest); out += ',';
+            appendNumber(out, n.lastAttempt);
+            out += ']';
+        }
+    }
+    out += "],";
+
     key(out, "bestRun");
     out += '[';
     for (size_t i = 0; i < L.bestRunInputs.size(); ++i) {
@@ -247,6 +266,15 @@ bool deserializeLevel(std::string_view text, LevelMemory& out, std::string* erro
         h.experiments = static_cast<uint32_t>(row.at(5).asInt());
         h.escalation = static_cast<uint32_t>(row.at(6).asInt());
         L.hotspots[h.bucket] = h;
+    }
+    for (auto const& row : d.get("nearMisses").items()) {
+        if (row.size() < 5) continue;
+        NearMissSpot n;
+        n.count = static_cast<uint32_t>(row.at(1).asInt());
+        n.closest = static_cast<float>(row.at(2).asNumber());
+        n.lastClosest = static_cast<float>(row.at(3).asNumber());
+        n.lastAttempt = static_cast<uint32_t>(row.at(4).asInt());
+        L.nearMisses[static_cast<int32_t>(row.at(0).asInt())] = n;
     }
     for (auto const& row : d.get("bestRun").items()) {
         if (row.size() < 2) continue;
