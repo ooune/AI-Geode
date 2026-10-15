@@ -91,6 +91,64 @@ void PhysicsModel::observeHeldEntry(bool activated) {
     else ++m_cal.heldEntryIgnored;
 }
 
+namespace {
+OrbPhysics padGuess(PadType t, ModePhysics const& m) {
+    OrbPhysics o;
+    switch (t) {
+        case PadType::Yellow: o.vy = 1.45f * m.impulse; break;
+        case PadType::Pink: o.vy = 0.95f * m.impulse; break;
+        case PadType::Red: o.vy = 1.8f * m.impulse; break;
+        case PadType::Blue: o.flips = true; o.vy = -0.5f * m.impulse; break;
+        default: break;
+    }
+    return o;
+}
+} // namespace
+
+OrbPhysics PhysicsModel::pad(PadType type, GameMode mode, bool mini) const {
+    OrbPhysics o = padGuess(type, params(mode, mini));
+    if (!padSimulated(type)) return o;
+    auto const& c = m_cal.pads[PhysicsCalibration::padSlot(type, mode, mini)];
+    if (c.n > 0) {
+        o.known = true;
+        o.flips = c.flips * 2 > c.n;
+        o.vy = static_cast<float>(c.vy.mean(o.vy));
+    }
+    return o;
+}
+
+float PhysicsModel::observePad(PadEvent const& e) {
+    if (!padSimulated(e.type)) return 0.f;
+    OrbPhysics const before = pad(e.type, e.mode, e.mini);
+    auto& c = m_cal.pads[PhysicsCalibration::padSlot(e.type, e.mode, e.mini)];
+    bool const flipped = e.flippedAfter != e.flippedBefore;
+    float const vyN = e.flippedAfter ? -e.vyAfter : e.vyAfter;
+    ++c.n;
+    if (flipped) ++c.flips;
+    c.vy.add(vyN);
+    return vyN - before.vy;
+}
+
+std::string PhysicsModel::describePads() const {
+    std::string s;
+    char buf[160];
+    for (int t = 0; t < static_cast<int>(PadType::Count); ++t) {
+        for (int m = 0; m < static_cast<int>(GameMode::Count); ++m) {
+            for (int mini = 0; mini < 2; ++mini) {
+                auto const type = static_cast<PadType>(t);
+                auto const mode = static_cast<GameMode>(m);
+                auto const& c = m_cal.pads[PhysicsCalibration::padSlot(type, mode, mini != 0)];
+                if (c.n == 0) continue;
+                OrbPhysics const o = pad(type, mode, mini != 0);
+                std::snprintf(buf, sizeof(buf), "%s%s/%s%s: vy %.2f%s (%u)", s.empty() ? "" : "; ", padTypeName(type), gameModeName(mode),
+                              mini ? " mini" : "", o.vy, o.flips ? ", flips gravity" : "", c.n);
+                s += buf;
+            }
+        }
+    }
+    return s.empty() ? "no pad activations seen yet" : s;
+}
+
 std::string PhysicsModel::describeOrbs() const {
     std::string s;
     char buf[200];

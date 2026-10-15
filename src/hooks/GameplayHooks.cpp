@@ -26,6 +26,15 @@ class $modify(AIBaseGameLayer, GJBaseGameLayer) {
         }
     }
 
+    // Jump pads: the effect (velocity, gravity) the game applied, so the
+    // predictor can learn it. Only state is read; the game's behaviour is not changed.
+    void bumpPlayer(PlayerObject* player, EffectGameObject* object) {
+        double const vyBefore = player ? player->m_yVelocity : 0.0;
+        bool const flippedBefore = player && player->m_isUpsideDown;
+        GJBaseGameLayer::bumpPlayer(player, object);
+        if (player && object) AIController::get().onPadActivated(player, object, vyBefore, player->m_yVelocity, flippedBefore, player->m_isUpsideDown);
+    }
+
     // While the AI plays, the jump button belongs to it: user presses are
     // ignored so the two never fight over the input.
     void handleButton(bool down, int button, bool isPlayer1) {

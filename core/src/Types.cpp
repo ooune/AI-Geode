@@ -62,6 +62,17 @@ char const* orbTypeName(OrbType t) {
     }
 }
 
+char const* padTypeName(PadType t) {
+    switch (t) {
+        case PadType::Yellow: return "yellow pad";
+        case PadType::Pink: return "pink pad";
+        case PadType::Red: return "red pad";
+        case PadType::Blue: return "blue pad";
+        case PadType::Spider: return "spider pad";
+        default: return "pad";
+    }
+}
+
 char const* failureKindName(FailureKind kind) {
     switch (kind) {
         case FailureKind::None: return "none";

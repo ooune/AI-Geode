@@ -81,6 +81,11 @@ struct PredictedPath {
     int32_t orbId[2] = {0, 0};
     int32_t dashEndStep = -1;      // a dash along the path ended here
     bool activates(int32_t id) const { return (orbActivations > 0 && orbId[0] == id) || (orbActivations > 1 && orbId[1] == id); }
+    // jump pads the path touches (up to 2): they act by themselves
+    int padActivations = 0;
+    int32_t padStep[2] = {-1, -1};
+    float padX[2] = {0.f, 0.f}, padY[2] = {0.f, 0.f};
+    PadType padType[2] = {PadType::Yellow, PadType::Yellow};
     // Proximity (v0.7.0): clearance of the player hitbox to the nearest deadly
     // geometry after every simulated step (see Proximity.hpp), and its minimum.
     std::vector<float> proximity;
@@ -128,6 +133,8 @@ struct SimStart {
     OrbType dashType = OrbType::Dash;
     float dashRotation = 0.f;
     int32_t dashLeft = 1 << 20;    // steps until the dash ends by itself
+    // Jump pads ahead (sorted by left edge).
+    std::span<Pad const> pads;
 };
 
 // Forward simulation of the player for every game mode, with hitbox collision
@@ -333,6 +340,21 @@ public:
         uint32_t activations = 0;     // confirmed by the game since load
     };
     OrbCheck const& lastOrbCheck() const { return m_orbCheck; }
+    // Pad learning (diagnostics): the last pad the game reported and how far
+    // the model was off.
+    struct PadCheck {
+        int32_t tick = -1;
+        PadType type = PadType::Yellow;
+        float vyError = 0.f;          // actual - predicted velocity right after (normalised)
+        bool wasKnown = false;        // the model had been calibrated before
+        uint32_t activations = 0;     // reported by the game since load
+        uint32_t knownActivations = 0, accurate = 0; // of those: predicted with a calibrated model, within 0.5
+        // Cube launches predicted with a calibrated pad, compared with what the
+        // game then did from the pad to the landing (at most 60 steps).
+        uint32_t pathsChecked = 0, pathsAborted = 0;
+        float lastPathError = 0.f, worstPathError = 0.f;
+    };
+    PadCheck const& lastPadCheck() const { return m_padCheck; }
     bool dashActive() const { return m_dashActive; }
     PredictedPath const& releasePath() const { return m_release; }
     Advice const& lastAdvice() const { return m_advice; }
@@ -404,6 +426,15 @@ private:
     int32_t m_dashMaxSteps = 1 << 20;
     int32_t m_lastOrbTick = -1000;
     OrbCheck m_orbCheck;
+    PadCheck m_padCheck;
+    struct PadTrack {
+        bool active = false;
+        int32_t startTick = 0;     // the tick the path was simulated from
+        int32_t padStep = 0;       // path step of the pad
+        int32_t endStep = 0;       // last step compared
+        float maxError = 0.f;
+        std::vector<PathPoint> points;
+    } m_padTrack;
     std::vector<int32_t> m_overOrbs;     // orbs the player overlapped at the last observation
     PredictedPath m_orbOn, m_orbOff, m_orbTmp;
     GameMode m_boundsMode = GameMode::Count;

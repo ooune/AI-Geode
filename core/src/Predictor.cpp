@@ -55,6 +55,7 @@ SimStart Predictor::startFrom(Observation const& obs, bool holding) const {
     s.bounds = m_bounds;
     s.events = obs.events;
     s.orbs = obs.orbs;
+    s.pads = obs.pads;
     if (obs.dashing && m_dashActive) {
         s.dashing = true;
         s.dashType = m_dashType;
@@ -143,6 +144,16 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
         Orb const& ob = s.orbs[k];
         if (ob.l <= s.x + P.halfSize && ob.r >= s.x - P.halfSize && ob.b <= s.y + P.halfSize && ob.t >= s.y - P.halfSize) orbOver |= uint64_t(1) << k;
     }
+    // pads: used (bit per pad, the first 64); one already overlapped at the
+    // start is not entered again
+    size_t const nPads = std::min<size_t>(s.pads.size(), 64);
+    uint64_t padUsed = 0;
+    for (size_t k = 0; k < nPads; ++k) {
+        Pad const& pd = s.pads[k];
+        if (pd.used || (pd.l <= s.x + P.halfSize && pd.r >= s.x - P.halfSize && pd.b <= s.y + P.halfSize && pd.t >= s.y - P.halfSize))
+            padUsed |= uint64_t(1) << k;
+    }
+    out.padActivations = 0;
     int const heldRule = m_model.heldEntryActivates();
     bool dashing = s.dashing;
     OrbPhysics dashP = dashing ? m_model.orb(s.dashType, s.mode, s.mini) : OrbPhysics{};
@@ -362,7 +373,47 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
             break;
         }
 
-        if (!orbFired && !dashing) switch (P.press) {
+        // ---- jump pads: they act by themselves when the hitbox touches them ----
+        bool padFired = false;
+        if (!dashing && !orbFired) {
+            for (size_t k = 0; k < nPads; ++k) {
+                Pad const& pd = s.pads[k];
+                uint64_t const bit = uint64_t(1) << k;
+                if (pd.l > x + h) break;
+                if ((padUsed & bit) || pd.r < x - h || pd.t < y - h || pd.b > y + h) continue;
+                padUsed |= bit;
+                if (!padSimulated(pd.type) || !pd.facesGravity(g < 0.f)) {
+                    // spider pads, sideways pads: not simulated
+                    if (out.uncertainFrom < 0) out.uncertainFrom = step;
+                    stop = true;
+                    break;
+                }
+                OrbPhysics const pp = m_model.pad(pd.type, mode, mini);
+                if (!pp.known) out.unverifiedPhysics = true;
+                if (out.eventStep < 0 && !pp.known) out.eventStep = step;
+                if (out.padActivations < 2) {
+                    int const i = out.padActivations;
+                    out.padStep[i] = step;
+                    out.padX[i] = x;
+                    out.padY[i] = y;
+                    out.padType[i] = pd.type;
+                }
+                ++out.padActivations;
+                padFired = true;
+                // see where the launch lands, whatever the horizon
+                if (holds.empty()) stepLimit = std::max(stepLimit, std::min(step + 200, 600));
+                onGround = false;
+                if (pp.flips) g = -g;
+                vyN = pp.vy;
+                break;
+            }
+        }
+        if (stop) {
+            out.steps = step;
+            break;
+        }
+
+        if (!orbFired && !padFired && !dashing) switch (P.press) {
             case PressAction::JumpOnGround:
                 if (onGround && hold) {
                     vyN = P.impulse;
@@ -820,7 +871,9 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     m_never = PredictedPath{};
     m_press = PredictedPath{};
     m_release = PredictedPath{};
-    if (!supports(obs.mode) || (obs.obstacles.empty() && obs.orbs.empty() && obs.events.empty() && !continuousControl(obs.mode) && !tapControl(obs.mode))) return m_advice;
+    if (!supports(obs.mode) || (obs.obstacles.empty() && obs.orbs.empty() && obs.pads.empty() && obs.events.empty() && !continuousControl(obs.mode) &&
+                                !tapControl(obs.mode)))
+        return m_advice;
 
     SimStart s = startFrom(obs, holding);
     int const savedHorizon = m_horizon;
@@ -829,7 +882,7 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     if (continuousControl(s.mode) || tapControl(s.mode)) m_horizon = std::min(m_horizon, m_modeLookahead ? 180 : 120);
 
     float const reach = s.x + static_cast<float>(m_horizon) * m_model.vxPerTick(s.speedClass) + kNear;
-    bool relevant = continuousControl(s.mode) || tapControl(s.mode) || !obs.orbs.empty() || !obs.events.empty();
+    bool relevant = continuousControl(s.mode) || tapControl(s.mode) || !obs.orbs.empty() || !obs.pads.empty() || !obs.events.empty();
     for (auto const& o : obs.obstacles) {
         if (o.kind == Obstacle::Kind::Uncertain) continue;
         if (o.l < reach && o.r > s.x - 20.f) {
@@ -1346,6 +1399,27 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
 void Predictor::noteExecuted(bool pressed) {
     m_executedPress = pressed;
     m_executedValid = m_advice.valid;
+    // Start comparing a cube path that launches from a calibrated pad soon.
+    if (m_executedValid && !m_padTrack.active) {
+        PredictedPath const& p = executedPath();
+        if (p.padActivations > 0 && p.padStep[0] >= 0 && p.padStep[0] <= 30 && p.outcome == Certainty::Safe && m_computedMode == GameMode::Cube &&
+            m_model.pad(p.padType[0], GameMode::Cube, m_stateMini).known) {
+            int32_t end = std::min<int32_t>(p.padStep[0] + 60, static_cast<int32_t>(p.points.size()) - 1);
+            for (int k = 0; k < p.landings; ++k)
+                if (p.landingStep[k] > p.padStep[0]) {
+                    end = std::min(end, p.landingStep[k]);
+                    break;
+                }
+            if (end > p.padStep[0]) {
+                m_padTrack.active = true;
+                m_padTrack.startTick = m_computedTick;
+                m_padTrack.padStep = p.padStep[0];
+                m_padTrack.endStep = end;
+                m_padTrack.maxError = 0.f;
+                m_padTrack.points = p.points;
+            }
+        }
+    }
     if (!m_advice.valid) {
         m_expectValid = false;
         return;
@@ -1460,6 +1534,26 @@ void Predictor::updateBounds(Observation const& obs, bool held) {
 }
 
 void Predictor::observe(Observation const& obs, bool heldDuringStep) {
+    // A predicted pad launch being compared with what the game does.
+    if (m_padTrack.active) {
+        int32_t const i = obs.tick - m_padTrack.startTick - 1;
+        bool const otherEffect = !obs.orbEvents.empty() || obs.dashing || obs.mode != GameMode::Cube;
+        if (obs.dead || otherEffect || i < 0 || i >= static_cast<int32_t>(m_padTrack.points.size())) {
+            m_padTrack.active = false;
+            ++m_padCheck.pathsAborted;
+        } else {
+            if (i >= m_padTrack.padStep) {
+                auto const& p = m_padTrack.points[static_cast<size_t>(i)];
+                m_padTrack.maxError = std::max(m_padTrack.maxError, std::hypot(p.x - obs.x, p.y - obs.y));
+            }
+            if (i >= m_padTrack.endStep) {
+                m_padTrack.active = false;
+                ++m_padCheck.pathsChecked;
+                m_padCheck.lastPathError = m_padTrack.maxError;
+                m_padCheck.worstPathError = std::max(m_padCheck.worstPathError, m_padTrack.maxError);
+            }
+        }
+    }
     Rec const* last = m_histCount ? &m_hist[(m_histHead + kHistory - 1) % kHistory] : nullptr;
     // Steps since the previous observation (real physics steps), or 0 when
     // the two are not connected (first observation, respawn, teleport).
@@ -1510,6 +1604,20 @@ void Predictor::observe(Observation const& obs, bool heldDuringStep) {
         }
     }
     if (m_dashActive && !obs.dashing && obs.orbEvents.empty()) m_dashActive = false;
+    // ---- pads: learn their effect from what the game reported ----
+    for (auto const& e : obs.padEvents) {
+        m_lastOrbTick = obs.tick; // not normal movement: no calibration / accuracy window over it
+        OrbPhysics const known = m_model.pad(e.type, e.mode, e.mini);
+        m_padCheck.tick = obs.tick;
+        m_padCheck.type = e.type;
+        m_padCheck.wasKnown = known.known;
+        m_padCheck.vyError = m_model.observePad(e);
+        ++m_padCheck.activations;
+        if (known.known && padSimulated(e.type)) {
+            ++m_padCheck.knownActivations;
+            if (std::fabs(m_padCheck.vyError) < 0.5f) ++m_padCheck.accurate;
+        }
+    }
     // every step of a dash counts as an orb step (no mode calibration, no
     // accuracy windows over it: the dash is not mode physics)
     if (m_dashActive || obs.dashing) m_lastOrbTick = obs.tick;
@@ -1565,7 +1673,7 @@ void Predictor::observe(Observation const& obs, bool heldDuringStep) {
             prev.tick = p.tick;
             prev.playerSpeed = p.playerSpeed;
             // (steps with an orb activation or a dash are not normal movement)
-            bool const orbStep = !obs.orbEvents.empty() || obs.dashing || m_dashActive;
+            bool const orbStep = !obs.orbEvents.empty() || !obs.padEvents.empty() || obs.dashing || m_dashActive;
             if (!orbStep) m_model.observeStep(prev, obs, effHeld, effBefore);
 
             // one-step prediction error (diagnostics)

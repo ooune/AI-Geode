@@ -303,10 +303,12 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
         reach = std::max(reach, strategicReach);
         reach = std::max(reach, m_settings.strategicPlanning ? strategicReach : 0.f);
         // (gravity portals: the model of their effect has not been checked in game)
-        m_map.collect(obs.x - 90.f, obs.x + reach + 60.f, m_obstacles, m_events, false, &m_orbs);
+        m_map.collect(obs.x - 90.f, obs.x + reach + 60.f, m_obstacles, m_events, false, &m_orbs, &m_pads);
         for (auto& b : m_orbs) b.used = std::find(m_usedOrbs.begin(), m_usedOrbs.end(), b.id) != m_usedOrbs.end();
+        for (auto& p : m_pads) p.used = std::find(m_usedPads.begin(), m_usedPads.end(), p.id) != m_usedPads.end();
         obs.events = m_events;
         obs.orbs = m_orbs;
+        obs.pads = m_pads;
         obs.geometryVersion = m_map.version();
     } else {
         m_observer.collectObstacles(obs.x - 90.f, obs.x + reach + 60.f, m_obstacles);
@@ -316,6 +318,9 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
     m_orbEventsNow.swap(m_orbEvents);
     m_orbEvents.clear();
     obs.orbEvents = m_orbEventsNow;
+    m_padEventsNow.swap(m_padEvents);
+    m_padEvents.clear();
+    obs.padEvents = m_padEventsNow;
     m_predictor.observe(obs, m_holding);
     if (m_level->levelLength < obs.levelLength) m_level->levelLength = obs.levelLength;
 
@@ -323,6 +328,8 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
         bool fromCheckpoint = layer->m_isPracticeMode && layer->m_checkpointArray && layer->m_checkpointArray->count() > 0;
         if (m_holding) press(layer, false);
         m_usedOrbs.clear();
+        m_usedPads.clear();
+        m_padsThisAttempt = 0;
         m_agent.beginAttempt(obs, fromCheckpoint);
         m_stallX = obs.x;
         m_stallTick = tick;
@@ -340,6 +347,8 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
     m_lastObs.events = {};
     m_lastObs.orbs = {};
     m_lastObs.orbEvents = {};
+    m_lastObs.pads = {};
+    m_lastObs.padEvents = {};
 
     // Watchdog: classic levels always move right; if nothing happens for a
     // while (stuck object, odd trigger setup) restart instead of hanging.
@@ -483,6 +492,17 @@ void AIController::logAttemptQuality(aigd::GameMode mode, bool mini) const {
               st.orbsSeen, st.orbActivationsPlanned, st.orbActivationsConfirmed, st.orbActivationsMissed, st.orbSkips, st.orbStrategiesLearned,
               m_physics.describeOrbs(), st.orbChoice.empty() ? "" : " | last choice: ", st.orbChoice);
     for (auto const& msg : st.orbLog) log::info("  Orb: {}", msg);
+    {
+        auto const& pc = m_predictor.lastPadCheck();
+        log::info("Pads: {} activation(s) this attempt | {} since load, {} with a calibrated model ({} within 0.5 vy) | launches compared with the game: "
+                  "{} (largest error {:.2f} units, last {:.2f}; {} not comparable){} | model: {}",
+                  m_padsThisAttempt, pc.activations, pc.knownActivations, pc.accurate, pc.pathsChecked, pc.worstPathError, pc.lastPathError,
+                  pc.pathsAborted,
+                  pc.tick >= 0 ? fmt::format(" | last: {} vy off by {:.2f}{}", aigd::padTypeName(pc.type), pc.vyError,
+                                             pc.wasKnown ? "" : " (first sight)")
+                               : std::string(),
+                  m_physics.describePads());
+    }
     {
         auto const& pc = m_predictor.proximityConfig();
         float const len = std::max(1.f, m_level ? m_level->levelLength : 1.f);
@@ -814,6 +834,38 @@ void AIController::onOrbActivated(PlayerObject* player, GameObject* ring, double
     e.newPress = m_holding && m_lastPressTick >= m_lastTick;
     m_orbEvents.push_back(e);
     if (std::find(m_usedOrbs.begin(), m_usedOrbs.end(), e.id) == m_usedOrbs.end()) m_usedOrbs.push_back(e.id);
+}
+
+void AIController::onPadActivated(PlayerObject* player, GameObject* pad, double vyBefore, double vyAfter, bool flippedBefore, bool flippedAfter) {
+    if (!tracksPlayer(player) || !pad) return;
+    aigd::PadEvent e;
+    switch (pad->m_objectType) {
+        case GameObjectType::YellowJumpPad: e.type = aigd::PadType::Yellow; break;
+        case GameObjectType::PinkJumpPad: e.type = aigd::PadType::Pink; break;
+        case GameObjectType::RedJumpPad: e.type = aigd::PadType::Red; break;
+        case GameObjectType::GravityPad: e.type = aigd::PadType::Blue; break;
+        case GameObjectType::SpiderPad: e.type = aigd::PadType::Spider; break;
+        default: return; // not a pad
+    }
+    // a call that changed nothing (an already used pad touched again)
+    if (vyAfter == vyBefore && flippedAfter == flippedBefore) return;
+    e.id = pad->m_uniqueID;
+    e.mode = Observer::modeOf(player);
+    e.mini = player->m_vehicleSize < 0.9f;
+    e.x = player->m_position.x;
+    e.y = player->m_position.y;
+    e.vyBefore = static_cast<float>(vyBefore);
+    e.vyAfter = static_cast<float>(vyAfter);
+    e.flippedBefore = flippedBefore;
+    e.flippedAfter = flippedAfter;
+    e.rotation = pad->getRotation();
+    // Only pads facing the gravity the player had are learned from (the
+    // predictor does not simulate the others).
+    aigd::Pad shape;
+    shape.rotation = e.rotation;
+    if (shape.facesGravity(flippedBefore)) m_padEvents.push_back(e);
+    ++m_padsThisAttempt;
+    if (std::find(m_usedPads.begin(), m_usedPads.end(), e.id) == m_usedPads.end()) m_usedPads.push_back(e.id);
 }
 
 void AIController::onDashStarted(PlayerObject* player, GameObject* ring, double angle) {

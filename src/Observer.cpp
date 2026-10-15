@@ -100,11 +100,11 @@ std::optional<std::pair<aigd::MapKind, uint8_t>> classifyForMap(GameObject* obj)
         case GameObjectType::Solid:
         case GameObjectType::Breakable: return std::pair{obj->m_isPassable ? K::Platform : K::Solid, uint8_t(0)};
         case GameObjectType::Slope: return std::pair{K::Slope, uint8_t(0)};
-        case GameObjectType::YellowJumpPad:
-        case GameObjectType::PinkJumpPad:
-        case GameObjectType::GravityPad:
-        case GameObjectType::RedJumpPad:
-        case GameObjectType::SpiderPad: return std::pair{K::Pad, uint8_t(0)};
+        case GameObjectType::YellowJumpPad: return std::pair{K::Pad, static_cast<uint8_t>(aigd::PadType::Yellow)};
+        case GameObjectType::PinkJumpPad: return std::pair{K::Pad, static_cast<uint8_t>(aigd::PadType::Pink)};
+        case GameObjectType::RedJumpPad: return std::pair{K::Pad, static_cast<uint8_t>(aigd::PadType::Red)};
+        case GameObjectType::GravityPad: return std::pair{K::Pad, static_cast<uint8_t>(aigd::PadType::Blue)};
+        case GameObjectType::SpiderPad: return std::pair{K::Pad, static_cast<uint8_t>(aigd::PadType::Spider)};
         case GameObjectType::YellowJumpRing: return std::pair{K::Orb, static_cast<uint8_t>(aigd::OrbType::Yellow)};
         case GameObjectType::PinkJumpRing: return std::pair{K::Orb, static_cast<uint8_t>(aigd::OrbType::Pink)};
         case GameObjectType::RedJumpRing: return std::pair{K::Orb, static_cast<uint8_t>(aigd::OrbType::Red)};
@@ -233,6 +233,10 @@ void Observer::buildMap(PlayLayer* layer, aigd::LevelMap& map, float floorSurfac
         if (obj->m_groups && !moved.empty()) {
             for (int g = 0; g < obj->m_groupCount && g < 10; ++g)
                 if (moved.count((*obj->m_groups)[static_cast<size_t>(g)])) m.dynamic = true;
+        }
+        if (m.kind == aigd::MapKind::Pad) {
+            m.rotation = obj->getRotation();
+            m.uniqueId = obj->m_uniqueID;
         }
         if (m.kind == aigd::MapKind::Orb) {
             m.rotation = obj->getRotation();

@@ -97,6 +97,8 @@ struct PredictionRig {
     std::vector<PhysicsEvent> events;
     std::vector<Orb> orbs;
     std::vector<OrbEvent> orbEvents;
+    std::vector<Pad> pads;
+    std::vector<PadEvent> padEvents;
     bool held = false;
     float ahead = 480.f; // how far ahead obstacles are reported (the game observer's window)
 
@@ -106,10 +108,14 @@ struct PredictionRig {
         world.collectEvents(o.x - 90.f, o.x + ahead, events);
         world.collectOrbs(o.x - 90.f, o.x + ahead, orbs);
         orbEvents = world.orbEvents();
+        world.collectPads(o.x - 90.f, o.x + ahead, pads);
+        padEvents = world.padEvents();
         o.obstacles = obstacles;
         o.events = events;
         o.orbs = orbs;
         o.orbEvents = orbEvents;
+        o.pads = pads;
+        o.padEvents = padEvents;
         o.dashing = world.dashing();
         return o;
     }
@@ -3826,6 +3832,11 @@ LevelMap simMap(sim::Level const& L) {
                 m.maxDuration = o.maxDuration;
                 m.uniqueId = static_cast<int32_t>(i);
                 break;
+            case sim::ObjKind::Pad:
+                m = {o.x, o.y, o.x + o.w, o.y + o.h, MapKind::Pad, static_cast<uint8_t>(o.padType)};
+                m.rotation = o.rotation;
+                m.uniqueId = static_cast<int32_t>(i);
+                break;
         }
         m.dynamic = o.moveAt >= 0;
         m.source = i;
@@ -3845,6 +3856,8 @@ struct MapObserver {
     std::vector<PhysicsEvent> events;
     std::vector<Orb> orbs, worldOrbs;
     std::vector<OrbEvent> orbEvents;
+    std::vector<Pad> pads, worldPads;
+    std::vector<PadEvent> padEvents;
     float ahead = 900.f;
     bool refresh = true;
 
@@ -3858,17 +3871,24 @@ struct MapObserver {
             }
         }
         Observation o = w.observe();
-        map.collect(o.x - 90.f, o.x + ahead, obstacles, events, true, &orbs);
+        map.collect(o.x - 90.f, o.x + ahead, obstacles, events, true, &orbs, &pads);
         // which orbs were used: what the game tells (activated ids)
         w.collectOrbs(o.x - 90.f, o.x + ahead, worldOrbs);
         for (auto& b : orbs)
             for (auto const& wb : worldOrbs)
                 if (wb.id == b.id) b.used = wb.used;
         orbEvents = w.orbEvents();
+        w.collectPads(o.x - 90.f, o.x + ahead, worldPads);
+        for (auto& p : pads)
+            for (auto const& wp : worldPads)
+                if (wp.id == p.id) p.used = wp.used;
+        padEvents = w.padEvents();
         o.obstacles = obstacles;
         o.events = events;
         o.orbs = orbs;
         o.orbEvents = orbEvents;
+        o.pads = pads;
+        o.padEvents = padEvents;
         o.dashing = w.dashing();
         o.geometryVersion = map.version();
         return o;
@@ -5542,6 +5562,213 @@ TEST(upside_down_cube_contact_is_not_a_ceiling) {
 }
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------- jump pads
+
+namespace {
+// Walks the world with the button released, feeding the rig, until the
+// player's centre reaches x (or something ends the walk).
+Observation walkTo(PredictionRig& rig, sim::World& w, float x) {
+    rig.held = false;
+    Observation o = rig.observe(w);
+    for (int t = 0; t < 4000 && o.x < x && !w.dead() && !w.complete(); ++t) {
+        rig.predictor.observe(o, false);
+        w.step(false);
+        o = rig.observe(w);
+    }
+    rig.predictor.observe(o, false);
+    return o;
+}
+
+// One pad on the floor at block 10, a ceiling 9 blocks up.
+sim::Level padLevel(PadType t) {
+    sim::Level L;
+    L.name = "pad";
+    L.pad(10.f, 0.f, t);
+    L.block(4, 9, 40, 1);
+    L.finish(40);
+    return L;
+}
+
+// Predicts the released path from 3 blocks before the pad and compares it with
+// what the world does.
+struct PadComparison {
+    PredictedPath path;
+    float maxError = 0.f;
+    int compared = 0;
+    bool firedActual = false;
+};
+PadComparison comparePadPath(PredictionRig& rig, sim::Level const& L, float padX) {
+    PadComparison r;
+    sim::World w(L);
+    Observation o = walkTo(rig, w, padX - 90.f);
+    SimStart st = rig.predictor.startFrom(o, false);
+    st.horizon = 160;
+    rig.predictor.simulate(st, o.obstacles, Plan{-1, 0, 0, false}, r.path);
+    for (size_t i = 0; i < r.path.points.size() && !w.dead() && !w.complete(); ++i) {
+        w.step(false);
+        r.firedActual = r.firedActual || !w.padEvents().empty();
+        Observation a = w.observe();
+        r.maxError = std::max(r.maxError, std::hypot(a.x - r.path.points[i].x, a.y - r.path.points[i].y));
+        ++r.compared;
+    }
+    return r;
+}
+
+// Runs the world through the pad once with the predictor watching (the game
+// reports the activation and the model learns the pad's effect).
+void calibratePad(PredictionRig& rig, PadType t) {
+    sim::Level L = padLevel(t);
+    sim::World w(L);
+    walkTo(rig, w, 16.f * 30.f);
+}
+} // namespace
+
+TEST(pads_are_detected_and_classified) {
+    // Every pad type is in the level map with its collision strip, type and
+    // orientation. Without a pad list (older callers) pads stay uncertain
+    // obstacles; spider pads and pads that do not face the player's gravity
+    // are not simulated.
+    sim::Level L;
+    L.name = "pads";
+    PadType const types[] = {PadType::Yellow, PadType::Pink, PadType::Red, PadType::Blue, PadType::Spider};
+    float x = 10.f;
+    for (PadType t : types) L.pad(x += 4.f, 0.f, t);
+    L.pad(x += 4.f, 5.f, PadType::Yellow, true);
+    L.finish(x + 10.f);
+    LevelMap map = simMap(L);
+    std::vector<Obstacle> obs;
+    std::vector<PhysicsEvent> ev;
+    std::vector<Orb> orbs;
+    std::vector<Pad> pads;
+    map.collect(0.f, L.length, obs, ev, true, &orbs, &pads);
+    CHECK(map.count(MapKind::Pad) == 6);
+    CHECK(pads.size() == 6 && obs.empty());
+    int ok = 0;
+    for (size_t i = 0; i < 5 && i < pads.size(); ++i) ok += pads[i].type == types[i] ? 1 : 0;
+    CHECK(ok == 5);
+    CHECK(pads.size() == 6 && pads[5].rotation == 180.f);
+    CHECK(pads[0].facesGravity(false) && !pads[0].facesGravity(true));
+    CHECK(pads[5].facesGravity(true) && !pads[5].facesGravity(false));
+    Pad side;
+    side.rotation = 90.f;
+    CHECK(!side.facesGravity(false) && !side.facesGravity(true));
+    CHECK(padSimulated(PadType::Blue) && !padSimulated(PadType::Spider));
+    map.collect(0.f, L.length, obs, ev, true, &orbs);
+    CHECK(obs.size() == 6);
+    std::printf("    %zu pads: %s ... %s (ceiling pad rotation %.0f)\n", pads.size(), padTypeName(pads[0].type), padTypeName(pads[4].type),
+                pads[5].rotation);
+}
+
+TEST(pad_effect_is_learned_and_predicted) {
+    // Before the game has shown a pad's effect, a path over it is never safe.
+    // After one activation the predicted launch matches the real one for every
+    // simulated pad type (including the gravity flip of the blue pad).
+    for (PadType t : {PadType::Yellow, PadType::Pink, PadType::Red, PadType::Blue}) {
+        sim::Level L = padLevel(t);
+        PredictionRig rig;
+        warmUp(rig);
+        PadComparison before = comparePadPath(rig, L, 10.f * 30.f);
+        calibratePad(rig, t);
+        PadComparison after = comparePadPath(rig, L, 10.f * 30.f);
+        OrbPhysics const pp = rig.model.pad(t, GameMode::Cube, false);
+        std::printf("    %-10s learned vy %6.2f%s; before calibration: %s, path error %6.2f; after: %s, path error %5.2f (%d steps)\n", padTypeName(t),
+                    pp.vy, pp.flips ? " (flips gravity)" : "", certaintyName(before.path.outcome), before.maxError,
+                    certaintyName(after.path.outcome), after.maxError, after.compared);
+        CHECK(before.path.padActivations > 0 && before.path.outcome != Certainty::Safe);
+        CHECK(pp.known);
+        CHECK(after.firedActual && after.path.padActivations > 0);
+        CHECK(after.path.outcome == Certainty::Safe);
+        CHECK(after.maxError < 0.5f);
+        CHECK(after.compared >= 100);
+    }
+}
+
+TEST(pad_calibration_is_saved_and_loaded) {
+    PredictionRig rig;
+    warmUp(rig);
+    calibratePad(rig, PadType::Yellow);
+    calibratePad(rig, PadType::Blue);
+    PatternMemory pat;
+    pat.physics = rig.model.calibration();
+    PatternMemory back;
+    auto dir = tempDir();
+    std::string err;
+    CHECK(storage::writeFileAtomic(dir / "pads.json", storage::serializePatterns(pat), &err));
+    CHECK(storage::loadPatternFile(dir / "pads.json", back, &err));
+    PhysicsModel m;
+    m.loadCalibration(back.physics);
+    OrbPhysics const y = m.pad(PadType::Yellow, GameMode::Cube, false), b = m.pad(PadType::Blue, GameMode::Cube, false);
+    OrbPhysics const y0 = rig.model.pad(PadType::Yellow, GameMode::Cube, false);
+    CHECK(y.known && b.known && b.flips && !y.flips);
+    CHECK(std::fabs(y.vy - y0.vy) < 1e-4f);
+    CHECK(!m.pad(PadType::Red, GameMode::Cube, false).known);
+    std::printf("    after reload: %s\n", m.describePads().c_str());
+}
+
+TEST(pad_model_follows_the_game_when_it_differs) {
+    // The game's pad turns out stronger than first measured: every reported
+    // activation moves the model towards what the game does.
+    PredictionRig rig;
+    warmUp(rig);
+    calibratePad(rig, PadType::Yellow);
+    float const first = rig.model.pad(PadType::Yellow, GameMode::Cube, false).vy;
+    sim::World::s_padScale = 1.25f;
+    for (int i = 0; i < 6; ++i) calibratePad(rig, PadType::Yellow);
+    sim::World::s_padScale = 1.f;
+    float const later = rig.model.pad(PadType::Yellow, GameMode::Cube, false).vy;
+    std::printf("    yellow pad vy: %.2f first, %.2f after 6 stronger activations (game %.2f), last error %.2f\n", first, later,
+                sim::World::kYellowPad * 1.25f, rig.predictor.lastPadCheck().vyError);
+    CHECK(std::fabs(first - sim::World::kYellowPad) < 0.05f);
+    CHECK(later > first + 0.5f * (sim::World::kYellowPad * 1.25f - first));
+    CHECK(rig.predictor.lastPadCheck().activations == 7);
+}
+
+TEST(ai_uses_a_pad_to_clear_a_wall_it_cannot_jump) {
+    // The Hexagon Force start: a pad, then a wall too high for a normal jump.
+    // Only the pad's launch gets on top. With pads simulated the AI sees the
+    // launch (after the game has shown it once) and lets the pad do the work;
+    // with pads unknown (the old behaviour) the path over the pad is uncertain.
+    sim::Level L;
+    L.name = "pad-wall";
+    L.pad(12.f, 0.f, PadType::Yellow);
+    L.block(17, 0, 30, 3);
+    L.finish(46);
+    PredictionRig rig;
+    warmUp(rig);
+    calibratePad(rig, PadType::Yellow);
+    LevelMemory mem = freshLevel(L);
+    Knowledge k;
+    Agent agent(isolatedConfig());
+    agent.attach(&mem, &k.patterns, &k.strategies);
+    agent.setPredictor(&rig.predictor);
+    LevelMap map = simMap(L);
+    int presses = 0, completedAt = -1;
+    Certainty seen = Certainty::Uncertain;
+    for (int a = 0; a < 5 && completedAt < 0; ++a) {
+        MapRun r = runWithMap(agent, L, map, rig, true, [&](Observation const& o, Agent const&) {
+            if (a == 0 && o.x > 9.f * 30.f && o.x < 9.f * 30.f + 2.f) seen = rig.predictor.lastAdvice().outcome(false);
+        });
+        if (a == 0) presses = r.presses;
+        if (r.completed) completedAt = a + 1;
+    }
+    // the same moment with the pad unknown
+    PredictionRig fresh;
+    warmUp(fresh);
+    sim::World w(L);
+    Observation o = walkTo(fresh, w, 9.f * 30.f);
+    PredictedPath unknown;
+    fresh.predictor.simulate(fresh.predictor.startFrom(o, false), o.obstacles, Plan{-1, 0, 0, false}, unknown);
+    std::printf("    walking into the pad 3 blocks ahead: %s with the pad learned, %s with it unknown; first attempt %d presses; completed on attempt %d\n",
+                certaintyName(seen), certaintyName(unknown.outcome), presses, completedAt);
+    auto const& pc = rig.predictor.lastPadCheck();
+    std::printf("    live check of the launch: %u predicted launches compared (%u aborted), largest error %.2f units\n", pc.pathsChecked, pc.pathsAborted,
+                pc.worstPathError);
+    CHECK(pc.pathsChecked >= 1 && pc.worstPathError < 0.5f);
+    CHECK(seen == Certainty::Safe);
+    CHECK(unknown.outcome != Certainty::Safe);
+    CHECK(completedAt == 1);
+}
 
 int main(int argc, char** argv) {
     bool bench = false;

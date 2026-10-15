@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -115,6 +116,50 @@ struct OrbEvent {
     float dashAngle = 0.f;     // the game's dash angle after the start (degrees)
 };
 
+// Jump pads: they act by themselves when the player's hitbox touches them
+// (once per attempt), whatever the button does.
+enum class PadType : uint8_t {
+    Yellow = 0,   // jump
+    Pink,         // small jump
+    Red,          // big jump
+    Blue,         // gravity pad: flips gravity
+    Spider,       // spider pad: teleports (not simulated)
+    Count
+};
+char const* padTypeName(PadType t);
+// Pads whose effect the predictor can simulate (once calibrated).
+inline bool padSimulated(PadType t) { return t <= PadType::Blue; }
+
+// A pad near the player: the game's collision rectangle and what it does.
+struct Pad {
+    float l = 0.f, b = 0.f, r = 0.f, t = 0.f;
+    PadType type = PadType::Yellow;
+    float rotation = 0.f;      // object rotation in degrees; 0 = on a floor, 180 = on a ceiling
+    bool used = false;         // already activated in this attempt
+    int32_t id = 0;            // the game's unique id
+    // Whether the pad faces the player's gravity at the given orientation:
+    // a floor pad for normal gravity, a ceiling pad for flipped gravity.
+    // Sideways or mismatched pads are not simulated.
+    bool facesGravity(bool upsideDown) const {
+        float const r = std::fmod(std::fabs(rotation), 360.f);
+        if (r < 1.f || r > 359.f) return !upsideDown;
+        if (std::fabs(r - 180.f) < 1.f) return upsideDown;
+        return false;
+    }
+};
+
+// A pad activation the game reported (hooked in game, the simulator in tests).
+struct PadEvent {
+    PadType type = PadType::Yellow;
+    int32_t id = 0;
+    GameMode mode = GameMode::Cube;
+    bool mini = false;
+    float x = 0.f, y = 0.f;
+    float vyBefore = 0.f, vyAfter = 0.f;   // raw vertical velocity
+    bool flippedBefore = false, flippedAfter = false;
+    float rotation = 0.f;                  // the pad's rotation
+};
+
 // Everything the agent may know about the current physics step. Filled by the
 // Geode observer from real game state (or by the simulator in tests).
 struct Observation {
@@ -143,6 +188,10 @@ struct Observation {
     // activations the game reported since the previous observation.
     std::span<Orb const> orbs;
     std::span<OrbEvent const> orbEvents;
+    // Jump pads around the player (same window), sorted by l, and the pad
+    // activations the game reported since the previous observation.
+    std::span<Pad const> pads;
+    std::span<PadEvent const> padEvents;
     bool dashing = false;      // a dash orb's dash is in progress
     // Playing-area floor/ceiling surfaces reported by the game for corridor
     // modes (ship, UFO, ...). Only a hint: confirmed by actual contact.

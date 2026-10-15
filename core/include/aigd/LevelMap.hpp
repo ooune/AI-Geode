@@ -15,7 +15,7 @@ enum class MapKind : uint8_t {
     Platform,       // one-way (passable) solid: not simulated
     Slope,          // not simulated
     Orb,            // acts only when pressed inside it: not simulated
-    Pad,            // launches the player: not simulated
+    Pad,            // launches the player by itself; value = PadType (simulated once calibrated)
     SpeedPortal,    // value = speed class
     GravityPortal,  // value: 0 normal, 1 flipped, 2 toggle
     ModePortal,     // value = GameMode
@@ -68,10 +68,10 @@ public:
     // else that is not simulated becomes an Uncertain obstacle.
     // `gravityVerified`: whether the gravity-portal model has been checked
     // against the game (see PhysicsEvent::verified).
-    // Orbs go to `orbs` when given (simulated by the predictor), otherwise they
-    // are uncertain obstacles as before.
+    // Orbs go to `orbs` and pads to `pads` when given (simulated by the
+    // predictor), otherwise they are uncertain obstacles as before.
     void collect(float x0, float x1, std::vector<Obstacle>& obstacles, std::vector<PhysicsEvent>& events,
-                 bool gravityVerified, std::vector<Orb>* orbs = nullptr) const;
+                 bool gravityVerified, std::vector<Orb>* orbs = nullptr, std::vector<Pad>* pads = nullptr) const;
 
     std::vector<MapObject> const& objects() const { return m_objs; }
     std::vector<uint32_t> const& dynamicObjects() const { return m_dynamic; }

@@ -90,15 +90,18 @@ struct OrbCalibration {
 struct PhysicsCalibration {
     static constexpr size_t kSlots = static_cast<size_t>(GameMode::Count) * 2;
     static constexpr size_t kOrbSlots = static_cast<size_t>(OrbType::Count) * kSlots;
+    static constexpr size_t kPadSlots = static_cast<size_t>(PadType::Count) * kSlots;
     std::array<ModeCalibration, kSlots> modes{};
     std::array<double, 5> vxSum{};
     std::array<uint32_t, 5> vxN{};
     std::array<OrbCalibration, kOrbSlots> orbs{};
+    std::array<OrbCalibration, kPadSlots> pads{}; // jump pads (vy, flips; no dash fields)
     // Holding the button from before reaching an orb: did the orb activate?
     uint32_t heldEntryActivated = 0, heldEntryIgnored = 0;
 
     static size_t slot(GameMode m, bool mini) { return static_cast<size_t>(m) * 2 + (mini ? 1 : 0); }
     static size_t orbSlot(OrbType t, GameMode m, bool mini) { return static_cast<size_t>(t) * kSlots + slot(m, mini); }
+    static size_t padSlot(PadType t, GameMode m, bool mini) { return static_cast<size_t>(t) * kSlots + slot(m, mini); }
 };
 
 // Physics model of the player for every game mode, fitted to what the game
@@ -138,6 +141,15 @@ public:
     int heldEntryActivates() const;
     void observeHeldEntry(bool activated);
     std::string describeOrbs() const;
+
+    // ---- jump pads ----
+    // The effect of a pad type in a mode: vertical velocity right after the
+    // pad (gravity-normalised, after any flip) and whether it flips gravity.
+    // known = false (a guess) until the game has shown an activation.
+    OrbPhysics pad(PadType type, GameMode mode, bool mini) const;
+    // An activation reported by the game. Returns actual - predicted velocity.
+    float observePad(PadEvent const& e);
+    std::string describePads() const;
 
     void recordAccuracy(GameMode mode, float error, int steps, bool mini = false);
     float driftPerTick(GameMode mode, bool mini = false) const;

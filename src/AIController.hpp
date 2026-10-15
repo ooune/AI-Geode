@@ -67,6 +67,8 @@ public:
     // Orbs (from the PlayerObject hooks): what the game really did.
     bool tracksPlayer(PlayerObject* player) const;
     void onOrbActivated(PlayerObject* player, GameObject* ring, double vyBefore, double vyAfter, bool flippedBefore, bool flippedAfter);
+    // A jump pad acted on the player (hooked GJBaseGameLayer::bumpPlayer).
+    void onPadActivated(PlayerObject* player, GameObject* pad, double vyBefore, double vyAfter, bool flippedBefore, bool flippedAfter);
     void onDashStarted(PlayerObject* player, GameObject* ring, double angle);
     void onDashStopped(PlayerObject* player, double vyBefore, double vyAfter);
 
@@ -151,6 +153,11 @@ private:
     std::vector<aigd::OrbEvent> m_orbEvents;     // reported by the hooks since the last AI step
     std::vector<aigd::OrbEvent> m_orbEventsNow;  // ... handed to the AI in this step
     std::vector<int32_t> m_usedOrbs;             // orbs activated in this attempt (unique ids)
+    std::vector<aigd::Pad> m_pads;
+    std::vector<aigd::PadEvent> m_padEvents;     // reported by the hook since the last AI step
+    std::vector<aigd::PadEvent> m_padEventsNow;  // ... handed to the AI in this step
+    std::vector<int32_t> m_usedPads;             // pads activated in this attempt (unique ids)
+    uint32_t m_padsThisAttempt = 0;
     int32_t m_lastPressTick = -1000;
     aigd::OrbType m_dashType = aigd::OrbType::Dash;
     std::vector<aigd::UnderstandingOverlay::Mark> m_overview;

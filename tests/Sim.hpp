@@ -27,7 +27,7 @@ using aigd::GameMode;
 using aigd::KillerKind;
 using aigd::Observation;
 
-enum class ObjKind { Spike, Block, ModePortal, GravityPortal, SpeedPortal, Orb };
+enum class ObjKind { Spike, Block, ModePortal, GravityPortal, SpeedPortal, Orb, Pad };
 
 struct Obj {
     ObjKind kind;
@@ -40,6 +40,7 @@ struct Obj {
     aigd::OrbType orbType = aigd::OrbType::Yellow; // orbs
     float rotation = 0.f;           // dash orbs: direction (degrees, clockwise like cocos)
     float maxDuration = 0.f;        // dash orbs: seconds (0 = until released)
+    aigd::PadType padType = aigd::PadType::Yellow; // pads (rotation 0 = floor pad, 180 = ceiling pad)
 };
 
 struct Level {
@@ -75,6 +76,14 @@ struct Level {
         o.orbType = gravity ? aigd::OrbType::GravityDash : aigd::OrbType::Dash;
         o.rotation = rotation;
         o.maxDuration = maxDuration;
+        objs.push_back(o);
+    }
+    // a jump pad: a thin strip on the floor of block cell (bx, by), or under
+    // the top of the cell when it hangs from a ceiling (ceiling = true)
+    void pad(float bx, float by, aigd::PadType t, bool ceiling = false) {
+        Obj o{ObjKind::Pad, bx * 30.f + 2.f, by * 30.f + (ceiling ? 22.f : 0.f), 26.f, 8.f};
+        o.padType = t;
+        o.rotation = ceiling ? 180.f : 0.f;
         objs.push_back(o);
     }
     // a block that moves vertically by dyBlocks at the given tick
@@ -123,6 +132,7 @@ public:
     static inline uint32_t s_noiseSeed = 12345u; // seed of the vertical noise (per world reset)
     static inline bool s_orbsDisabled = false;   // orbs never activate (an activation the AI expects does not happen)
     static inline float s_orbScale = 1.f;        // orb velocities scaled (the game differs from what was learned)
+    static inline float s_padScale = 1.f;        // pad velocities scaled (the game differs from what was learned)
 
     static ModeSpec spec(GameMode m) {
         ModeSpec s = baseSpec(m);
@@ -171,6 +181,8 @@ public:
         m_speedClass = m_startSpeed;
         m_orbUsed.assign(m_level.objs.size(), 0);
         m_orbInside.assign(m_level.objs.size(), 0);
+        m_padUsed.assign(m_level.objs.size(), 0);
+        m_padEvents.clear();
         m_events.clear();
         m_dashing = false;
         m_dashLeft = 0;
@@ -209,7 +221,8 @@ public:
             if (o.x > x1) break;
             if (o.x + o.w < x0) continue;
             if (o.hidden) continue;
-            if (o.kind == ObjKind::GravityPortal || o.kind == ObjKind::SpeedPortal || o.kind == ObjKind::Orb) continue; // events / orbs
+            if (o.kind == ObjKind::GravityPortal || o.kind == ObjKind::SpeedPortal || o.kind == ObjKind::Orb || o.kind == ObjKind::Pad)
+                continue; // events / orbs / pads
             aigd::Obstacle ob;
             float const oy = yOf(o);
             if (o.kind == ObjKind::Spike) {
@@ -260,6 +273,27 @@ public:
             out.push_back(b);
         }
     }
+    // Pads in [x0, x1] as the observer reports them (used = already activated).
+    void collectPads(float x0, float x1, std::vector<aigd::Pad>& out) const {
+        out.clear();
+        for (size_t i = 0; i < m_level.objs.size(); ++i) {
+            auto const& o = m_level.objs[i];
+            if (o.x > x1) break;
+            if (o.kind != ObjKind::Pad || o.x + o.w < x0) continue;
+            aigd::Pad p;
+            p.l = o.x;
+            p.b = o.y;
+            p.r = o.x + o.w;
+            p.t = o.y + o.h;
+            p.type = o.padType;
+            p.rotation = o.rotation;
+            p.used = m_padUsed.size() > i && m_padUsed[i];
+            p.id = static_cast<int32_t>(i);
+            out.push_back(p);
+        }
+    }
+    // Pad activations of the last step (what the game's hook reports in game).
+    std::vector<aigd::PadEvent> const& padEvents() const { return m_padEvents; }
     // Orb activations / dash starts and stops of the last step (what the
     // game's hooks report in game).
     std::vector<aigd::OrbEvent> const& orbEvents() const { return m_events; }
@@ -269,6 +303,8 @@ public:
     // them from the events, as it must in game).
     static constexpr float kYellowOrb = 11.2f, kPinkOrb = 7.9f, kRedOrb = 14.6f, kBlueOrb = -3.3f, kGreenOrb = 11.f, kBlackOrb = -17.6f;
     static constexpr float kDashEndVy = 2.f;
+    // The simulator's pad effects (learned by the predictor from the events).
+    static constexpr float kYellowPad = 16.f, kPinkPad = 10.6f, kRedPad = 20.f, kBluePad = -9.f;
 
     Observation observe() const {
         Observation o;
@@ -397,7 +433,48 @@ public:
             }
         }
 
-        if (!orbFired && !m_dashing) switch (m_mode) {
+        // ---- pads: they act by themselves on the first touch ----
+        m_padEvents.clear();
+        bool padFired = false;
+        if (!m_dashing && !orbFired) {
+            Rect const player{m_x - half, m_y - half, m_x + half, m_y + half};
+            for (size_t i = 0; i < m_level.objs.size(); ++i) {
+                auto const& o = m_level.objs[i];
+                if (o.x > m_x + 60.f) break;
+                if (o.kind != ObjKind::Pad || m_padUsed[i]) continue;
+                if (!player.overlaps(Rect{o.x, o.y, o.x + o.w, o.y + o.h})) continue;
+                m_padUsed[i] = 1;
+                aigd::PadEvent e;
+                e.type = o.padType;
+                e.id = static_cast<int32_t>(i);
+                e.mode = m_mode;
+                e.x = m_x;
+                e.y = m_y;
+                e.vyBefore = m_vy;
+                e.flippedBefore = m_upsideDown;
+                e.rotation = o.rotation;
+                if (o.padType == aigd::PadType::Blue) {
+                    m_upsideDown = !m_upsideDown;
+                    sg = -sg;
+                }
+                switch (o.padType) {
+                    case aigd::PadType::Yellow: vyN = kYellowPad; break;
+                    case aigd::PadType::Pink: vyN = kPinkPad; break;
+                    case aigd::PadType::Red: vyN = kRedPad; break;
+                    case aigd::PadType::Blue: vyN = kBluePad; break;
+                    default: break;
+                }
+                vyN *= s_padScale;
+                m_onGround = false;
+                padFired = true;
+                e.vyAfter = vyN * sg;
+                e.flippedAfter = m_upsideDown;
+                m_padEvents.push_back(e);
+                break;
+            }
+        }
+
+        if (!orbFired && !padFired && !m_dashing) switch (m_mode) {
             case GameMode::Cube:
                 if (m_onGround && hold) {
                     vyN = S.impulse;
@@ -532,7 +609,7 @@ public:
                 }
                 continue;
             }
-            if (o.kind == ObjKind::Orb) continue; // orbs are not solid (handled before the move)
+            if (o.kind == ObjKind::Orb || o.kind == ObjKind::Pad) continue; // orbs and pads are not solid (handled before the move)
             float const oy = yOf(o);
             if (o.kind == ObjKind::Spike) {
                 if (player.overlaps(spikeHitboxAt(o, oy))) {
@@ -584,7 +661,8 @@ private:
     int m_speedClass;
     int m_startSpeed = 1;
     int m_speedPassed = 0;
-    std::vector<uint8_t> m_orbUsed, m_orbInside;
+    std::vector<uint8_t> m_orbUsed, m_orbInside, m_padUsed;
+    std::vector<aigd::PadEvent> m_padEvents;
     std::vector<aigd::OrbEvent> m_events;
     bool m_dashing = false;
     aigd::OrbType m_dashType = aigd::OrbType::Dash;

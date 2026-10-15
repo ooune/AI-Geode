@@ -376,6 +376,27 @@ std::string serializePatterns(PatternMemory const& P) {
         }
     }
     out += "],";
+    // pad calibration (v0.7.1): [slot, vySum, vyN, n, flips]
+    key(out, "pads");
+    out += '[';
+    {
+        bool firstRow = true;
+        for (size_t i = 0; i < P.physics.pads.size(); ++i) {
+            auto const& c = P.physics.pads[i];
+            if (c.n == 0) continue;
+            if (!firstRow) out += ',';
+            firstRow = false;
+            out += '[';
+            bool firstNum = true;
+            for (double v : {static_cast<double>(i), c.vy.sum, static_cast<double>(c.vy.n), static_cast<double>(c.n), static_cast<double>(c.flips)}) {
+                if (!firstNum) out += ',';
+                firstNum = false;
+                appendNumber(out, v);
+            }
+            out += ']';
+        }
+    }
+    out += "],";
     key(out, "orbHeldEntry");
     out += '[';
     appendNumber(out, P.physics.heldEntryActivated);
@@ -447,6 +468,16 @@ bool deserializePatterns(std::string_view text, PatternMemory& out, std::string*
         c.dashEndVy.n = static_cast<uint32_t>(row.at(10).asInt());
         c.dashEndsReleased = static_cast<uint32_t>(row.at(11).asInt());
         c.dashEndsOther = static_cast<uint32_t>(row.at(12).asInt());
+    }
+    for (auto const& row : d.get("pads").items()) {
+        if (!row.isArray() || row.size() < 5) continue;
+        size_t const i = static_cast<size_t>(row.at(0).asInt(-1));
+        if (i >= P.physics.pads.size()) continue;
+        auto& c = P.physics.pads[i];
+        c.vy.sum = row.at(1).asNumber();
+        c.vy.n = static_cast<uint32_t>(row.at(2).asInt());
+        c.n = static_cast<uint32_t>(row.at(3).asInt());
+        c.flips = static_cast<uint32_t>(row.at(4).asInt());
     }
     auto const& held = d.get("orbHeldEntry");
     if (held.isArray() && held.size() >= 2) {

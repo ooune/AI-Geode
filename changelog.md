@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.7.1-beta.1 — Jump pads (beta, not yet tested in game)
+- **The trajectory now reads jump pads.** Yellow, pink, red and blue (gravity) pads are part of the predicted path: when the hitbox touches a pad, the predicted path launches exactly as the game would, including the blue pad's gravity flip.
+- Each pad's strength is learned from the game, the first time the player touches that pad type in a mode. Until then, paths over that pad type stay *uncertain*, and are never called safe.
+- Spider pads, and pads mounted sideways or facing away from the player's gravity, are still treated as uncertain.
+- Every predicted cube launch from a learned pad is compared with what the game then does, up to the landing. The new `Pads:` log line after each attempt reports it.
+
 ## v0.7.0 — Trajectory proximity
 - Every predicted step measures how close the player's hitbox comes to deadly geometry, using the game's collision rectangles (not the artwork). Floors and blocks underfoot are not dangers.
 - **Danger colours:** the drawn path blends from green (clear) through orange to red (very close or colliding), with a ringed marker at the closest point. Yellow still means uncertain.
