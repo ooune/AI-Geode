@@ -518,8 +518,16 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
                     float sep = (ox > 0.f && oy > 0.f) ? -std::min(ox, oy) : std::max(-ox, -oy);
                     out.clearance = std::min(out.clearance, sep);
                     if (ox > m && oy > m) {
-                        recordHit(step, idx, true);
-                        stop = true;
+                        // A rotated object's axis-aligned envelope includes
+                        // empty corners. Never claim a definite hit from it.
+                        if (o.approximate) {
+                            recordHit(step, idx, false);
+                            out.uncertainFrom = step;
+                            stop = true;
+                        } else {
+                            recordHit(step, idx, true);
+                            stop = true;
+                        }
                     } else if (ox > -(m + sweep) && oy > -(m + sweep)) {
                         recordHit(step, idx, false);
                     }
@@ -624,7 +632,19 @@ float Predictor::score(PredictedPath const& p) const {
         int32_t when = p.collisionStep >= 0 ? p.collisionStep : p.uncertainFrom;
         if (when >= 0) base += static_cast<float>(when) * 0.5f;
     }
-    return base + std::min(p.clearance, kClearanceCap) - kInputCost * static_cast<float>(p.presses);
+    float inputCost = kInputCost * static_cast<float>(p.presses);
+    if (m_computedMode == GameMode::Wave) {
+        // Presses alone do not price a release, yet every release reverses
+        // the wave's slope. Penalise both changes to avoid a needless zigzag.
+        bool held = m_adviceHolding;
+        int changes = 0;
+        for (auto state : p.holds) {
+            if (static_cast<bool>(state) != held) ++changes;
+            held = state != 0;
+        }
+        inputCost += 2.f * static_cast<float>(changes);
+    }
+    return base + std::min(p.clearance, kClearanceCap) - inputCost;
 }
 
 bool Predictor::sameState(Observation const& obs, bool holding) const {
@@ -802,10 +822,9 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     // Near an imminent hazard: find a viable action fast rather than the
     // finest one.
     if (neverHit < 30) m_budgetNow = std::min(m_budget, m_advice.simulations + 48);
-    // Timing resolution the model and the real decision rate support: no
-    // single-step refinement when the AI only acts every ~2 steps or the
-    // model drifts.
-    int const res = std::max(1, static_cast<int>(std::lround(m_interval)) + (m_model.driftPerTick(s.mode) > 0.05f ? 1 : 0));
+    // Drift changes confidence, not the spacing of button opportunities.
+    // Search every physics step when callbacks actually arrive every step.
+    int const res = std::max(1, static_cast<int>(std::lround(m_interval)));
     m_advice.resolution = res;
 
     // continuation shapes tried for each delay

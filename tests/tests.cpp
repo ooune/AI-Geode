@@ -1444,6 +1444,42 @@ TEST(mode_followup_inputs_and_cache_invalidation) {
     CHECK(rig.predictor.totalSimulations() > sims);
 }
 
+TEST(rotated_hazard_envelope_is_not_a_definite_hit) {
+    PredictionRig rig;
+    SimStart start;
+    start.x = 100.f;
+    start.y = 105.f;
+    start.onGround = true;
+    start.horizon = 5;
+    Obstacle obstacle;
+    obstacle.l = 102.f;
+    obstacle.r = 118.f;
+    obstacle.b = 92.f;
+    obstacle.t = 122.f;
+    obstacle.kind = Obstacle::Kind::Hazard;
+    PredictedPath path;
+    rig.predictor.simulate(start, std::span<Obstacle const>(&obstacle, 1), Plan{}, path);
+    CHECK(path.outcome == Certainty::Collision);
+    obstacle.approximate = true;
+    rig.predictor.simulate(start, std::span<Obstacle const>(&obstacle, 1), Plan{}, path);
+    CHECK(path.outcome == Certainty::Uncertain);
+    CHECK(path.uncertainFrom >= 0);
+}
+
+TEST(wave_search_keeps_one_step_timing) {
+    PredictionRig rig;
+    warmUpMode(rig, GameMode::Wave);
+    sim::World world(sim::modeCourse(GameMode::Wave));
+    Observation o = rig.observe(world);
+    o.mode = GameMode::Wave;
+    o.x = 250.f;
+    o.y = 140.f;
+    o.onGround = false;
+    auto const& advice = rig.predictor.advise(o, false);
+    CHECK(advice.valid);
+    CHECK(advice.resolution == 1);
+}
+
 TEST(mode_lookahead_comparison_on_shifted_courses) {
     for (GameMode mode : {GameMode::Ship, GameMode::Wave, GameMode::Ufo, GameMode::Swing, GameMode::Ball, GameMode::Spider, GameMode::Robot}) {
         int completed[2]{};

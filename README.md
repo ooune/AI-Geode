@@ -1,5 +1,9 @@
 # AI Geode
 
+**v0.6.6:** wave steering also has a short hold period when both predicted actions are uncertain because of nearby unmodelled geometry, but only while the movement model is trusted. Safety overrides can still change direction immediately when one action is safer. This was prompted by a real wave-level log where the safe-only rule rarely activated.
+
+**v0.6.4:** wave steering now prices both presses and releases and holds a safe slope instead of making marginal turns. Rotated hazard rectangles are treated as uncertain envelopes rather than definite hits, and one-step callback timing keeps one-step search resolution. Player hitbox sizes remain estimates; this release does not guarantee frame-perfect play.
+
 **v0.6.3:** mode-specific follow-up inputs, longer flying-mode lookahead, finer robot holds and prediction-cache fixes. See [mode comparison and validation](V063-VALIDATION.md).
 
 **v0.6.2:** a three-tab GD-style control popup and compact, screen-bounded HUD. See [UI validation notes](V062-VALIDATION.md).

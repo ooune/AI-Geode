@@ -667,7 +667,15 @@ bool Agent::act(Observation const& obs) {
     // Never toggle faster than the configured minimum (prevents input spam).
     // Applied before the safety check, so that the check judges the action
     // that will really be executed; the check itself may override it.
-    if (!following && a != m_curAction && obs.tick - m_lastToggleTick < m_cfg.minToggleTicks) {
+    // Unknown decorative/interactive geometry can make both wave branches
+    // uncertain every step. In that case the score oscillates although no
+    // modelled collision calls for a turn. Hold the current slope for a few
+    // ticks; the safety check below may still override this immediately.
+    bool const waveQuiet = obs.mode == GameMode::Wave && trusted &&
+                           adv->outcome(0) != Certainty::Collision && adv->outcome(1) != Certainty::Collision &&
+                           adv->risk(m_curAction) < 0 && (!obs.hazard.present || obs.hazard.dx > 30.f);
+    int const minToggle = waveQuiet ? std::max(m_cfg.minToggleTicks, 6) : m_cfg.minToggleTicks;
+    if (!following && a != m_curAction && obs.tick - m_lastToggleTick < minToggle) {
         a = m_curAction;
         forced = false;
         explored = false;
@@ -876,6 +884,21 @@ bool Agent::act(Observation const& obs) {
         rec.predictionValid = true;
         rec.reason = fmt("Following the plan made %d steps ago (state as expected: height %+.1f, %s)", m_plan.age(obs.tick),
                          m_plan.lastCheck.dy, obs.onGround ? "on the ground" : "in the air");
+    }
+    // A wave can safely keep its current slope for a while even when a fresh
+    // search finds a marginally clearer zigzag. Reversing now only creates
+    // another input and a visually noisy path. The safety check above stays
+    // authoritative whenever either direction is risky or a turn is near.
+    if (!following && trusted && obs.mode == GameMode::Wave && a != m_curAction &&
+        adv->outcome(m_curAction) == Certainty::Safe && adv->outcome(a) == Certainty::Safe &&
+        adv->keepForSafe(m_curAction) >= 12 && adv->risk(m_curAction) < 0 &&
+        src != DecisionSource::Experiment && src != DecisionSource::AvoidRepeat) {
+        a = m_curAction;
+        src = DecisionSource::Debounce;
+        shielded = forced = explored = replayed = planned = false;
+        rec.verdict = SafetyVerdict::Kept;
+        rec.reason = "Wave input held: the current slope remains safe for at least 12 steps";
+        reason = rec.reason;
     }
     rec.executed = static_cast<uint8_t>(a);
     if (a == 1 && m_curAction == 0) ++m_status.pressesThisAttempt;

@@ -377,7 +377,9 @@ void Observer::collectObstacles(float x0, float x1, std::vector<aigd::Obstacle>&
         o.b = rect.getMinY();
         o.r = rect.getMaxX();
         o.t = rect.getMaxY();
-        if (it->unmodelled) o.kind = aigd::Obstacle::Kind::Uncertain;
+        float const rotation = std::fmod(std::fabs(obj->getRotation()), 90.f);
+        o.approximate = rotation > 1.f && rotation < 89.f;
+        if (it->unmodelled || (o.approximate && it->kind == Kind::Solid)) o.kind = aigd::Obstacle::Kind::Uncertain;
         else if (it->kind == Kind::Hazard) o.kind = aigd::Obstacle::Kind::Hazard;
         else if (it->kind == Kind::Solid) o.kind = aigd::Obstacle::Kind::Solid;
         else o.kind = aigd::Obstacle::Kind::Uncertain; // orbs: act only if pressed inside them

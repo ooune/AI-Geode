@@ -44,6 +44,9 @@ struct Obstacle {
     };
     float l = 0.f, b = 0.f, r = 0.f, t = 0.f;
     Kind kind = Kind::Hazard;
+    // getObjectRect() is an axis-aligned envelope for rotated objects. Its
+    // corners may be empty even though this rectangle overlaps the player.
+    bool approximate = false;
 };
 
 // A change of movement physics the player passes through (a portal), taken
