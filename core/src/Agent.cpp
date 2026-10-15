@@ -360,7 +360,7 @@ bool Agent::act(Observation const& obs) {
     // untouched) and forces a new decision from the actual state now.
     bool planInvalidated = false;
     if (m_plan.active()) {
-        float const drift = m_predictor ? m_predictor->model().driftPerTick(obs.mode) : 0.f;
+        float const drift = m_predictor ? m_predictor->model().driftPerTick(obs.mode, obs.mini) : 0.f;
         // (2.5 units: the game snaps the player onto surfaces when landing)
         float const tol = 2.5f + 2.f * drift * static_cast<float>(std::max(0, m_plan.age(obs.tick)));
         PlanCheck const chk = m_plan.validate(obs, tol);
@@ -651,13 +651,15 @@ bool Agent::act(Observation const& obs) {
         }
     }
 
-    // Trajectory prediction: no learned preference here yet -> follow the
-    // planner's best plan.
+    // Follow the planner when there is no learned preference, or when its
+    // verified safe route improves on a learned choice that is not safe.
     bool planned = false;
     bool shielded = false;
     if (trusted) {
         bool opinion = (e->visited(0) || e->visited(1)) && std::fabs(e->q[0] - e->q[1]) > 1e-3f;
-        if (!decided && !explored && !opinion) {
+        bool const verifiedRoute = adv->outcome(adv->bestPresses ? 1 : 0) == Certainty::Safe &&
+                                   adv->outcome(a) != Certainty::Safe;
+        if (!decided && !explored && (!opinion || verifiedRoute)) {
             a = adv->bestPresses ? 1 : 0;
             planned = true;
             src = DecisionSource::Planner;

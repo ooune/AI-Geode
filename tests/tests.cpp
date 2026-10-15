@@ -1466,10 +1466,67 @@ TEST(rotated_hazard_envelope_is_not_a_definite_hit) {
     CHECK(path.uncertainFrom >= 0);
 }
 
+TEST(precision_confidence_isolated_for_every_mini_mode) {
+    PhysicsModel model;
+    for (int i = 0; i < static_cast<int>(GameMode::Count); ++i) {
+        auto mode = static_cast<GameMode>(i);
+        model.recordAccuracy(mode, 0.32f, 32, false);
+        model.recordAccuracy(mode, 32.f, 32, true);
+        CHECK(std::fabs(model.driftPerTick(mode, false) - 0.01f) < 0.0001f);
+        CHECK(std::fabs(model.driftPerTick(mode, true) - 1.f) < 0.0001f);
+    }
+}
+
+TEST(precision_mini_wave_slope_at_every_speed_and_gravity) {
+    PredictionRig rig;
+    for (bool mini : {false, true}) for (bool flipped : {false, true})
+        for (int speed = 0; speed < 5; ++speed) for (bool held : {false, true}) {
+            SimStart s;
+            s.mode = GameMode::Wave;
+            s.mini = mini;
+            s.upsideDown = flipped;
+            s.speedClass = speed;
+            s.x = 100.f;
+            s.y = 500.f;
+            s.onGround = false;
+            s.horizon = 8;
+            s.bounds = {};
+            Plan plan;
+            plan.pressAt = held ? 0 : -1;
+            PredictedPath path;
+            rig.predictor.simulate(s, {}, plan, path);
+            CHECK(path.points.size() == 8);
+            float dx = path.points.back().x - s.x;
+            float dy = path.points.back().y - s.y;
+            float slope = (mini ? 2.f : 1.f) * (held ? 1.f : -1.f) * (flipped ? -1.f : 1.f);
+            CHECK(std::fabs(dy - dx * slope) < 0.001f);
+        }
+}
+
+TEST(precision_flight_ground_flag_does_not_cancel_matching_path) {
+    for (GameMode mode : {GameMode::Wave, GameMode::Ship, GameMode::Swing}) {
+        PlanManager plans;
+        Observation o;
+        o.mode = mode;
+        o.x = 100.f; o.y = 100.f; o.tick = 10;
+        o.onGround = false;
+        PredictedPath path;
+        path.points.push_back({101.f, 102.f});
+        path.holds.push_back(1);
+        path.ground.push_back(0);
+        Predictor::Advice advice;
+        plans.adopt(path, o, o.tick, PlanSource::Search, advice, true);
+        o.tick++; o.x = 101.f; o.y = 102.f; o.onGround = true;
+        CHECK(plans.validate(o, 1.f).valid);
+        o.y += 10.f;
+        CHECK(!plans.validate(o, 1.f).valid);
+    }
+}
 TEST(wave_search_keeps_one_step_timing) {
     PredictionRig rig;
     warmUpMode(rig, GameMode::Wave);
-    sim::World world(sim::modeCourse(GameMode::Wave));
+    auto const level = sim::modeCourse(GameMode::Wave);
+    sim::World world(level);
     Observation o = rig.observe(world);
     o.mode = GameMode::Wave;
     o.x = 250.f;

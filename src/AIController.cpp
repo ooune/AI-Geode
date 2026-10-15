@@ -453,7 +453,7 @@ void AIController::logAttemptQuality(aigd::GameMode mode, bool mini) const {
               "{} windows), caution {:.2f}, one-step error {:.2f}, {} estimate(s) replaced",
               st.decisionsTrusted, st.decisionsUntrusted, st.trust.empty() ? "" : " - ", st.trust, st.pressesThisAttempt,
               st.pressesAvoidedThisAttempt, st.overridesThisAttempt, st.noSafeOptionThisAttempt, aigd::gameModeName(mode),
-              model.driftPerTick(mode), m_predictor.inputLatency(), m_predictor.latencyError(0), m_predictor.latencyError(1),
+              model.driftPerTick(mode, mini), m_predictor.inputLatency(), m_predictor.latencyError(0), m_predictor.latencyError(1),
               m_predictor.latencyError(2), m_predictor.latencySamples(), m_predictor.caution(), m_predictor.lastStepError(),
               model.regimeChanges());
     auto const& plans = m_agent.plans();

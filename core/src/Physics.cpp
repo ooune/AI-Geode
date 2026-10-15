@@ -330,9 +330,9 @@ void PhysicsModel::refit(size_t slot) {
     m_params[slot] = p;
 }
 
-void PhysicsModel::recordAccuracy(GameMode mode, float error, int steps) {
+void PhysicsModel::recordAccuracy(GameMode mode, float error, int steps, bool mini) {
     if (steps <= 0) return;
-    auto i = static_cast<size_t>(mode);
+    auto i = PhysicsCalibration::slot(mode, mini);
     float perTick = error / static_cast<float>(steps);
     // slow average: one odd window cannot swing the trust level
     m_drift[i] = m_driftN[i] == 0 ? perTick : m_drift[i] * 0.9f + perTick * 0.1f;
@@ -341,8 +341,8 @@ void PhysicsModel::recordAccuracy(GameMode mode, float error, int steps) {
     ++m_accuracyN;
 }
 
-float PhysicsModel::driftPerTick(GameMode mode) const {
-    return m_drift[static_cast<size_t>(mode)];
+float PhysicsModel::driftPerTick(GameMode mode, bool mini) const {
+    return m_drift[PhysicsCalibration::slot(mode, mini)];
 }
 
 std::string PhysicsModel::describe(GameMode mode) const {

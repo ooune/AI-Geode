@@ -1,5 +1,7 @@
 # AI Geode
 
+**v0.6.7:** prediction drift and safety margins are now separate for normal and mini sizes in every mode. Continuous flight plans tolerate a grounded-flag disagreement while still checking position and physics changes. Flying pulse release times receive bounded one-step refinement; a trusted safe route can replace an unsafe learned choice without disrupting an already safe choice. See [validation and limitations](V067-VALIDATION.md).
+
 **v0.6.6:** wave steering also has a short hold period when both predicted actions are uncertain because of nearby unmodelled geometry, but only while the movement model is trusted. Safety overrides can still change direction immediately when one action is safer. This was prompted by a real wave-level log where the safe-only rule rarely activated.
 
 **v0.6.4:** wave steering now prices both presses and releases and holds a safe slope instead of making marginal turns. Rotated hazard rectangles are treated as uncertain envelopes rather than definite hits, and one-step callback timing keeps one-step search resolution. Player hitbox sizes remain estimates; this release does not guarantee frame-perfect play.

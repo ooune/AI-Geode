@@ -123,7 +123,7 @@ PlanCheck PlanManager::validate(Observation const& obs, float tolerance) {
             // Still the step the plan was made in: valid only for the state it was made from.
             c.dx = obs.x - m_plan.startX;
             c.dy = obs.y - m_plan.startY;
-            if (std::fabs(c.dx) <= 0.01f && std::fabs(c.dy) <= 0.01f && obs.onGround == m_plan.startGrounded) {
+            if (std::fabs(c.dx) <= 0.01f && std::fabs(c.dy) <= 0.01f && (isFlyingMode(obs.mode) || obs.onGround == m_plan.startGrounded)) {
                 c.valid = true;
                 lastCheck = c;
                 return c;
@@ -143,7 +143,9 @@ PlanCheck PlanManager::validate(Observation const& obs, float tolerance) {
         c.expectedGrounded = e.grounded;
         // Grounded / airborne: compared over a step either side, so a landing
         // that is exactly one step off does not count as a different plan.
-        bool groundMismatch = true;
+        // Continuous flight does not use grounded state to trigger its input effect.
+        // Position checks below still reject an actual unexpected surface contact.
+        bool groundMismatch = !isFlyingMode(obs.mode);
         for (int j = std::max(0, i - 1); j <= std::min<int>(i + 1, static_cast<int>(m_plan.steps.size()) - 1); ++j)
             if ((m_plan.steps[static_cast<size_t>(j)].grounded != 0) == obs.onGround) groundMismatch = false;
         if (groundMismatch && obs.onGround) {

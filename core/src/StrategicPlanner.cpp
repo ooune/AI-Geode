@@ -96,7 +96,7 @@ StrategicPlan const* StrategicPlanner::update(Observation const& obs, bool holdi
             replan = true;
         } else {
             PathPoint const& e = P.path.points[static_cast<size_t>(idx)];
-            float const drift = predictor.model().driftPerTick(obs.mode);
+            float const drift = predictor.model().driftPerTick(obs.mode, obs.mini);
             float const tol = 2.5f + 2.f * drift * static_cast<float>(idx);
             auto groundAt = [&](int32_t i) {
                 return i >= 0 && i < static_cast<int32_t>(P.path.ground.size()) ? P.path.ground[static_cast<size_t>(i)] != 0 : obs.onGround;

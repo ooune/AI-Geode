@@ -139,8 +139,8 @@ public:
     void observeHeldEntry(bool activated);
     std::string describeOrbs() const;
 
-    void recordAccuracy(GameMode mode, float error, int steps);
-    float driftPerTick(GameMode mode) const;
+    void recordAccuracy(GameMode mode, float error, int steps, bool mini = false);
+    float driftPerTick(GameMode mode, bool mini = false) const;
     float driftPerTick() const { return driftPerTick(GameMode::Cube); }
     float lastResimError() const { return m_lastResimError; }
     uint32_t accuracySamples() const { return m_accuracyN; }
@@ -166,8 +166,8 @@ private:
 
     PhysicsCalibration m_cal;
     std::array<ModePhysics, PhysicsCalibration::kSlots> m_params;
-    std::array<float, static_cast<size_t>(GameMode::Count)> m_drift{};
-    std::array<uint32_t, static_cast<size_t>(GameMode::Count)> m_driftN{};
+    std::array<float, PhysicsCalibration::kSlots> m_drift{};
+    std::array<uint32_t, PhysicsCalibration::kSlots> m_driftN{};
     float m_lastResimError = 0.f;
     uint32_t m_accuracyN = 0;
     int32_t m_robotSinceTakeoff = 1 << 20;

@@ -101,7 +101,7 @@ bool Predictor::sentAt(int32_t step, int currentFrom, bool current) const {
 std::string Predictor::trustReason(GameMode mode, bool mini) const {
     char buf[160];
     if (!m_model.calibrated(mode, mini)) return "calibrating: not enough observed jumps/flights in this mode yet";
-    float d = m_model.driftPerTick(mode);
+    float d = m_model.driftPerTick(mode, mini);
     if (d >= 0.15f) {
         std::snprintf(buf, sizeof(buf), "not trusted: the model drifts %.3f units/step from the real game (limit 0.15)", d);
         return buf;
@@ -115,12 +115,12 @@ std::string Predictor::trustReason(GameMode mode, bool mini) const {
 }
 
 bool Predictor::trusted(GameMode mode, bool mini) const {
-    return m_model.calibrated(mode, mini) && m_model.driftPerTick(mode) < 0.15f && m_caution < 3.f;
+    return m_model.calibrated(mode, mini) && m_model.driftPerTick(mode, mini) < 0.15f && m_caution < 3.f;
 }
 
 float Predictor::margin(int step, GameMode mode, bool mini) const {
     float base = trusted(mode, mini) ? 0.5f : 3.f;
-    return std::min(12.f, (base + m_model.driftPerTick(mode) * static_cast<float>(step)) * m_caution);
+    return std::min(12.f, (base + m_model.driftPerTick(mode, mini) * static_cast<float>(step)) * m_caution);
 }
 
 void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles, Plan const& plan, PredictedPath& out,
@@ -196,7 +196,7 @@ void Predictor::simulate(SimStart const& s, std::span<Obstacle const> obstacles,
     bool potential = false;
     bool definite = false;
     float const m0 = (trusted(s.mode, s.mini) ? 0.5f : 3.f) * m_caution;
-    float const dm = m_model.driftPerTick(s.mode) * m_caution;
+    float const dm = m_model.driftPerTick(s.mode, s.mini) * m_caution;
     size_t first = 0;
     size_t const nObs = obstacles.size();
 
@@ -941,6 +941,22 @@ Predictor::Advice const& Predictor::advise(Observation const& obs, bool holding,
     }
     m_advice.stage = nRefine > 0 ? SearchStage::Refined : SearchStage::Coarse;
 
+    // Refine both the start and end of a flying pulse at the actual input
+    // resolution. Sparse hold lengths alone miss narrow mini-wave corridors.
+    if (continuousControl(s.mode) && !m_advice.budgetHit) {
+        Plan const bases[] = {m_release.plan, m_press.plan};
+        for (int branch = 0; branch < 2; ++branch) {
+            Plan const base = bases[branch];
+            if (base.pressAt < 0 || base.holdFor <= 0 || base.repeatEvery > 0) continue;
+            for (int d : {-2 * res, -res, res, 2 * res}) {
+                Plan p = base;
+                p.holdFor = base.holdFor + d;
+                if (p.holdFor < 1 || p.pressAt + p.holdFor >= m_horizon) continue;
+                evaluate(s, span, p, m_tmp, branch ? m_press : m_release,
+                         branch ? havePress : haveRelease, branch);
+            }
+        }
+    }
     // Independently timed follow-up inputs, not a fixed repeating rhythm.
     // Try both immediate-input branches and score the full simulated path.
     // The ordinary candidates remain available; this cannot lower their score.
@@ -1559,7 +1575,7 @@ void Predictor::observe(Observation const& obs, bool heldDuringStep) {
                     errs[static_cast<size_t>(L)] = std::hypot(e.x - end.x, e.y - end.y);
                 }
                 if (valid) {
-                    m_model.recordAccuracy(s0.mode, errs[static_cast<size_t>(m_latency)], steps);
+                    m_model.recordAccuracy(s0.mode, errs[static_cast<size_t>(m_latency)], steps, s0.mini);
                     if (differs) {
                         // Only windows with an input change say anything about latency.
                         for (int L = 0; L < kLags; ++L) {
