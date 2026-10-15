@@ -26,7 +26,7 @@
 ## Validation
 
 Full suite: **110 tests, 2674 checks, zero failures**. Raw output:
-`v061-validation-tests.txt`. Three new regressions cover overlay metadata and
+`logs/v061-validation-tests.txt`. Three new regressions cover overlay metadata and
 selected endpoint, plan tail and landing height, and distant reactivation/small
 movement. Existing prediction, strategy, orb and map tests also pass.
 

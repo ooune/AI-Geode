@@ -23,7 +23,7 @@
 ## Tests
 
 Full suite: **112 tests, 2705 checks, zero failures**. Raw output:
-`v063-validation-tests.txt`. New regressions verify follow-up press/release edges
+`logs/v063-validation-tests.txt`. New regressions verify follow-up press/release edges
 in six modes and recomputation after speed, size and geometry changes.
 Existing all-mode calibration, 32-step accuracy, controller courses and
 false-safe collision regressions pass.
@@ -48,8 +48,8 @@ synthetic fixtures, not a representative test of arbitrary GD levels.
 Spider mean progress improved from 78.1% to 100%. Other modes showed no completion
 improvement because the baseline already completed these fixtures. Search cost
 increased, particularly in flying modes. Timings are standalone optimized tests,
-not game frame-time measurements (`v063-mode-release.txt`). The earlier ungated
-search comparison is retained in `v063-mode-tests.txt`; the final implementation
+not game frame-time measurements (`logs/v063-mode-release.txt`). The earlier ungated
+search comparison is retained in `logs/v063-mode-tests.txt`; the final implementation
 avoids extra follow-up work when a simpler safe route already exists.
 
 ## Installation

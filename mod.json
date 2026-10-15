@@ -8,7 +8,9 @@
 	"version": "v0.7.0",
 	"developer": "aqvose",
 	"description": "An AI player that learns Geometry Dash levels from its own deaths.",
-	"repository": "https://github.com/aqvose-prog/AI-Geode",
+	"links": {
+		"source": "https://github.com/ooune/AI-Geode"
+	},
 	"dependencies": {
 		"geode.node-ids": ">=v1.23.3"
 	},

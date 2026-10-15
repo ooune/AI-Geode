@@ -29,10 +29,10 @@ from the executed action, including its post-activation movement.
 
 Recorded full suite: **107 tests, 2660 checks, 0 failures** (`D:/GeodeDev/t41.txt`).
 Fresh rerun on 2026-10-14 also passed **107 tests, 2660 checks, 0 failures**;
-output is in `v060-validation-tests-unrestricted.txt`. The initial sandboxed
+output is in `logs/v060-validation-tests-unrestricted.txt`. The initial sandboxed
 rerun had 16 failed checks in three file-storage tests. Rerunning the same binary
 with permitted temporary-file access resolved them; all orb tests passed in
-both runs. The sandboxed output is retained as `v060-validation-tests.txt`.
+both runs. The sandboxed output is retained as `logs/v060-validation-tests.txt`.
 Twelve orb regressions cover classification, calibrated effects, activation vs
 skip, post-activation collision, useful interaction selection, dash movement and
 termination, sequences, cancellation, model correction, transfer and overlay

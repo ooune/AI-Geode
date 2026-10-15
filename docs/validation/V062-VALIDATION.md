@@ -13,7 +13,7 @@
 ## Validation
 
 The Geode build succeeded. Existing core regression suite: **110 tests, 2674
-checks, zero failures** (`v062-validation-tests.txt`). No gameplay algorithms
+checks, zero failures** (`logs/v062-validation-tests.txt`). No gameplay algorithms
 changed. The automated suite does not validate visual layout or menu clicks.
 
 Installed package SHA-256 matches the build:

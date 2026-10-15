@@ -11,3 +11,8 @@ compile_commands.json
 .vs/
 .idea/
 *.user
+
+# Local diagnostics and scratch output
+hitbox-trace.csv
+*.log
+dist/

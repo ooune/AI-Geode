@@ -1,0 +1,130 @@
+# Builds the mod, runs the core tests and packages the .geode file on every
+# relevant push / pull request. A pushed version tag (vX.Y.Z or vX.Y.Z-suffix)
+# additionally publishes a GitHub release with the built file - but only if
+# the tag matches mod.json, release notes exist, and every job succeeded.
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+    # (path filters are not applied to tag pushes)
+    paths:
+      - "src/**"
+      - "core/**"
+      - "tests/**"
+      - "resources/**"
+      - "CMakeLists.txt"
+      - "mod.json"
+      - "about.md"
+      - "changelog.md"
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - "src/**"
+      - "core/**"
+      - "tests/**"
+      - "resources/**"
+      - "CMakeLists.txt"
+      - "mod.json"
+      - "about.md"
+      - "changelog.md"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  version:
+    name: Version check
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Read mod.json version (and compare with the tag)
+        shell: bash
+        run: |
+          version=$(jq -r .version mod.json)
+          echo "mod.json version: $version"
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error file=mod.json::version '$version' is not of the form vX.Y.Z[-suffix]"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            if [[ "$tag" != "$version" ]]; then
+              echo "::error::Tag $tag does not match the mod.json version $version"; exit 1
+            fi
+            if [[ ! -s "docs/releases/$tag.md" ]]; then
+              echo "::error::Missing release notes docs/releases/$tag.md"; exit 1
+            fi
+          fi
+
+  tests:
+    name: Core tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S tests -B build-tests -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++
+      - name: Build
+        run: cmake --build build-tests --parallel
+      - name: Run tests
+        run: ./build-tests/aigd_tests
+
+  build:
+    name: Build mod (Windows)
+    runs-on: windows-latest
+    needs: version
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the mod
+        id: build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: given   # the Geode version in mod.json
+      - name: Upload the .geode file
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-geode-${{ needs.version.outputs.version }}
+          path: ${{ steps.build.outputs.build-output }}/*.geode
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, tests, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ai-geode-${{ needs.version.outputs.version }}
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: |
+          ls -la
+          test -f aqvose.ai-geode.geode
+          sha256sum *.geode > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          flags=()
+          if [[ "${{ needs.version.outputs.prerelease }}" == "true" ]]; then flags+=(--prerelease); else flags+=(--latest); fi
+          gh release create "$TAG" dist/aqvose.ai-geode.geode dist/SHA256SUMS.txt \
+            --verify-tag --title "AI-Geode $TAG" --notes-file "docs/releases/$TAG.md" "${flags[@]}"
