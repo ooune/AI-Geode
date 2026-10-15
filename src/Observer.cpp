@@ -361,6 +361,17 @@ aigd::Observation Observer::observe(PlayLayer* layer, int32_t tick) {
     return o;
 }
 
+void Observer::nearbyObjects(float x0, float x1, std::vector<GameObject*>& out) const {
+    out.clear();
+    auto it = std::lower_bound(m_items.begin(), m_items.end(), x0 - kIndexPadding,
+                               [](Item const& item, float v) { return item.x < v; });
+    for (; it != m_items.end() && out.size() < kMaxObstacles; ++it) {
+        if (it->x > x1 + kIndexPadding) break;
+        if (it->kind == Kind::Other || it->object->m_isGroupDisabled || it->object->m_isNoTouch) continue;
+        out.push_back(it->object);
+    }
+}
+
 void Observer::collectObstacles(float x0, float x1, std::vector<aigd::Obstacle>& out) const {
     out.clear();
     if (m_items.empty()) return;

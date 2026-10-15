@@ -1,5 +1,6 @@
 #pragma once
 
+#include "HitboxTrace.hpp"
 #include "Observer.hpp"
 #include "SaveWorker.hpp"
 
@@ -43,6 +44,7 @@ public:
         bool strategicPlanning = true;
         bool showUnderstanding = false;
         bool showOrbs = true;
+        bool hitboxTrace = false;
         bool showProximity = true;
         bool proximityScoring = true;
         float proximitySafe = 18.f;
@@ -142,6 +144,8 @@ private:
     aigd::StrategyLibrary m_strategies;  // layer B: strategies per kind of situation
     bool m_patternsLoaded = false;
     Observer m_observer;
+    HitboxTrace m_trace;
+    std::vector<GameObject*> m_traceNearby;
     // whole-level understanding (v0.5.0)
     aigd::LevelMap m_map;
     aigd::LevelAnalysis m_analysis;

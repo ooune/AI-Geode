@@ -61,6 +61,7 @@ void AIController::loadSettings() {
     m_settings.strategicPlanning = mod->getSettingValue<bool>("strategic-planning");
     m_settings.showUnderstanding = mod->getSettingValue<bool>("show-understanding");
     m_settings.showOrbs = mod->getSettingValue<bool>("show-orb-trajectories");
+    m_settings.hitboxTrace = mod->getSettingValue<bool>("hitbox-trace");
     m_settings.showProximity = mod->getSettingValue<bool>("show-proximity");
     m_settings.proximityScoring = mod->getSettingValue<bool>("proximity-scoring");
     m_settings.proximitySafe = static_cast<float>(mod->getSettingValue<double>("proximity-safe"));
@@ -164,6 +165,8 @@ void AIController::onLevelInit(PlayLayer* layer) {
     m_observer.reset();
     m_checkpointXs.clear();
     m_notice.clear();
+    m_trace.end();
+    if (m_settings.hitboxTrace) m_trace.begin((Mod::get()->getSaveDir() / "hitbox-trace.csv").string());
 
     m_supported = true;
     m_unsupportedReason.clear();
@@ -206,6 +209,7 @@ void AIController::onLevelQuit(PlayLayer* layer) {
     if (layer != m_layer) return;
     endAttemptWithoutOutcome(layer);
     saveNow();
+    m_trace.end();
     applyTimeScale(false);
     m_agent.detach();
     m_observer.reset();
@@ -312,6 +316,10 @@ void AIController::onPhysicsStep(PlayLayer* layer) {
         m_observer.collectObstacles(obs.x - 90.f, obs.x + reach + 60.f, m_obstacles);
     }
     obs.obstacles = m_obstacles;
+    if (m_trace.active()) {
+        m_observer.nearbyObjects(obs.x - 60.f, obs.x + 60.f, m_traceNearby);
+        m_trace.step(layer, player, tick, m_traceNearby);
+    }
     // orb activations the game reported since the last step
     m_orbEventsNow.swap(m_orbEvents);
     m_orbEvents.clear();
@@ -411,6 +419,7 @@ void AIController::onPlayerDestroyed(PlayLayer* layer, PlayerObject* player, Gam
     obs.tick = m_clock.tick();
     obs.dead = true;
     auto death = m_observer.deathInfo(layer, player, killer);
+    m_trace.death(layer, player, killer, obs.tick);
     if (m_holding) press(layer, false);
     // The safety-critical decisions right before the death, as executed.
     auto const& safetyLog = m_agent.safetyLog();

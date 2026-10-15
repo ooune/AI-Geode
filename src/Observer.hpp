@@ -31,6 +31,8 @@ public:
     // hitboxes are the real, smaller-than-the-artwork ones.
     void collectObstacles(float x0, float x1, std::vector<aigd::Obstacle>& out) const;
     size_t indexedObjects() const { return m_items.size(); }
+    // Enabled hazard / solid / orb objects whose index position lies between x0 and x1.
+    void nearbyObjects(float x0, float x1, std::vector<GameObject*>& out) const;
 
     // ---- Whole-level map (v0.5.0) ----
     // Every loaded object that matters for movement or survival, with the
